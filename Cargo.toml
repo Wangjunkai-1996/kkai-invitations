@@ -1,0 +1,22 @@
+[package]
+name = "invitations"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+tower = "0.5"
+thiserror = "2"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
