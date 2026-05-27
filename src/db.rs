@@ -1,4 +1,7 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Executor;
+
+const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
 
 pub async fn init_pool(database_url: &str) -> PgPool {
     let pool = PgPoolOptions::new()
@@ -14,6 +17,12 @@ pub async fn init_pool(database_url: &str) -> PgPool {
 pub async fn init_readonly_pool(database_url: &str) -> PgPool {
     PgPoolOptions::new()
         .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute(READONLY_CONNECTION_SETUP_SQL).await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await
         .expect("failed to connect to new-api database")
