@@ -505,11 +505,11 @@ pub async fn get_rebate_stats(
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(rebate_amount), 0) as total,
-            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = 'pending' THEN rebate_amount ELSE 0 END), 0) as pending,
-            COALESCE(SUM(CASE WHEN status = 'requested' THEN rebate_amount ELSE 0 END), 0) as requested,
-            COALESCE(SUM(CASE WHEN status = 'approved' THEN rebate_amount ELSE 0 END), 0) as approved
+            COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
+            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending,
+            COALESCE(SUM(CASE WHEN status = 'requested' THEN rebate_amount ELSE 0 END), 0)::BIGINT as requested,
+            COALESCE(SUM(CASE WHEN status = 'approved' THEN rebate_amount ELSE 0 END), 0)::BIGINT as approved
         FROM rebate_records
         "#,
     )

@@ -142,9 +142,9 @@ pub async fn my_code(
     let stats = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM(rebate_amount), 0) as total,
-            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0) as pending_withdrawal
+            COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
+            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_withdrawal
         FROM rebate_records
         WHERE inviter_id = $1
         "#,
