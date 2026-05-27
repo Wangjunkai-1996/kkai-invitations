@@ -1,6 +1,8 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Executor;
 
+pub const USER_INVITATION_REBATE_ENABLED_KEY: &str = "user_invitation_rebate_enabled";
+
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
 
 pub async fn init_pool(database_url: &str) -> PgPool {
@@ -207,7 +209,8 @@ async fn migrate(pool: &PgPool) {
         INSERT INTO system_config (key, value, description, updated_at)
         VALUES
             ('min_rebate_request_amount', '1000000', '最低返利申请金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ('rebate_request_frequency_days', '7', '返利申请频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT)
+            ('rebate_request_frequency_days', '7', '返利申请频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ('user_invitation_rebate_enabled', 'true', '用户侧邀请返利界面开关', EXTRACT(EPOCH FROM NOW())::BIGINT)
         ON CONFLICT (key) DO NOTHING
         "#,
     )

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
+use crate::db::USER_INVITATION_REBATE_ENABLED_KEY;
 use crate::error::{AppError, Result};
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::session::SessionUser;
@@ -25,6 +26,13 @@ pub struct InvitationStats {
     pub total_rebate: i64,
     pub completed_rebate: i64,
     pub pending_rebate: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationFeatureStatus {
+    pub available: bool,
+    pub user_invitation_rebate_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -124,11 +132,26 @@ impl PaginationParams {
     }
 }
 
+// GET /api/invitations/status
+pub async fn invitation_feature_status(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<InvitationFeatureStatus>>> {
+    let user_invitation_rebate_enabled =
+        get_config_bool_value(&state.pool, USER_INVITATION_REBATE_ENABLED_KEY).await?;
+
+    Ok(ok(InvitationFeatureStatus {
+        available: true,
+        user_invitation_rebate_enabled,
+    }))
+}
+
 // GET /api/invitations/my-code
 pub async fn my_code(
     State(state): State<AppState>,
     user: SessionUser,
 ) -> Result<Json<ApiResponse<InvitationStats>>> {
+    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+
     let user_info = sqlx::query("SELECT aff_code FROM users WHERE id = $1")
         .bind(user.id)
         .fetch_optional(&state.newapi_pool)
@@ -171,6 +194,8 @@ pub async fn rebate_records(
     user: SessionUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
+    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+
     let records = fetch_rebate_records(
         &state.pool,
         Some(user.id),
@@ -202,6 +227,8 @@ pub async fn available_rebates(
     State(state): State<AppState>,
     user: SessionUser,
 ) -> Result<Json<ApiResponse<AvailableRebates>>> {
+    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+
     let rows = sqlx::query(
         r#"
         SELECT id, rebate_amount
@@ -235,6 +262,8 @@ pub async fn request_rebate(
     user: SessionUser,
     Json(req): Json<RebateRequest>,
 ) -> Result<Json<ApiResponse<RebateRequestSubmitResponse>>> {
+    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+
     let rebate_record_ids = unique_ids(&req.rebate_record_ids)?;
     if rebate_record_ids.is_empty() {
         return Err(AppError::BadRequest("请选择要返利的记录".to_string()));
@@ -392,6 +421,8 @@ pub async fn my_rebate_requests(
     user: SessionUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRequestResponse>>>> {
+    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+
     let status = params.rebate_request_status_filter();
     let total = count_user_rebate_requests(&state.pool, user.id, status).await?;
     let rows = fetch_user_rebate_requests(
@@ -639,6 +670,31 @@ async fn get_config_value_tx(
         .map_err(|_| AppError::Internal("配置值格式错误".to_string()))
 }
 
+async fn ensure_user_invitation_rebate_enabled(pool: &PgPool) -> Result<()> {
+    if get_config_bool_value(pool, USER_INVITATION_REBATE_ENABLED_KEY).await? {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden)
+}
+
+async fn get_config_bool_value(pool: &PgPool, key: &str) -> Result<bool> {
+    let value: String = sqlx::query_scalar("SELECT value FROM system_config WHERE key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await?;
+
+    parse_config_bool(&value)
+}
+
+fn parse_config_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(AppError::Internal("配置值格式错误".to_string())),
+    }
+}
+
 fn yuan_text_to_cents(value: String) -> i64 {
     (text_to_f64(value) * CENTS_PER_YUAN as f64).round() as i64
 }
@@ -703,6 +759,19 @@ mod tests {
         };
         assert_eq!(rejected.rebate_status_filter(), Some("rejected"));
         assert_eq!(rejected.rebate_request_status_filter(), Some("rejected"));
+    }
+
+    #[test]
+    fn parses_boolean_config_values() {
+        assert!(parse_config_bool("true").unwrap());
+        assert!(parse_config_bool("1").unwrap());
+        assert!(parse_config_bool("yes").unwrap());
+        assert!(parse_config_bool("on").unwrap());
+        assert!(!parse_config_bool("false").unwrap());
+        assert!(!parse_config_bool("0").unwrap());
+        assert!(!parse_config_bool("no").unwrap());
+        assert!(!parse_config_bool("off").unwrap());
+        assert!(parse_config_bool("invalid").is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 
+use crate::db::USER_INVITATION_REBATE_ENABLED_KEY;
 use crate::error::{AppError, Result};
 use crate::middleware::AdminUser;
 use crate::rebate_lifecycle::{
@@ -55,6 +56,7 @@ pub struct UserGroup {
 pub struct SystemConfig {
     pub min_rebate_request_amount: i64,
     pub rebate_request_frequency_days: i64,
+    pub user_invitation_rebate_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -407,10 +409,13 @@ pub async fn get_system_config(
 ) -> Result<Json<ApiResponse<SystemConfig>>> {
     let min_amount = get_config_value(&state.pool, "min_rebate_request_amount").await?;
     let frequency_days = get_config_value(&state.pool, "rebate_request_frequency_days").await?;
+    let user_invitation_rebate_enabled =
+        get_config_bool_value(&state.pool, USER_INVITATION_REBATE_ENABLED_KEY).await?;
 
     Ok(ok(SystemConfig {
         min_rebate_request_amount: quota_to_cents(min_amount),
         rebate_request_frequency_days: frequency_days,
+        user_invitation_rebate_enabled,
     }))
 }
 
@@ -445,6 +450,18 @@ pub async fn update_system_config(
         "rebate_request_frequency_days",
         &config.rebate_request_frequency_days.to_string(),
         "返利申请频率限制（天数）",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        USER_INVITATION_REBATE_ENABLED_KEY,
+        if config.user_invitation_rebate_enabled {
+            "true"
+        } else {
+            "false"
+        },
+        "用户侧邀请返利界面开关",
         now,
     )
     .await?;
@@ -1525,6 +1542,23 @@ async fn get_config_value(pool: &sqlx::PgPool, key: &str) -> Result<i64> {
     value
         .parse::<i64>()
         .map_err(|_| AppError::Internal("配置值格式错误".to_string()))
+}
+
+async fn get_config_bool_value(pool: &sqlx::PgPool, key: &str) -> Result<bool> {
+    let value: String = sqlx::query_scalar("SELECT value FROM system_config WHERE key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await?;
+
+    parse_config_bool(&value)
+}
+
+fn parse_config_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(AppError::Internal("配置值格式错误".to_string())),
+    }
 }
 
 async fn upsert_config_value(

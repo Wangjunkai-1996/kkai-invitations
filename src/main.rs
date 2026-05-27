@@ -48,6 +48,10 @@ async fn main() {
     let mut app = Router::new()
         // 用户 API
         .route(
+            &format!("{b}/api/invitations/status"),
+            get(routes::user::invitation_feature_status),
+        )
+        .route(
             &format!("{b}/api/invitations/my-code"),
             get(routes::user::my_code),
         )
