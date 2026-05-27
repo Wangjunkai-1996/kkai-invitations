@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::error::{AppError, Result};
+use crate::rebate_lifecycle::{
+    finalize_ready_initializing_records, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+};
 use crate::response::{message, ApiResponse};
 use crate::AppState;
-
-const QUOTA_UNITS_PER_YUAN: f64 = 500_000.0;
 
 // POST /api/system/sync-rebates
 pub async fn sync_rebates(
@@ -21,6 +22,12 @@ pub async fn sync_rebates(
     let now = chrono::Utc::now().timestamp();
     tracing::info!("Starting rebate sync");
 
+    let finalized = finalize_ready_initializing_records(&state.pool, now).await?;
+    tracing::info!(
+        finalized_count = finalized,
+        "Initializing rebate records finalized"
+    );
+
     let topup_synced = sync_topup_orders(&state, now).await?;
     tracing::info!(synced_count = topup_synced, "Topup orders synced");
 
@@ -32,6 +39,7 @@ pub async fn sync_rebates(
 
     Ok(message(
         SyncResponse {
+            finalized,
             topup_synced,
             subscription_synced,
         },
@@ -46,6 +54,7 @@ pub struct SyncParams {
 
 #[derive(Serialize)]
 pub struct SyncResponse {
+    pub finalized: i64,
     pub topup_synced: i64,
     pub subscription_synced: i64,
 }
@@ -58,6 +67,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
             t.id,
             t.user_id,
             t.money,
+            COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS order_time,
             u.inviter_id,
             u."group"
         FROM top_ups t
@@ -86,6 +96,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
         let order_id: i64 = order.try_get("id")?;
         let user_id: i64 = order.try_get("user_id")?;
         let money: f64 = order.try_get("money")?;
+        let order_time: i64 = order.try_get("order_time")?;
         let inviter_id: i64 = order.try_get("inviter_id")?;
         let group: Option<String> = order.try_get("group")?;
 
@@ -97,6 +108,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
                 user_id,
                 inviter_id,
                 money,
+                order_time,
                 group: group.as_deref().unwrap_or("default"),
                 now,
             },
@@ -109,15 +121,6 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
             }
             InsertOutcome::Duplicate => {
                 max_processed_id = order_id;
-            }
-            InsertOutcome::MissingRule => {
-                tracing::warn!(
-                    order_type = "topup",
-                    order_id,
-                    group = group.as_deref().unwrap_or("default"),
-                    "Stopping topup sync before checkpoint because rebate rule is missing"
-                );
-                break;
             }
         }
     }
@@ -134,6 +137,7 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
             s.id,
             s.user_id,
             s.money,
+            COALESCE(NULLIF(s.complete_time, 0), NULLIF(s.create_time, 0), 0) AS order_time,
             u.inviter_id,
             u."group"
         FROM subscription_orders s
@@ -157,6 +161,7 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
         let order_id: i64 = order.try_get("id")?;
         let user_id: i64 = order.try_get("user_id")?;
         let money: f64 = order.try_get("money")?;
+        let order_time: i64 = order.try_get("order_time")?;
         let inviter_id: i64 = order.try_get("inviter_id")?;
         let group: Option<String> = order.try_get("group")?;
 
@@ -168,6 +173,7 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
                 user_id,
                 inviter_id,
                 money,
+                order_time,
                 group: group.as_deref().unwrap_or("default"),
                 now,
             },
@@ -181,15 +187,6 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
             InsertOutcome::Duplicate => {
                 max_processed_id = order_id;
             }
-            InsertOutcome::MissingRule => {
-                tracing::warn!(
-                    order_type = "subscription",
-                    order_id,
-                    group = group.as_deref().unwrap_or("default"),
-                    "Stopping subscription sync before checkpoint because rebate rule is missing"
-                );
-                break;
-            }
         }
     }
 
@@ -201,7 +198,6 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
 enum InsertOutcome {
     Inserted,
     Duplicate,
-    MissingRule,
 }
 
 struct InsertRebateRecord<'a> {
@@ -210,6 +206,7 @@ struct InsertRebateRecord<'a> {
     user_id: i64,
     inviter_id: i64,
     money: f64,
+    order_time: i64,
     group: &'a str,
     now: i64,
 }
@@ -218,39 +215,39 @@ async fn insert_rebate_record(
     state: &AppState,
     params: InsertRebateRecord<'_>,
 ) -> Result<InsertOutcome> {
-    let rule = sqlx::query(
-        "SELECT rebate_rate FROM rebate_rules WHERE user_group = $1 AND rule_type = $2",
-    )
-    .bind(params.group)
-    .bind(params.order_type)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let Some(rule_row) = rule else {
-        return Ok(InsertOutcome::MissingRule);
-    };
-
-    let rebate_rate: f64 = rule_row.try_get("rebate_rate")?;
-    let rebate_amount = (params.money * rebate_rate * QUOTA_UNITS_PER_YUAN).round() as i64;
     let ulid = ulid::Ulid::new().to_string();
+    let order_time = if params.order_time > 0 {
+        params.order_time
+    } else {
+        params.now
+    };
+    let scan_started_at = params.now;
+    let initialization_ends_at = scan_started_at + INITIALIZATION_SECONDS;
+    let rebate_effective_at = order_time + REBATE_EFFECTIVE_DELAY_SECONDS;
 
     let result = sqlx::query(
         r#"
         INSERT INTO rebate_records
-        (ulid, inviter_id, invitee_id, order_type, order_id, order_amount, rebate_amount, rebate_rate, status, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $9)
+        (
+            ulid, inviter_id, invitee_id, user_group, order_type, order_id,
+            order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+            status, scan_started_at, initialization_ends_at, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NULL, 'initializing', $10, $11, $10, $10)
         ON CONFLICT (order_type, order_id) DO NOTHING
         "#,
     )
     .bind(&ulid)
     .bind(params.inviter_id)
     .bind(params.user_id)
+    .bind(params.group)
     .bind(params.order_type)
     .bind(params.order_id)
     .bind(params.money)
-    .bind(rebate_amount)
-    .bind(rebate_rate)
-    .bind(params.now)
+    .bind(order_time)
+    .bind(rebate_effective_at)
+    .bind(scan_started_at)
+    .bind(initialization_ends_at)
     .execute(&state.pool)
     .await?;
 

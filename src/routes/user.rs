@@ -24,7 +24,7 @@ pub struct InvitationStats {
     pub invited_count: i64,
     pub total_rebate: i64,
     pub completed_rebate: i64,
-    pub pending_withdrawal: i64,
+    pub pending_rebate: i64,
 }
 
 #[derive(Serialize)]
@@ -36,22 +36,25 @@ pub struct RebateRecord {
     pub order_type: String,
     pub order_amount: i64,
     pub rebate_amount: i64,
-    pub rebate_ratio: f64,
+    pub rebate_ratio: Option<f64>,
     pub status: String,
+    pub display_status: String,
+    pub effective_at: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Deserialize)]
-pub struct WithdrawalRequest {
+#[serde(rename_all = "camelCase")]
+pub struct RebateRequest {
     pub amount: Option<i64>,
-    #[serde(default, alias = "rebateRecordIds")]
+    #[serde(default)]
     pub rebate_record_ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WithdrawalRequestResponse {
+pub struct RebateRequestResponse {
     pub id: i64,
     pub user_id: i64,
     pub amount: i64,
@@ -74,7 +77,7 @@ pub struct AvailableRebates {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WithdrawalSubmitResponse {
+pub struct RebateRequestSubmitResponse {
     pub id: i64,
     pub request_id: i64,
     pub amount: i64,
@@ -82,9 +85,9 @@ pub struct WithdrawalSubmitResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PaginationParams {
     pub page: Option<i64>,
-    #[serde(alias = "pageSize")]
     pub page_size: Option<i64>,
     pub status: Option<String>,
 }
@@ -113,7 +116,7 @@ impl PaginationParams {
         }
     }
 
-    fn withdrawal_status_filter(&self) -> Option<&str> {
+    fn rebate_request_status_filter(&self) -> Option<&str> {
         match self.status.as_deref() {
             Some("pending" | "approved" | "completed" | "rejected") => self.status.as_deref(),
             _ => None,
@@ -144,9 +147,9 @@ pub async fn my_code(
         SELECT
             COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
             COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
-            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_withdrawal
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_rebate
         FROM rebate_records
-        WHERE inviter_id = $1
+        WHERE inviter_id = $1 AND status NOT IN ('initializing', 'closed')
         "#,
     )
     .bind(user.id)
@@ -158,7 +161,7 @@ pub async fn my_code(
         invited_count,
         total_rebate: quota_to_cents(stats.try_get("total")?),
         completed_rebate: quota_to_cents(stats.try_get("completed")?),
-        pending_withdrawal: quota_to_cents(stats.try_get("pending_withdrawal")?),
+        pending_rebate: quota_to_cents(stats.try_get("pending_rebate")?),
     }))
 }
 
@@ -172,13 +175,19 @@ pub async fn rebate_records(
         &state.pool,
         Some(user.id),
         params.rebate_status_filter(),
+        true,
         params.page_size(),
         params.offset(),
     )
     .await?;
 
-    let total =
-        count_rebate_records(&state.pool, Some(user.id), params.rebate_status_filter()).await?;
+    let total = count_rebate_records(
+        &state.pool,
+        Some(user.id),
+        params.rebate_status_filter(),
+        true,
+    )
+    .await?;
 
     Ok(ok(PaginatedResponse {
         items: records,
@@ -197,11 +206,16 @@ pub async fn available_rebates(
         r#"
         SELECT id, rebate_amount
         FROM rebate_records
-        WHERE inviter_id = $1 AND status = 'pending'
+        WHERE inviter_id = $1
+          AND status = 'pending'
+          AND rebate_effective_at <= $2
+          AND rebate_amount > 0
+          AND rebate_rate IS NOT NULL
         ORDER BY created_at DESC
         "#,
     )
     .bind(user.id)
+    .bind(Utc::now().timestamp())
     .fetch_all(&state.pool)
     .await?;
 
@@ -215,30 +229,30 @@ pub async fn available_rebates(
     Ok(ok(AvailableRebates { amount, record_ids }))
 }
 
-// POST /api/invitations/request-withdrawal
-pub async fn request_withdrawal(
+// POST /api/invitations/rebate-requests
+pub async fn request_rebate(
     State(state): State<AppState>,
     user: SessionUser,
-    Json(req): Json<WithdrawalRequest>,
-) -> Result<Json<ApiResponse<WithdrawalSubmitResponse>>> {
+    Json(req): Json<RebateRequest>,
+) -> Result<Json<ApiResponse<RebateRequestSubmitResponse>>> {
     let rebate_record_ids = unique_ids(&req.rebate_record_ids)?;
     if rebate_record_ids.is_empty() {
-        return Err(AppError::BadRequest("请选择要提现的返利记录".to_string()));
+        return Err(AppError::BadRequest("请选择要返利的记录".to_string()));
     }
 
     tracing::info!(
         user_id = user.id,
         rebate_record_count = rebate_record_ids.len(),
-        "User requesting withdrawal"
+        "User requesting rebate to balance"
     );
 
     let mut tx = state.pool.begin().await?;
-    let min_amount = get_config_value_tx(&mut tx, "min_withdrawal_amount").await?;
-    let frequency_days = get_config_value_tx(&mut tx, "withdrawal_frequency_days").await?;
+    let min_amount = get_config_value_tx(&mut tx, "min_rebate_request_amount").await?;
+    let frequency_days = get_config_value_tx(&mut tx, "rebate_request_frequency_days").await?;
     let now = Utc::now().timestamp();
 
     let last_request_time: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(created_at) FROM withdrawal_requests WHERE user_id = $1 AND status != 'rejected'",
+        "SELECT MAX(created_at) FROM rebate_requests WHERE user_id = $1 AND status != 'rejected'",
     )
     .bind(user.id)
     .fetch_optional(&mut *tx)
@@ -252,10 +266,10 @@ pub async fn request_withdrawal(
                 user_id = user.id,
                 days_since,
                 frequency_days,
-                "Withdrawal request rejected: too frequent"
+                "Rebate request rejected: too frequent"
             );
             return Err(AppError::BadRequest(format!(
-                "提现申请过于频繁，请等待 {} 天后再试",
+                "返利申请过于频繁，请等待 {} 天后再试",
                 frequency_days - days_since
             )));
         }
@@ -263,7 +277,7 @@ pub async fn request_withdrawal(
 
     let rows = sqlx::query(
         r#"
-        SELECT id, rebate_amount, status
+        SELECT id, rebate_amount, rebate_rate::TEXT AS rebate_rate, rebate_effective_at, status
         FROM rebate_records
         WHERE id = ANY($1) AND inviter_id = $2
         ORDER BY id
@@ -286,6 +300,14 @@ pub async fn request_withdrawal(
         if status != "pending" {
             return Err(AppError::BadRequest("部分返利记录状态不正确".to_string()));
         }
+        let rebate_rate: Option<String> = row.try_get("rebate_rate")?;
+        let rebate_amount: i64 = row.try_get("rebate_amount")?;
+        let rebate_effective_at: i64 = row.try_get("rebate_effective_at")?;
+        if rebate_rate.is_none() || rebate_amount <= 0 || rebate_effective_at > now {
+            return Err(AppError::BadRequest(
+                "部分返利记录尚未达到可返利条件".to_string(),
+            ));
+        }
     }
 
     let total_amount: i64 = rows
@@ -297,7 +319,7 @@ pub async fn request_withdrawal(
 
     if total_amount < min_amount {
         return Err(AppError::BadRequest(format!(
-            "提现金额不足最低限额 {}",
+            "返利金额不足最低申请金额 {}",
             quota_to_cents(min_amount)
         )));
     }
@@ -309,14 +331,14 @@ pub async fn request_withdrawal(
                 user_id = user.id,
                 requested_cents,
                 computed_cents,
-                "Ignoring client supplied withdrawal amount"
+                "Ignoring client supplied rebate amount"
             );
         }
     }
 
     let request_id: i64 = sqlx::query_scalar(
         r#"
-        INSERT INTO withdrawal_requests (user_id, rebate_record_ids, total_amount, status, created_at, updated_at)
+        INSERT INTO rebate_requests (user_id, rebate_record_ids, total_amount, status, created_at, updated_at)
         VALUES ($1, $2, $3, 'pending', $4, $4)
         RETURNING id
         "#,
@@ -350,29 +372,29 @@ pub async fn request_withdrawal(
         user_id = user.id,
         request_id,
         total_amount,
-        "Withdrawal request submitted"
+        "Rebate request submitted"
     );
 
     Ok(message(
-        WithdrawalSubmitResponse {
+        RebateRequestSubmitResponse {
             id: request_id,
             request_id,
             amount: quota_to_cents(total_amount),
             rebate_record_ids,
         },
-        "提现申请已提交",
+        "返利申请已提交",
     ))
 }
 
-// GET /api/invitations/my-requests
-pub async fn my_requests(
+// GET /api/invitations/rebate-requests
+pub async fn my_rebate_requests(
     State(state): State<AppState>,
     user: SessionUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<ApiResponse<PaginatedResponse<WithdrawalRequestResponse>>>> {
-    let status = params.withdrawal_status_filter();
-    let total = count_user_withdrawal_requests(&state.pool, user.id, status).await?;
-    let rows = fetch_user_withdrawal_requests(
+) -> Result<Json<ApiResponse<PaginatedResponse<RebateRequestResponse>>>> {
+    let status = params.rebate_request_status_filter();
+    let total = count_user_rebate_requests(&state.pool, user.id, status).await?;
+    let rows = fetch_user_rebate_requests(
         &state.pool,
         user.id,
         status,
@@ -383,7 +405,7 @@ pub async fn my_requests(
 
     let requests = rows
         .iter()
-        .map(withdrawal_response_from_row)
+        .map(rebate_request_response_from_row)
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ok(PaginatedResponse {
@@ -394,21 +416,21 @@ pub async fn my_requests(
     }))
 }
 
-async fn count_user_withdrawal_requests(
+async fn count_user_rebate_requests(
     pool: &PgPool,
     user_id: i64,
     status: Option<&str>,
 ) -> Result<i64> {
     let total = if let Some(status) = status {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM withdrawal_requests WHERE user_id = $1 AND status = $2",
+            "SELECT COUNT(*) FROM rebate_requests WHERE user_id = $1 AND status = $2",
         )
         .bind(user_id)
         .bind(status)
         .fetch_one(pool)
         .await?
     } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM withdrawal_requests WHERE user_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM rebate_requests WHERE user_id = $1")
             .bind(user_id)
             .fetch_one(pool)
             .await?
@@ -417,7 +439,7 @@ async fn count_user_withdrawal_requests(
     Ok(total)
 }
 
-async fn fetch_user_withdrawal_requests(
+async fn fetch_user_rebate_requests(
     pool: &PgPool,
     user_id: i64,
     status: Option<&str>,
@@ -429,7 +451,7 @@ async fn fetch_user_withdrawal_requests(
             r#"
             SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
                    approved_at, completed_at, rejected_at, admin_note
-            FROM withdrawal_requests
+            FROM rebate_requests
             WHERE user_id = $1 AND status = $2
             ORDER BY created_at DESC
             LIMIT $3 OFFSET $4
@@ -446,7 +468,7 @@ async fn fetch_user_withdrawal_requests(
             r#"
             SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
                    approved_at, completed_at, rejected_at, admin_note
-            FROM withdrawal_requests
+            FROM rebate_requests
             WHERE user_id = $1
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -466,115 +488,57 @@ pub async fn fetch_rebate_records(
     pool: &PgPool,
     inviter_id: Option<i64>,
     status: Option<&str>,
+    visible_only: bool,
     page_size: i64,
     offset: i64,
 ) -> Result<Vec<RebateRecord>> {
-    let rows = match (inviter_id, status) {
-        (Some(inviter_id), Some(status)) => {
-            sqlx::query(
-                r#"
-                SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-                       rebate_amount, rebate_rate::TEXT as rebate_rate, created_at, updated_at, status
-                FROM rebate_records
-                WHERE inviter_id = $1 AND status = $2
-                ORDER BY created_at DESC
-                LIMIT $3 OFFSET $4
-                "#,
-            )
-                .bind(inviter_id)
-                .bind(status)
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(pool)
-                .await?
-        }
-        (Some(inviter_id), None) => {
-            sqlx::query(
-                r#"
-                SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-                       rebate_amount, rebate_rate::TEXT as rebate_rate, created_at, updated_at, status
-                FROM rebate_records
-                WHERE inviter_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-                .bind(inviter_id)
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(pool)
-                .await?
-        }
-        (None, Some(status)) => {
-            sqlx::query(
-                r#"
-                SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-                       rebate_amount, rebate_rate::TEXT as rebate_rate, created_at, updated_at, status
-                FROM rebate_records
-                WHERE status = $1
-                ORDER BY created_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-                .bind(status)
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(pool)
-                .await?
-        }
-        (None, None) => {
-            sqlx::query(
-                r#"
-                SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-                       rebate_amount, rebate_rate::TEXT as rebate_rate, created_at, updated_at, status
-                FROM rebate_records
-                ORDER BY created_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(pool)
-                .await?
-        }
-    };
+    let rows = sqlx::query(
+        r#"
+        SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
+               rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
+               created_at, updated_at, status
+        FROM rebate_records
+        WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
+          AND ($2::TEXT IS NULL OR status = $2)
+          AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
+        ORDER BY created_at DESC
+        LIMIT $4 OFFSET $5
+        "#,
+    )
+    .bind(inviter_id)
+    .bind(status)
+    .bind(visible_only)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
 
-    rows.iter().map(rebate_record_from_row).collect()
+    let now = Utc::now().timestamp();
+    rows.iter()
+        .map(|row| rebate_record_from_row(row, now))
+        .collect()
 }
 
 pub async fn count_rebate_records(
     pool: &PgPool,
     inviter_id: Option<i64>,
     status: Option<&str>,
+    visible_only: bool,
 ) -> Result<i64> {
-    let total = match (inviter_id, status) {
-        (Some(inviter_id), Some(status)) => {
-            sqlx::query_scalar(
-                "SELECT COUNT(*) FROM rebate_records WHERE inviter_id = $1 AND status = $2",
-            )
-            .bind(inviter_id)
-            .bind(status)
-            .fetch_one(pool)
-            .await?
-        }
-        (Some(inviter_id), None) => {
-            sqlx::query_scalar("SELECT COUNT(*) FROM rebate_records WHERE inviter_id = $1")
-                .bind(inviter_id)
-                .fetch_one(pool)
-                .await?
-        }
-        (None, Some(status)) => {
-            sqlx::query_scalar("SELECT COUNT(*) FROM rebate_records WHERE status = $1")
-                .bind(status)
-                .fetch_one(pool)
-                .await?
-        }
-        (None, None) => {
-            sqlx::query_scalar("SELECT COUNT(*) FROM rebate_records")
-                .fetch_one(pool)
-                .await?
-        }
-    };
+    let total = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM rebate_records
+        WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
+          AND ($2::TEXT IS NULL OR status = $2)
+          AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
+        "#,
+    )
+    .bind(inviter_id)
+    .bind(status)
+    .bind(visible_only)
+    .fetch_one(pool)
+    .await?;
 
     Ok(total)
 }
@@ -587,7 +551,14 @@ pub fn cents_to_quota(amount: i64) -> i64 {
     (amount * QUOTA_UNITS_PER_YUAN + CENTS_PER_YUAN / 2) / CENTS_PER_YUAN
 }
 
-fn rebate_record_from_row(row: &PgRow) -> Result<RebateRecord> {
+fn rebate_record_from_row(row: &PgRow, now: i64) -> Result<RebateRecord> {
+    let rebate_rate: Option<String> = row.try_get("rebate_rate")?;
+    let rebate_effective_at: i64 = row.try_get("rebate_effective_at")?;
+    let status: String = row.try_get("status")?;
+    let display_status =
+        derive_rebate_display_status(&status, now, rebate_effective_at, rebate_rate.is_none())
+            .to_string();
+
     Ok(RebateRecord {
         id: row.try_get("id")?,
         ulid: row.try_get("ulid")?,
@@ -595,15 +566,36 @@ fn rebate_record_from_row(row: &PgRow) -> Result<RebateRecord> {
         order_type: row.try_get("order_type")?,
         order_amount: yuan_text_to_cents(row.try_get("order_amount")?),
         rebate_amount: quota_to_cents(row.try_get("rebate_amount")?),
-        rebate_ratio: text_to_f64(row.try_get("rebate_rate")?),
+        rebate_ratio: rebate_rate.map(text_to_f64),
+        status,
+        display_status,
+        effective_at: timestamp_to_iso(rebate_effective_at),
         created_at: timestamp_to_iso(row.try_get("created_at")?),
         updated_at: timestamp_to_iso(row.try_get("updated_at")?),
-        status: row.try_get("status")?,
     })
 }
 
-fn withdrawal_response_from_row(row: &PgRow) -> Result<WithdrawalRequestResponse> {
-    Ok(WithdrawalRequestResponse {
+fn derive_rebate_display_status(
+    status: &str,
+    now: i64,
+    effective_at: i64,
+    rule_missing: bool,
+) -> &'static str {
+    match status {
+        "requested" | "approved" | "completed" => "paid",
+        "pending" | "rejected" => {
+            if rule_missing || now < effective_at {
+                "estimated"
+            } else {
+                "claimable"
+            }
+        }
+        _ => "estimated",
+    }
+}
+
+fn rebate_request_response_from_row(row: &PgRow) -> Result<RebateRequestResponse> {
+    Ok(RebateRequestResponse {
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
         amount: quota_to_cents(row.try_get("total_amount")?),
@@ -679,8 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_camel_case_withdrawal_request_ids() {
-        let req: WithdrawalRequest =
+    fn accepts_camel_case_rebate_request_ids() {
+        let req: RebateRequest =
             serde_json::from_str(r#"{"amount":500,"rebateRecordIds":[2,1]}"#).unwrap();
 
         assert_eq!(req.amount, Some(500));
@@ -688,22 +680,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_withdrawal_request_ids() {
-        let req: WithdrawalRequest =
-            serde_json::from_str(r#"{"rebate_record_ids":[1,1]}"#).unwrap();
+    fn rejects_duplicate_rebate_request_ids() {
+        let req: RebateRequest = serde_json::from_str(r#"{"rebateRecordIds":[1,1]}"#).unwrap();
 
         assert!(unique_ids(&req.rebate_record_ids).is_err());
     }
 
     #[test]
-    fn separates_rebate_and_withdrawal_status_filters() {
+    fn separates_rebate_and_rebate_request_status_filters() {
         let requested = PaginationParams {
             page: None,
             page_size: None,
             status: Some("requested".to_string()),
         };
         assert_eq!(requested.rebate_status_filter(), Some("requested"));
-        assert_eq!(requested.withdrawal_status_filter(), None);
+        assert_eq!(requested.rebate_request_status_filter(), None);
 
         let rejected = PaginationParams {
             page: None,
@@ -711,6 +702,26 @@ mod tests {
             status: Some("rejected".to_string()),
         };
         assert_eq!(rejected.rebate_status_filter(), Some("rejected"));
-        assert_eq!(rejected.withdrawal_status_filter(), Some("rejected"));
+        assert_eq!(rejected.rebate_request_status_filter(), Some("rejected"));
+    }
+
+    #[test]
+    fn derives_user_facing_rebate_statuses() {
+        assert_eq!(
+            derive_rebate_display_status("pending", 1_000, 2_000, false),
+            "estimated"
+        );
+        assert_eq!(
+            derive_rebate_display_status("pending", 2_000, 1_000, false),
+            "claimable"
+        );
+        assert_eq!(
+            derive_rebate_display_status("pending", 2_000, 1_000, true),
+            "estimated"
+        );
+        assert_eq!(
+            derive_rebate_display_status("completed", 1_000, 2_000, false),
+            "paid"
+        );
     }
 }

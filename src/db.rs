@@ -61,12 +61,20 @@ async fn migrate(pool: &PgPool) {
             ulid VARCHAR(26),
             inviter_id BIGINT NOT NULL,
             invitee_id BIGINT NOT NULL,
+            user_group VARCHAR(64) NOT NULL,
             order_type VARCHAR(20) NOT NULL,
             order_id BIGINT NOT NULL,
             order_amount DECIMAL(10,2) NOT NULL,
-            rebate_amount BIGINT NOT NULL,
-            rebate_rate DECIMAL(5,4) NOT NULL,
+            order_time BIGINT NOT NULL,
+            rebate_effective_at BIGINT NOT NULL,
+            rebate_amount BIGINT NOT NULL DEFAULT 0,
+            rebate_rate DECIMAL(5,4),
             status VARCHAR(20) NOT NULL,
+            scan_started_at BIGINT NOT NULL,
+            initialization_ends_at BIGINT NOT NULL,
+            finalized_at BIGINT,
+            admin_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
+            closed_at BIGINT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             UNIQUE(order_type, order_id)
@@ -77,13 +85,6 @@ async fn migrate(pool: &PgPool) {
     .await
     .expect("failed to create rebate_records table");
 
-    // 为现有表添加 ulid 列（如果不存在）
-    sqlx::query("ALTER TABLE rebate_records ADD COLUMN IF NOT EXISTS ulid VARCHAR(26)")
-        .execute(pool)
-        .await
-        .ok();
-
-    // 为 ulid 列添加唯一索引
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_ulid ON rebate_records(ulid)",
     )
@@ -103,16 +104,30 @@ async fn migrate(pool: &PgPool) {
         .await
         .ok();
 
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rebate_records_initialization ON rebate_records(status, initialization_ends_at)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rebate_records_effective ON rebate_records(inviter_id, status, rebate_effective_at)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     // 添加复合索引以优化常见查询
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_records_inviter_status ON rebate_records(inviter_id, status)")
         .execute(pool)
         .await
         .ok();
 
-    // 提现申请表
+    // 返利申请表
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+        CREATE TABLE IF NOT EXISTS rebate_requests (
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
             rebate_record_ids BIGINT[] NOT NULL,
@@ -130,23 +145,14 @@ async fn migrate(pool: &PgPool) {
     )
     .execute(pool)
     .await
-    .expect("failed to create withdrawal_requests table");
+    .expect("failed to create rebate_requests table");
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_user ON withdrawal_requests(user_id)",
-    )
-    .execute(pool)
-    .await
-    .ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_requests_user ON rebate_requests(user_id)")
+        .execute(pool)
+        .await
+        .ok();
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS rejected_at BIGINT")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_requests_status ON rebate_requests(status)")
         .execute(pool)
         .await
         .ok();
@@ -194,8 +200,8 @@ async fn migrate(pool: &PgPool) {
         r#"
         INSERT INTO system_config (key, value, description, updated_at)
         VALUES
-            ('min_withdrawal_amount', '1000000', '最低提现金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ('withdrawal_frequency_days', '7', '提现频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT)
+            ('min_rebate_request_amount', '1000000', '最低返利申请金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ('rebate_request_frequency_days', '7', '返利申请频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT)
         ON CONFLICT (key) DO NOTHING
         "#,
     )

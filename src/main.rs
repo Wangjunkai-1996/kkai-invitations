@@ -2,12 +2,13 @@ mod config;
 mod db;
 mod error;
 mod middleware;
+mod rebate_lifecycle;
 mod response;
 mod routes;
 mod session;
 
 use axum::{
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use sqlx::PgPool;
@@ -59,12 +60,8 @@ async fn main() {
             get(routes::user::available_rebates),
         )
         .route(
-            &format!("{b}/api/invitations/request-withdrawal"),
-            post(routes::user::request_withdrawal),
-        )
-        .route(
-            &format!("{b}/api/invitations/my-requests"),
-            get(routes::user::my_requests),
+            &format!("{b}/api/invitations/rebate-requests"),
+            get(routes::user::my_rebate_requests).post(routes::user::request_rebate),
         )
         // 管理员 API
         .route(
@@ -100,20 +97,20 @@ async fn main() {
             put(routes::admin::update_system_config),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests"),
-            get(routes::admin::get_withdrawal_requests),
+            &format!("{b}/api/admin/rebate-requests"),
+            get(routes::admin::get_rebate_requests),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/{{id}}/approve"),
-            post(routes::admin::approve_withdrawal),
+            &format!("{b}/api/admin/rebate-requests/{{id}}/approve"),
+            post(routes::admin::approve_rebate_request),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/{{id}}/reject"),
-            post(routes::admin::reject_withdrawal),
+            &format!("{b}/api/admin/rebate-requests/{{id}}/reject"),
+            post(routes::admin::reject_rebate_request),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/{{id}}/complete"),
-            post(routes::admin::complete_withdrawal),
+            &format!("{b}/api/admin/rebate-requests/{{id}}/complete"),
+            post(routes::admin::complete_rebate_request),
         )
         .route(
             &format!("{b}/api/admin/rebate-stats"),
@@ -122,6 +119,22 @@ async fn main() {
         .route(
             &format!("{b}/api/admin/rebate-order-records"),
             get(routes::admin::get_rebate_order_records),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-order-records"),
+            patch(routes::admin::update_rebate_order_records),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-order-records/close"),
+            post(routes::admin::close_rebate_order_records),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-order-records/end-initialization"),
+            post(routes::admin::end_rebate_order_initialization),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-order-records/extend-initialization"),
+            post(routes::admin::extend_rebate_order_initialization),
         )
         .route(
             &format!("{b}/api/admin/user-rebates/{{user_id}}"),
