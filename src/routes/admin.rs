@@ -116,6 +116,7 @@ pub struct AdminRebateOrderRecord {
     pub admin_adjusted: bool,
     pub can_modify: bool,
     pub can_close: bool,
+    pub can_reopen: bool,
     pub can_end_initialization: bool,
     pub can_extend_initialization: bool,
 }
@@ -899,6 +900,51 @@ pub async fn close_rebate_order_records(
     ))
 }
 
+// POST /api/admin/rebate-order-records/reopen
+pub async fn reopen_rebate_order_records(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Json(req): Json<RebateOrderRecordIdsRequest>,
+) -> Result<Json<ApiResponse<RebateOrderRecordBatchResponse>>> {
+    let record_ids = validate_record_ids(&req.record_ids)?;
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+    let rows = lock_rebate_records(&mut tx, &record_ids).await?;
+    validate_operation_rows(&rows, &record_ids, |status| status == "closed")?;
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE rebate_records
+        SET status = CASE
+                WHEN finalized_at IS NULL THEN 'initializing'
+                ELSE 'pending'
+            END,
+            closed_at = NULL,
+            updated_at = $1
+        WHERE id = ANY($2)
+        "#,
+    )
+    .bind(now)
+    .bind(&record_ids)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() as i64;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        record_count = record_ids.len(),
+        updated,
+        "Admin reopened rebate order records"
+    );
+
+    Ok(message(
+        RebateOrderRecordBatchResponse { updated },
+        "返利订单已开启",
+    ))
+}
+
 // POST /api/admin/rebate-order-records/end-initialization
 pub async fn end_rebate_order_initialization(
     State(state): State<AppState>,
@@ -956,10 +1002,11 @@ pub async fn extend_rebate_order_initialization(
     .fetch_all(&mut *tx)
     .await?;
 
-    validate_operation_rows(&rows, &record_ids, |status| status == "initializing")?;
+    validate_operation_rows(&rows, &record_ids, can_extend_initialization)?;
     for row in &rows {
         let current_ends_at: i64 = row.try_get("initialization_ends_at")?;
-        if req.initialization_ends_at <= current_ends_at {
+        let status: String = row.try_get("status")?;
+        if status == "initializing" && req.initialization_ends_at <= current_ends_at {
             return Err(AppError::BadRequest(
                 "新的初始化结束时间必须晚于当前初始化结束时间".to_string(),
             ));
@@ -969,7 +1016,10 @@ pub async fn extend_rebate_order_initialization(
     let updated = sqlx::query(
         r#"
         UPDATE rebate_records
-        SET initialization_ends_at = $1, updated_at = $2
+        SET status = 'initializing',
+            initialization_ends_at = $1,
+            finalized_at = NULL,
+            updated_at = $2
         WHERE id = ANY($3)
         "#,
     )
@@ -1385,11 +1435,14 @@ fn admin_rebate_order_record_from_parts(
         can_close: local_record
             .map(|record| is_rebate_record_mutable(&record.status))
             .unwrap_or(false),
+        can_reopen: local_record
+            .map(|record| record.status == "closed")
+            .unwrap_or(false),
         can_end_initialization: local_record
             .map(|record| record.status == "initializing")
             .unwrap_or(false),
         can_extend_initialization: local_record
-            .map(|record| record.status == "initializing")
+            .map(|record| can_extend_initialization(&record.status))
             .unwrap_or(false),
     }
 }
@@ -1677,6 +1730,10 @@ fn is_rebate_record_mutable(status: &str) -> bool {
     matches!(status, "initializing" | "pending" | "rejected")
 }
 
+fn can_extend_initialization(status: &str) -> bool {
+    matches!(status, "initializing" | "pending" | "rejected")
+}
+
 fn validate_rebate_ratio(ratio: f64) -> Result<()> {
     if !(0.0..=1.0).contains(&ratio) {
         return Err(AppError::BadRequest("返利比例必须在 0-1 之间".to_string()));
@@ -1803,5 +1860,16 @@ mod tests {
             derive_admin_rebate_status(2_000, 1_000, false, "closed"),
             "closed"
         );
+    }
+
+    #[test]
+    fn allows_extend_initialization_for_mutable_records() {
+        assert!(can_extend_initialization("initializing"));
+        assert!(can_extend_initialization("pending"));
+        assert!(can_extend_initialization("rejected"));
+        assert!(!can_extend_initialization("closed"));
+        assert!(!can_extend_initialization("requested"));
+        assert!(!can_extend_initialization("approved"));
+        assert!(!can_extend_initialization("completed"));
     }
 }

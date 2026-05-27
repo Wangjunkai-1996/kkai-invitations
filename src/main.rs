@@ -129,6 +129,10 @@ async fn main() {
             post(routes::admin::close_rebate_order_records),
         )
         .route(
+            &format!("{b}/api/admin/rebate-order-records/reopen"),
+            post(routes::admin::reopen_rebate_order_records),
+        )
+        .route(
             &format!("{b}/api/admin/rebate-order-records/end-initialization"),
             post(routes::admin::end_rebate_order_initialization),
         )
