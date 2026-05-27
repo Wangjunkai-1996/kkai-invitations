@@ -56,11 +56,11 @@ VALUES ($1, $2, $3, $4, $5, ...)
 pub struct RebateRecord {
     pub id: i64,
     pub ulid: Option<String>,  // 新增
-    pub order_type: String,
-    pub order_amount: String,
-    pub rebate_amount: i64,
-    pub rebate_rate: String,
-    pub created_at: i64,
+    pub order_type: String,    // API 输出为 orderType
+    pub order_amount: i64,     // API 输出为 orderAmount，单位：人民币分
+    pub rebate_amount: i64,    // API 输出为 rebateAmount，单位：人民币分
+    pub rebate_ratio: f64,     // API 输出为 rebateRatio
+    pub created_at: String,    // API 输出为 createdAt，ISO 时间
     pub status: String,
 }
 ```
@@ -89,7 +89,7 @@ pub struct RebateRecord {
 
 - 新同步的记录会自动生成 ULID
 - 历史记录的 `ulid` 字段保持为 `NULL`
-- API 响应中 `ulid` 字段类型为 `Option<String>`，兼容 NULL 值
+- API 响应中 `ulid` 字段可为 `null`，兼容历史记录
 
 如需为历史记录补充 ULID，可执行以下 SQL（可选）：
 
@@ -106,11 +106,11 @@ pub struct RebateRecord {
 {
   "id": 123,
   "ulid": "01HQZX3Y4K5M6N7P8Q9R0S1T2U",
-  "order_type": "topup",
-  "order_amount": "100.00",
-  "rebate_amount": 2500000,
-  "rebate_rate": "0.0500",
-  "created_at": 1735689600,
+  "orderType": "topup",
+  "orderAmount": 10000,
+  "rebateAmount": 500,
+  "rebateRatio": 0.05,
+  "createdAt": "2025-01-01T00:00:00+00:00",
   "status": "pending"
 }
 ```
@@ -121,11 +121,11 @@ pub struct RebateRecord {
 {
   "id": 100,
   "ulid": null,
-  "order_type": "subscription",
-  "order_amount": "50.00",
-  "rebate_amount": 2500000,
-  "rebate_rate": "0.1000",
-  "created_at": 1735603200,
+  "orderType": "subscription",
+  "orderAmount": 5000,
+  "rebateAmount": 500,
+  "rebateRatio": 0.1,
+  "createdAt": "2024-12-31T00:00:00+00:00",
   "status": "completed"
 }
 ```
@@ -152,16 +152,16 @@ pub struct RebateRecord {
 
 ```bash
 # 编译检查
-cargo check
+cargo check --locked
 
 # 代码检查
-cargo clippy -- -D warnings
+cargo clippy --locked -- -D warnings
 
 # 格式检查
 cargo fmt --check
 
 # 构建
-cargo build --release
+cargo build --release --locked
 ```
 
 所有检查均已通过 ✓

@@ -114,6 +114,7 @@ async fn migrate(pool: &PgPool) {
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             approved_at BIGINT,
+            rejected_at BIGINT,
             completed_at BIGINT
         )
         "#,
@@ -136,6 +137,11 @@ async fn migrate(pool: &PgPool) {
     .await
     .ok();
 
+    sqlx::query("ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS rejected_at BIGINT")
+        .execute(pool)
+        .await
+        .ok();
+
     // 同步日志表
     sqlx::query(
         r#"
@@ -151,6 +157,13 @@ async fn migrate(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("failed to create sync_log table");
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sync_log_type_id ON sync_log(sync_type, last_sync_id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
 
     // 系统配置表
     sqlx::query(

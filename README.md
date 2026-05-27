@@ -38,7 +38,7 @@
 
 ## 前置条件
 
-- Rust 1.85+（edition 2024）
+- Rust 1.85+（项目使用 edition 2021）
 - PostgreSQL 数据库
 - new-api 部署在同一域名下
 - new-api 使用 PostgreSQL 数据库（用于只读查询订单数据）
@@ -56,6 +56,9 @@ cp .env.example .env
 ```env
 # 必须与 new-api 的 SESSION_SECRET 环境变量相同
 SESSION_SECRET=your-new-api-session-secret
+
+# 系统同步接口密钥（cron 需要携带）
+SYNC_SECRET=change-this-random-sync-secret
 
 # Invitations 数据库（读写）
 DATABASE_URL=postgresql://user:password@localhost/invitations
@@ -128,7 +131,7 @@ location /invitations {
 
 ```bash
 # 每小时同步一次
-0 * * * * curl -X POST http://localhost:6212/api/system/sync-rebates
+0 * * * * curl -X POST http://localhost:6212/api/system/sync-rebates -H "X-Sync-Secret: change-this-random-sync-secret"
 ```
 
 或使用 systemd timer：
@@ -153,7 +156,7 @@ Description=Invitations Rebate Sync
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/curl -X POST http://localhost:6212/api/system/sync-rebates
+ExecStart=/usr/bin/curl -X POST http://localhost:6212/api/system/sync-rebates -H "X-Sync-Secret: change-this-random-sync-secret"
 ```
 
 启用定时器：
@@ -208,40 +211,45 @@ curl -X POST http://localhost:6212/api/admin/rebate-rules \
 | POST | `/rebate-rules` | 创建返利规则 |
 | GET | `/user-groups` | 获取用户组列表 |
 | GET | `/system-config` | 获取系统配置 |
-| POST | `/system-config` | 更新系统配置 |
+| PUT/POST | `/system-config` | 更新系统配置 |
 | GET | `/withdrawal-requests` | 获取提现申请列表 |
 | POST | `/withdrawal-requests/:id/approve` | 批准提现申请 |
 | POST | `/withdrawal-requests/:id/reject` | 拒绝提现申请 |
 | POST | `/withdrawal-requests/:id/complete` | 标记提现完成 |
 | GET | `/rebate-stats` | 获取返利统计 |
 | GET | `/user-rebates/:user_id` | 获取用户返利详情 |
+| GET | `/users/:user_id/rebate-details` | 获取用户返利详情（前端兼容路径） |
+| PUT | `/rebate-rules/:id` | 更新返利规则 |
+| DELETE | `/rebate-rules/:id` | 删除返利规则 |
 
 ### 系统 API（`/invitations/api/system/*`）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/sync-rebates` | 手动触发返利同步 |
+| POST | `/sync-rebates` | 手动触发返利同步，需要 `X-Sync-Secret`、`Authorization: Bearer <SYNC_SECRET>` 或 `?secret=` |
 
 ## 数据同步逻辑
 
 ### 订阅返利
-1. 从 new-api 的 `subscriptions` 表读取新订单（`status = 'active'`）
-2. 查找订单用户的 `aff_code`（邀请人）
+1. 从 new-api 的 `subscription_orders` 表读取新订单（`status = 'success'`）
+2. 查找订单用户的 `inviter_id`（邀请人）
 3. 根据邀请人的用户组查找返利规则（`rule_type = 'subscription'`）
-4. 计算返利金额：`订单金额 × 返利比例`
+4. 计算返利金额：`订单金额 × 返利比例 × 500000`（new-api 额度单位）
 5. 创建返利记录（`status = 'pending'`，使用 ULID 防止重复）
 
 ### 充值返利
-1. 从 new-api 的 `topups` 表读取新订单（`status = 'success'`）
-2. 查找订单用户的 `aff_code`（邀请人）
+1. 从 new-api 的 `top_ups` 表读取新订单（`status = 'success'`），并排除已在 `subscription_orders` 中存在的订阅支付镜像记录
+2. 查找订单用户的 `inviter_id`（邀请人）
 3. 根据邀请人的用户组查找返利规则（`rule_type = 'topup'`）
-4. 计算返利金额：`充值金额 × 返利比例`
+4. 计算返利金额：`充值金额 × 返利比例 × 500000`（new-api 额度单位）
 5. 创建返利记录（`status = 'pending'`，使用 ULID 防止重复）
 
 ### 幂等性保证
 - 每条返利记录使用 ULID 作为唯一标识
-- ULID 格式：`{order_type}_{order_id}_{inviter_id}`
-- 同步时检查 ULID 是否已存在，避免重复创建
+- ULID 格式为标准 26 字符 ULID，例如 `01HQZX3Y4K5M6N7P8Q9R0S1T2U`
+- 同步时通过 `(order_type, order_id)` 唯一约束避免重复创建
+- 订阅支付会由 new-api 镜像到 `top_ups`，同步充值订单时会排除这些镜像记录，避免同一订阅按充值和订阅重复返利
+- 如果缺少返利规则，同步不会推进到该订单之后，避免后续补规则时永久跳过订单
 
 ## 提现流程
 
@@ -255,8 +263,9 @@ curl -X POST http://localhost:6212/api/admin/rebate-rules \
 
 - Session cookie 通过 HMAC-SHA256 验证完整性，未通过验证的 cookie 会被拒绝
 - 管理员 API 需要 `role >= 10` 权限
+- 系统同步 API 需要 `SYNC_SECRET`
 - new-api 数据库连接为只读，不会修改 new-api 数据
-- 所有金额以分为单位存储，避免浮点数精度问题
+- 数据库存储的返利金额使用 new-api 额度单位；HTTP API 返回给前端的金额使用人民币分
 - 返利记录使用 ULID 唯一标识，保证幂等性
 
 ## 技术细节

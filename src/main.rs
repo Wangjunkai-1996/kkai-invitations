@@ -2,11 +2,12 @@ mod config;
 mod db;
 mod error;
 mod middleware;
+mod response;
 mod routes;
 mod session;
 
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use sqlx::PgPool;
@@ -75,6 +76,14 @@ async fn main() {
             post(routes::admin::create_rebate_rule),
         )
         .route(
+            &format!("{b}/api/admin/rebate-rules/{{id}}"),
+            put(routes::admin::update_rebate_rule),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-rules/{{id}}"),
+            delete(routes::admin::delete_rebate_rule),
+        )
+        .route(
             &format!("{b}/api/admin/user-groups"),
             get(routes::admin::get_user_groups),
         )
@@ -87,19 +96,23 @@ async fn main() {
             post(routes::admin::update_system_config),
         )
         .route(
+            &format!("{b}/api/admin/system-config"),
+            put(routes::admin::update_system_config),
+        )
+        .route(
             &format!("{b}/api/admin/withdrawal-requests"),
             get(routes::admin::get_withdrawal_requests),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/:id/approve"),
+            &format!("{b}/api/admin/withdrawal-requests/{{id}}/approve"),
             post(routes::admin::approve_withdrawal),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/:id/reject"),
+            &format!("{b}/api/admin/withdrawal-requests/{{id}}/reject"),
             post(routes::admin::reject_withdrawal),
         )
         .route(
-            &format!("{b}/api/admin/withdrawal-requests/:id/complete"),
+            &format!("{b}/api/admin/withdrawal-requests/{{id}}/complete"),
             post(routes::admin::complete_withdrawal),
         )
         .route(
@@ -107,7 +120,11 @@ async fn main() {
             get(routes::admin::get_rebate_stats),
         )
         .route(
-            &format!("{b}/api/admin/user-rebates/:user_id"),
+            &format!("{b}/api/admin/user-rebates/{{user_id}}"),
+            get(routes::admin::get_user_rebates),
+        )
+        .route(
+            &format!("{b}/api/admin/users/{{user_id}}/rebate-details"),
             get(routes::admin::get_user_rebates),
         )
         // 系统 API

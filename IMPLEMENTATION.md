@@ -38,89 +38,50 @@
 - ✅ .env.example - 环境变量示例
 - ✅ PRD.md - 需求文档
 
-## 需要完成的工作
+## 当前状态
 
-### 1. 修复 sqlx 编译问题 ⚠️
+### 1. 编译与 API 合同 ✅
 
-**问题**：sqlx 的 `query!` 和 `query_as!` 宏需要编译时数据库连接。
+- ✅ 已使用 sqlx 运行时查询，编译不需要连接数据库或 `.sqlx/` 离线缓存
+- ✅ 用户和管理员 API 统一返回 `{ success, message, data }`
+- ✅ 后端响应字段适配当前 `new-api/web/default/src/features/invitations` 前端
+- ✅ 补齐管理员规则更新/删除、系统配置 PUT、用户返利详情兼容路径
 
-**解决方案**：有两种选择：
+### 2. 业务正确性修复 ✅
 
-#### 方案 A：使用运行时查询（推荐）
-将所有 `query!` 改为 `query`，`query_as!` 改为 `query_as`，手动处理类型转换。
+- ✅ 提现申请在事务中锁定返利记录，避免并发重复申请
+- ✅ 审批通过时返利记录同步进入 `approved`
+- ✅ 拒绝时返利记录恢复为 `pending`
+- ✅ 完成放款时返利记录进入 `completed`
+- ✅ 同步缺少返利规则时不会推进 checkpoint，避免永久跳过订单
+- ✅ 充值同步会排除 new-api 为订阅支付生成的 `top_ups` 镜像记录，避免订阅订单重复返利
+- ✅ 系统同步接口需要 `SYNC_SECRET`
 
-优点：不需要编译时数据库连接
-缺点：失去编译时类型检查，需要手动处理字段映射
-
-#### 方案 B：配置 sqlx 离线模式
-1. 配置数据库连接
-2. 运行 `cargo sqlx prepare` 生成查询缓存
-3. 提交 `.sqlx/` 目录到版本控制
-
-优点：保留编译时类型检查
-缺点：需要维护查询缓存
-
-### 2. 测试和调试
+### 3. 测试和调试
 
 配置好数据库后需要测试：
-- ✅ 数据库迁移是否正常
-- ✅ Session 验证是否正常
-- ✅ 各个 API 端点是否正常
-- ✅ 返利计算逻辑是否正确
-- ✅ 提现流程是否完整
+- 数据库迁移是否正常
+- Session 验证是否正常
+- 各个 API 端点是否正常
+- 返利计算逻辑是否正确
+- 提现流程是否完整
+- cron 是否携带正确 `SYNC_SECRET`
 
-### 3. 部署配置
+### 4. 部署配置
 
 - ✅ 创建 .env 文件
 - ✅ 配置 Nginx 反向代理
 - ✅ 配置 cron 定时任务
 - ✅ 启动服务
 
-## 快速修复指南
-
-### 修复编译问题（方案 A - 运行时查询）
-
-需要修改以下文件，将编译时宏改为运行时查询：
-
-1. **routes/user.rs** - 10 处修改
-2. **routes/admin.rs** - 15 处修改
-3. **routes/system.rs** - 8 处修改
-
-示例修改：
-
-```rust
-// 修改前（编译时宏）
-let user_info = sqlx::query!(
-    "SELECT aff_code FROM users WHERE id = $1",
-    user.id
-)
-.fetch_optional(&state.newapi_pool)
-.await?;
-
-// 修改后（运行时查询）
-let user_info = sqlx::query("SELECT aff_code FROM users WHERE id = $1")
-    .bind(user.id)
-    .fetch_optional(&state.newapi_pool)
-    .await?;
-
-let aff_code = user_info
-    .and_then(|row| row.try_get::<Option<String>, _>("aff_code").ok())
-    .flatten()
-    .unwrap_or_default();
-```
-
-### 或者使用方案 B（离线模式）
+## 验证命令
 
 ```bash
-# 1. 配置数据库
-export DATABASE_URL="postgresql://user:pass@localhost/invitations"
-export NEWAPI_DATABASE_URL="postgresql://user:pass@localhost/newapi"
-
-# 2. 生成查询缓存
-cargo sqlx prepare
-
-# 3. 编译
-cargo build --release
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked -- -D warnings
+cargo build --release --locked
 ```
 
 ## 项目亮点
@@ -129,12 +90,11 @@ cargo build --release
 2. **安全设计**：只读 new-api 数据库，防止误操作
 3. **灵活配置**：支持按用户组配置返利规则
 4. **完整流程**：从同步订单到审批放款的完整闭环
-5. **防重复机制**：通过唯一索引防止重复申请
+5. **防重复机制**：通过唯一索引防止重复同步，通过事务锁定防止重复申请
 6. **可配置限制**：最低金额和频率限制可由管理员配置
 
 ## 下一步建议
 
-1. **立即**：修复 sqlx 编译问题（选择方案 A 或 B）
-2. **短期**：配置测试环境，验证功能
-3. **中期**：添加前端界面
-4. **长期**：考虑添加更多功能（多级返利、自动通知等）
+1. **短期**：配置测试数据库，跑真实 API/前端联调
+2. **中期**：补充数据库集成测试或 docker compose 测试环境
+3. **长期**：考虑添加更多功能（多级返利、自动通知等）

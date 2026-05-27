@@ -7,6 +7,7 @@ pub struct Config {
     pub database_url: String,
     pub newapi_database_url: String,
     pub session_secret: String,
+    pub sync_secret: Option<String>,
 }
 
 impl Config {
@@ -18,6 +19,10 @@ impl Config {
             newapi_database_url: env::var("NEWAPI_DATABASE_URL")
                 .expect("NEWAPI_DATABASE_URL must be set"),
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),
+            sync_secret: env::var("SYNC_SECRET")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
     }
 }
