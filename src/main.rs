@@ -120,6 +120,10 @@ async fn main() {
             get(routes::admin::get_rebate_stats),
         )
         .route(
+            &format!("{b}/api/admin/rebate-order-records"),
+            get(routes::admin::get_rebate_order_records),
+        )
+        .route(
             &format!("{b}/api/admin/user-rebates/{{user_id}}"),
             get(routes::admin::get_user_rebates),
         )
