@@ -9,7 +9,10 @@ use sqlx::Row;
 
 use crate::error::{AppError, Result};
 use crate::middleware::AdminUser;
-use crate::rebate_lifecycle::{finalize_initializing_records_by_ids, rebate_amount_for_yuan};
+use crate::rebate_lifecycle::{
+    finalize_initializing_records_by_ids, rebate_amount_for_yuan, INITIALIZATION_SECONDS,
+    REBATE_EFFECTIVE_DELAY_SECONDS,
+};
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::routes::user::{
     cents_to_quota, count_rebate_records, fetch_rebate_records, quota_to_cents, PaginationParams,
@@ -173,10 +176,6 @@ struct LocalRebateRecord {
     id: i64,
     order_type: String,
     order_id: i64,
-    inviter_id: i64,
-    invitee_id: i64,
-    user_group: String,
-    order_amount: i64,
     rebate_amount: i64,
     rebate_ratio: Option<f64>,
     status: String,
@@ -187,6 +186,20 @@ struct LocalRebateRecord {
     finalized_at: Option<i64>,
     closed_at: Option<i64>,
     admin_adjusted: bool,
+}
+
+#[derive(Clone)]
+struct NewApiRebateOrder {
+    order_type: String,
+    order_id: i64,
+    inviter_id: i64,
+    inviter_name: Option<String>,
+    invitee_id: i64,
+    invitee_name: Option<String>,
+    user_group: String,
+    order_amount: i64,
+    order_amount_yuan: f64,
+    order_time: i64,
 }
 
 #[derive(Deserialize)]
@@ -652,16 +665,28 @@ pub async fn get_rebate_order_records(
     Query(params): Query<RebateOrderRecordParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<AdminRebateOrderRecord>>>> {
     let order_type = params.order_type_filter();
-    let total = count_local_rebate_order_records(&state, order_type).await?;
-    let local_records =
-        fetch_local_rebate_order_records(&state, order_type, params.page_size(), params.offset())
-            .await?;
-    let user_map = fetch_local_record_user_map(&state, &local_records).await?;
+    let total = count_newapi_rebate_orders(&state, order_type).await?;
+    let orders =
+        fetch_newapi_rebate_orders(&state, order_type, params.page_size(), params.offset()).await?;
     let now = Utc::now().timestamp();
+    let hydrated = hydrate_newapi_rebate_orders(&state, &orders, now).await?;
+    if hydrated > 0 {
+        tracing::info!(
+            hydrated,
+            "Admin rebate order list hydrated local rebate records"
+        );
+    }
+    let local_record_map = fetch_local_rebate_record_map(&state, &orders).await?;
 
-    let records = local_records
+    let records = orders
         .iter()
-        .map(|record| admin_rebate_order_record_from_local(record, &user_map, now))
+        .map(|order| {
+            admin_rebate_order_record_from_parts(
+                order,
+                local_record_map.get(&(order.order_type.clone(), order.order_id)),
+                now,
+            )
+        })
         .collect::<Vec<_>>();
 
     Ok(ok(PaginatedResponse {
@@ -924,39 +949,203 @@ pub async fn get_user_rebates(
     }))
 }
 
-async fn count_local_rebate_order_records(
-    state: &AppState,
-    order_type: Option<&str>,
-) -> Result<i64> {
+async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) -> Result<i64> {
     sqlx::query_scalar(
         r#"
-        SELECT COUNT(*)
-        FROM rebate_records
+        SELECT COUNT(*) FROM (
+            SELECT 'topup'::TEXT AS order_type
+            FROM top_ups t
+            JOIN users u ON t.user_id = u.id
+            WHERE t.status = 'success'
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM subscription_orders s
+                  WHERE s.trade_no = t.trade_no
+              )
+            UNION ALL
+            SELECT 'subscription'::TEXT AS order_type
+            FROM subscription_orders s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.status = 'success'
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
+        ) rebate_orders
         WHERE ($1::TEXT IS NULL OR order_type = $1)
         "#,
     )
     .bind(order_type)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.newapi_pool)
     .await
     .map_err(AppError::from)
 }
 
-async fn fetch_local_rebate_order_records(
+async fn fetch_newapi_rebate_orders(
     state: &AppState,
     order_type: Option<&str>,
     page_size: i64,
     offset: i64,
-) -> Result<Vec<LocalRebateRecord>> {
+) -> Result<Vec<NewApiRebateOrder>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            order_type,
+            order_id,
+            inviter_id,
+            inviter_name,
+            invitee_id,
+            invitee_name,
+            user_group,
+            order_amount,
+            order_time
+        FROM (
+            SELECT
+                'topup'::TEXT AS order_type,
+                t.id AS order_id,
+                u.inviter_id AS inviter_id,
+                COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
+                t.user_id AS invitee_id,
+                COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
+                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
+                t.money::TEXT AS order_amount,
+                COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS order_time
+            FROM top_ups t
+            JOIN users u ON t.user_id = u.id
+            LEFT JOIN users inviter ON inviter.id = u.inviter_id
+            WHERE t.status = 'success'
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM subscription_orders s
+                  WHERE s.trade_no = t.trade_no
+              )
+            UNION ALL
+            SELECT
+                'subscription'::TEXT AS order_type,
+                s.id AS order_id,
+                u.inviter_id AS inviter_id,
+                COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
+                s.user_id AS invitee_id,
+                COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
+                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
+                s.money::TEXT AS order_amount,
+                COALESCE(NULLIF(s.complete_time, 0), NULLIF(s.create_time, 0), 0) AS order_time
+            FROM subscription_orders s
+            JOIN users u ON s.user_id = u.id
+            LEFT JOIN users inviter ON inviter.id = u.inviter_id
+            WHERE s.status = 'success'
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
+        ) rebate_orders
+        WHERE ($1::TEXT IS NULL OR order_type = $1)
+        ORDER BY order_time DESC, order_id DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(order_type)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.newapi_pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let order_amount_text: String = row.try_get("order_amount")?;
+            let order_amount_yuan = text_to_f64(&order_amount_text);
+            Ok(NewApiRebateOrder {
+                order_type: row.try_get("order_type")?,
+                order_id: row.try_get("order_id")?,
+                inviter_id: row.try_get("inviter_id")?,
+                inviter_name: row.try_get("inviter_name")?,
+                invitee_id: row.try_get("invitee_id")?,
+                invitee_name: row.try_get("invitee_name")?,
+                user_group: row.try_get("user_group")?,
+                order_amount: (order_amount_yuan * 100.0).round() as i64,
+                order_amount_yuan,
+                order_time: row.try_get("order_time")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+async fn hydrate_newapi_rebate_orders(
+    state: &AppState,
+    orders: &[NewApiRebateOrder],
+    now: i64,
+) -> Result<i64> {
+    let mut hydrated = 0;
+
+    for order in orders {
+        let ulid = ulid::Ulid::new().to_string();
+        let order_time = if order.order_time > 0 {
+            order.order_time
+        } else {
+            now
+        };
+        let scan_started_at = now;
+        let initialization_ends_at = scan_started_at + INITIALIZATION_SECONDS;
+        let rebate_effective_at = order_time + REBATE_EFFECTIVE_DELAY_SECONDS;
+
+        let rows_affected = sqlx::query(
+            r#"
+            INSERT INTO rebate_records
+            (
+                ulid, inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NULL, 'initializing', $10, $11, $10, $10)
+            ON CONFLICT (order_type, order_id) DO NOTHING
+            "#,
+        )
+        .bind(&ulid)
+        .bind(order.inviter_id)
+        .bind(order.invitee_id)
+        .bind(&order.user_group)
+        .bind(&order.order_type)
+        .bind(order.order_id)
+        .bind(order.order_amount_yuan)
+        .bind(order_time)
+        .bind(rebate_effective_at)
+        .bind(scan_started_at)
+        .bind(initialization_ends_at)
+        .execute(&state.pool)
+        .await?
+        .rows_affected();
+
+        hydrated += rows_affected as i64;
+    }
+
+    Ok(hydrated)
+}
+
+async fn fetch_local_rebate_record_map(
+    state: &AppState,
+    orders: &[NewApiRebateOrder],
+) -> Result<HashMap<(String, i64), LocalRebateRecord>> {
+    let topup_order_ids: Vec<i64> = orders
+        .iter()
+        .filter(|order| order.order_type == "topup")
+        .map(|order| order.order_id)
+        .collect();
+    let subscription_order_ids: Vec<i64> = orders
+        .iter()
+        .filter(|order| order.order_type == "subscription")
+        .map(|order| order.order_id)
+        .collect();
+
+    if topup_order_ids.is_empty() && subscription_order_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let rows = sqlx::query(
         r#"
         SELECT
             id,
             order_type,
             order_id,
-            inviter_id,
-            invitee_id,
-            user_group,
-            order_amount::TEXT AS order_amount,
             rebate_amount,
             rebate_rate::TEXT AS rebate_rate,
             status,
@@ -968,52 +1157,21 @@ async fn fetch_local_rebate_order_records(
             closed_at,
             admin_adjusted
         FROM rebate_records
-        WHERE ($1::TEXT IS NULL OR order_type = $1)
-        ORDER BY scan_started_at DESC, id DESC
-        LIMIT $2 OFFSET $3
+        WHERE (order_type = 'topup' AND order_id = ANY($1))
+           OR (order_type = 'subscription' AND order_id = ANY($2))
         "#,
     )
-    .bind(order_type)
-    .bind(page_size)
-    .bind(offset)
+    .bind(&topup_order_ids)
+    .bind(&subscription_order_ids)
     .fetch_all(&state.pool)
     .await?;
 
-    rows.iter().map(local_rebate_record_from_row).collect()
-}
-
-async fn fetch_local_record_user_map(
-    state: &AppState,
-    records: &[LocalRebateRecord],
-) -> Result<HashMap<i64, String>> {
-    let user_ids: Vec<i64> = records
-        .iter()
-        .flat_map(|record| [record.inviter_id, record.invitee_id])
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    if user_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    Ok(sqlx::query(
-        r#"
-        SELECT id, COALESCE(NULLIF(display_name, ''), NULLIF(username, '')) AS user_name
-        FROM users
-        WHERE id = ANY($1)
-        "#,
-    )
-    .bind(&user_ids)
-    .fetch_all(&state.newapi_pool)
-    .await?
-    .iter()
-    .filter_map(|row| {
-        let id = row.try_get::<i64, _>("id").ok()?;
-        let user_name = row.try_get::<Option<String>, _>("user_name").ok()??;
-        Some((id, user_name))
-    })
-    .collect())
+    rows.iter()
+        .map(|row| {
+            let record = local_rebate_record_from_row(row)?;
+            Ok(((record.order_type.clone(), record.order_id), record))
+        })
+        .collect()
 }
 
 fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
@@ -1022,11 +1180,6 @@ fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
         id: row.try_get("id")?,
         order_type: row.try_get("order_type")?,
         order_id: row.try_get("order_id")?,
-        inviter_id: row.try_get("inviter_id")?,
-        invitee_id: row.try_get("invitee_id")?,
-        user_group: row.try_get("user_group")?,
-        order_amount: (text_to_f64(&row.try_get::<String, _>("order_amount")?) * 100.0).round()
-            as i64,
         rebate_amount: quota_to_cents(row.try_get("rebate_amount")?),
         rebate_ratio: rebate_rate.as_deref().map(text_to_f64),
         status: row.try_get("status")?,
@@ -1040,46 +1193,77 @@ fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
     })
 }
 
-fn admin_rebate_order_record_from_local(
-    record: &LocalRebateRecord,
-    user_map: &HashMap<i64, String>,
+fn admin_rebate_order_record_from_parts(
+    order: &NewApiRebateOrder,
+    local_record: Option<&LocalRebateRecord>,
     now: i64,
 ) -> AdminRebateOrderRecord {
-    let rule_missing = record.rebate_ratio.is_none();
-    let status = derive_admin_rebate_status(
-        now,
-        record.rebate_effective_at,
-        rule_missing,
-        &record.status,
-    )
-    .to_string();
+    let rule_missing = local_record
+        .map(|record| record.rebate_ratio.is_none())
+        .unwrap_or(true);
+    let status = local_record
+        .map(|record| {
+            derive_admin_rebate_status(
+                now,
+                record.rebate_effective_at,
+                rule_missing,
+                &record.status,
+            )
+        })
+        .unwrap_or("initializing")
+        .to_string();
+    let order_time = local_record
+        .map(|record| record.order_time)
+        .unwrap_or(order.order_time);
+    let rebate_effective_at = local_record
+        .map(|record| record.rebate_effective_at)
+        .unwrap_or(order_time + REBATE_EFFECTIVE_DELAY_SECONDS);
+    let scan_started_at = local_record
+        .map(|record| record.scan_started_at)
+        .unwrap_or(now);
+    let initialization_ends_at = local_record
+        .map(|record| record.initialization_ends_at)
+        .unwrap_or(scan_started_at + INITIALIZATION_SECONDS);
 
     AdminRebateOrderRecord {
-        order_type: record.order_type.clone(),
-        order_id: record.order_id,
-        inviter_id: record.inviter_id,
-        inviter_name: user_map.get(&record.inviter_id).cloned(),
-        invitee_id: record.invitee_id,
-        invitee_name: user_map.get(&record.invitee_id).cloned(),
-        user_group: record.user_group.clone(),
-        order_amount: record.order_amount,
-        rebate_amount: record.rebate_amount,
-        rebate_ratio: record.rebate_ratio,
+        order_type: order.order_type.clone(),
+        order_id: order.order_id,
+        inviter_id: order.inviter_id,
+        inviter_name: order.inviter_name.clone(),
+        invitee_id: order.invitee_id,
+        invitee_name: order.invitee_name.clone(),
+        user_group: order.user_group.clone(),
+        order_amount: order.order_amount,
+        rebate_amount: local_record
+            .map(|record| record.rebate_amount)
+            .unwrap_or_default(),
+        rebate_ratio: local_record.and_then(|record| record.rebate_ratio),
         status,
         rule_missing,
-        local_rebate_record_id: Some(record.id),
-        local_rebate_status: Some(record.status.clone()),
-        order_time: timestamp_to_iso(record.order_time),
-        effective_at: timestamp_to_iso(record.rebate_effective_at),
-        scan_started_at: timestamp_to_iso(record.scan_started_at),
-        initialization_ends_at: timestamp_to_iso(record.initialization_ends_at),
-        finalized_at: optional_timestamp_to_iso(record.finalized_at),
-        closed_at: optional_timestamp_to_iso(record.closed_at),
-        admin_adjusted: record.admin_adjusted,
-        can_modify: is_rebate_record_mutable(&record.status),
-        can_close: is_rebate_record_mutable(&record.status),
-        can_end_initialization: record.status == "initializing",
-        can_extend_initialization: record.status == "initializing",
+        local_rebate_record_id: local_record.map(|record| record.id),
+        local_rebate_status: local_record.map(|record| record.status.clone()),
+        order_time: timestamp_to_iso(order_time),
+        effective_at: timestamp_to_iso(rebate_effective_at),
+        scan_started_at: timestamp_to_iso(scan_started_at),
+        initialization_ends_at: timestamp_to_iso(initialization_ends_at),
+        finalized_at: local_record
+            .and_then(|record| optional_timestamp_to_iso(record.finalized_at)),
+        closed_at: local_record.and_then(|record| optional_timestamp_to_iso(record.closed_at)),
+        admin_adjusted: local_record
+            .map(|record| record.admin_adjusted)
+            .unwrap_or(false),
+        can_modify: local_record
+            .map(|record| is_rebate_record_mutable(&record.status))
+            .unwrap_or(false),
+        can_close: local_record
+            .map(|record| is_rebate_record_mutable(&record.status))
+            .unwrap_or(false),
+        can_end_initialization: local_record
+            .map(|record| record.status == "initializing")
+            .unwrap_or(false),
+        can_extend_initialization: local_record
+            .map(|record| record.status == "initializing")
+            .unwrap_or(false),
     }
 }
 
