@@ -89,6 +89,12 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
     .fetch_all(&state.newapi_pool)
     .await?;
 
+    tracing::info!(
+        last_sync_id,
+        fetched_count = orders.len(),
+        "Topup rebate sync loaded new-api orders"
+    );
+
     let mut synced = 0;
     let mut max_processed_id = last_sync_id;
 
@@ -126,6 +132,12 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
     }
 
     update_sync_log_if_advanced(state, "topup", max_processed_id, last_sync_id, now).await?;
+    tracing::info!(
+        last_sync_id,
+        max_processed_id,
+        inserted_count = synced,
+        "Topup rebate sync processed"
+    );
     Ok(synced)
 }
 
@@ -153,6 +165,12 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
     .bind(last_sync_id)
     .fetch_all(&state.newapi_pool)
     .await?;
+
+    tracing::info!(
+        last_sync_id,
+        fetched_count = orders.len(),
+        "Subscription rebate sync loaded new-api orders"
+    );
 
     let mut synced = 0;
     let mut max_processed_id = last_sync_id;
@@ -191,6 +209,12 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
     }
 
     update_sync_log_if_advanced(state, "subscription", max_processed_id, last_sync_id, now).await?;
+    tracing::info!(
+        last_sync_id,
+        max_processed_id,
+        inserted_count = synced,
+        "Subscription rebate sync processed"
+    );
     Ok(synced)
 }
 

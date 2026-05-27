@@ -10,12 +10,13 @@ pub async fn init_pool(database_url: &str) -> PgPool {
         .await
         .expect("failed to connect to database");
 
+    tracing::info!("Invitations database pool connected");
     migrate(&pool).await;
     pool
 }
 
 pub async fn init_readonly_pool(database_url: &str) -> PgPool {
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(5)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -25,10 +26,15 @@ pub async fn init_readonly_pool(database_url: &str) -> PgPool {
         })
         .connect(database_url)
         .await
-        .expect("failed to connect to new-api database")
+        .expect("failed to connect to new-api database");
+
+    tracing::info!("new-api readonly database pool connected");
+    pool
 }
 
 async fn migrate(pool: &PgPool) {
+    tracing::info!("Starting invitations database migration");
+
     // 返利规则表
     sqlx::query(
         r#"
@@ -208,4 +214,6 @@ async fn migrate(pool: &PgPool) {
     .execute(pool)
     .await
     .ok();
+
+    tracing::info!("Invitations database migration completed");
 }

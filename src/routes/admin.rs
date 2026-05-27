@@ -202,6 +202,15 @@ struct NewApiRebateOrder {
     order_time: i64,
 }
 
+struct NewApiRebateOrderDiagnostics {
+    invited_users: i64,
+    topup_success: i64,
+    topup_invited: i64,
+    topup_rebate_orders: i64,
+    subscription_success: i64,
+    subscription_invited: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateRebateOrderRecordsRequest {
@@ -661,22 +670,71 @@ pub async fn get_rebate_stats(
 // GET /api/admin/rebate-order-records
 pub async fn get_rebate_order_records(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(params): Query<RebateOrderRecordParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<AdminRebateOrderRecord>>>> {
     let order_type = params.order_type_filter();
+    let page = params.page();
+    let page_size = params.page_size();
+    let offset = params.offset();
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        order_type = order_type.unwrap_or("all"),
+        page,
+        page_size,
+        offset,
+        "Admin rebate order records requested"
+    );
+
     let total = count_newapi_rebate_orders(&state, order_type).await?;
-    let orders =
-        fetch_newapi_rebate_orders(&state, order_type, params.page_size(), params.offset()).await?;
-    let now = Utc::now().timestamp();
-    let hydrated = hydrate_newapi_rebate_orders(&state, &orders, now).await?;
-    if hydrated > 0 {
-        tracing::info!(
-            hydrated,
-            "Admin rebate order list hydrated local rebate records"
+    tracing::info!(
+        admin_id = admin.0.id,
+        order_type = order_type.unwrap_or("all"),
+        total,
+        "New-api rebate order count loaded"
+    );
+
+    if total == 0 {
+        let diagnostics = fetch_newapi_rebate_order_diagnostics(&state).await?;
+        tracing::warn!(
+            admin_id = admin.0.id,
+            order_type = order_type.unwrap_or("all"),
+            invited_users = diagnostics.invited_users,
+            topup_success = diagnostics.topup_success,
+            topup_invited = diagnostics.topup_invited,
+            topup_rebate_orders = diagnostics.topup_rebate_orders,
+            subscription_success = diagnostics.subscription_success,
+            subscription_invited = diagnostics.subscription_invited,
+            "No new-api rebate orders matched admin rebate order query"
         );
     }
+
+    let orders = fetch_newapi_rebate_orders(&state, order_type, page_size, offset).await?;
+    tracing::info!(
+        admin_id = admin.0.id,
+        order_type = order_type.unwrap_or("all"),
+        fetched_count = orders.len(),
+        first_order_type = orders.first().map(|order| order.order_type.as_str()),
+        first_order_id = orders.first().map(|order| order.order_id),
+        "New-api rebate order page loaded"
+    );
+
+    let now = Utc::now().timestamp();
+    let hydrated = hydrate_newapi_rebate_orders(&state, &orders, now).await?;
+    tracing::info!(
+        admin_id = admin.0.id,
+        requested_count = orders.len(),
+        hydrated_count = hydrated,
+        "Admin rebate order list hydration finished"
+    );
+
     let local_record_map = fetch_local_rebate_record_map(&state, &orders).await?;
+    tracing::info!(
+        admin_id = admin.0.id,
+        local_record_count = local_record_map.len(),
+        "Local rebate record map loaded for admin order page"
+    );
 
     let records = orders
         .iter()
@@ -689,11 +747,20 @@ pub async fn get_rebate_order_records(
         })
         .collect::<Vec<_>>();
 
+    tracing::info!(
+        admin_id = admin.0.id,
+        returned_count = records.len(),
+        total,
+        page,
+        page_size,
+        "Admin rebate order records response ready"
+    );
+
     Ok(ok(PaginatedResponse {
         items: records,
         total,
-        page: params.page(),
-        page_size: params.page_size(),
+        page,
+        page_size,
     }))
 }
 
@@ -979,6 +1046,59 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
     .fetch_one(&state.newapi_pool)
     .await
     .map_err(AppError::from)
+}
+
+async fn fetch_newapi_rebate_order_diagnostics(
+    state: &AppState,
+) -> Result<NewApiRebateOrderDiagnostics> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM users WHERE inviter_id IS NOT NULL AND inviter_id > 0)::BIGINT AS invited_users,
+            (SELECT COUNT(*) FROM top_ups WHERE status = 'success')::BIGINT AS topup_success,
+            (
+                SELECT COUNT(*)
+                FROM top_ups t
+                JOIN users u ON t.user_id = u.id
+                WHERE t.status = 'success'
+                  AND u.inviter_id IS NOT NULL
+                  AND u.inviter_id > 0
+            )::BIGINT AS topup_invited,
+            (
+                SELECT COUNT(*)
+                FROM top_ups t
+                JOIN users u ON t.user_id = u.id
+                WHERE t.status = 'success'
+                  AND u.inviter_id IS NOT NULL
+                  AND u.inviter_id > 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM subscription_orders s
+                      WHERE s.trade_no = t.trade_no
+                  )
+            )::BIGINT AS topup_rebate_orders,
+            (SELECT COUNT(*) FROM subscription_orders WHERE status = 'success')::BIGINT AS subscription_success,
+            (
+                SELECT COUNT(*)
+                FROM subscription_orders s
+                JOIN users u ON s.user_id = u.id
+                WHERE s.status = 'success'
+                  AND u.inviter_id IS NOT NULL
+                  AND u.inviter_id > 0
+            )::BIGINT AS subscription_invited
+        "#,
+    )
+    .fetch_one(&state.newapi_pool)
+    .await?;
+
+    Ok(NewApiRebateOrderDiagnostics {
+        invited_users: row.try_get("invited_users")?,
+        topup_success: row.try_get("topup_success")?,
+        topup_invited: row.try_get("topup_invited")?,
+        topup_rebate_orders: row.try_get("topup_rebate_orders")?,
+        subscription_success: row.try_get("subscription_success")?,
+        subscription_invited: row.try_get("subscription_invited")?,
+    })
 }
 
 async fn fetch_newapi_rebate_orders(
