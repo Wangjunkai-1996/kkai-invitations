@@ -10,8 +10,8 @@ use sqlx::Row;
 use crate::error::{AppError, Result};
 use crate::middleware::AdminUser;
 use crate::rebate_lifecycle::{
-    finalize_initializing_records_by_ids, rebate_amount_for_yuan, INITIALIZATION_SECONDS,
-    REBATE_EFFECTIVE_DELAY_SECONDS,
+    finalize_initializing_records_by_ids, rebate_amount_for_yuan, ALL_USER_GROUP,
+    INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::routes::user::{
@@ -36,6 +36,12 @@ pub struct RebateRuleRequest {
     pub user_group: String,
     pub rule_type: String,
     pub rebate_rate: serde_json::Value,
+}
+
+struct ValidatedRebateRuleRequest {
+    user_group: String,
+    rule_type: String,
+    rebate_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -248,9 +254,10 @@ pub async fn get_rebate_rules(
         SELECT id, user_group, rule_type, rebate_rate::TEXT as rebate_rate,
                effective_time, created_at, updated_at
         FROM rebate_rules
-        ORDER BY user_group, rule_type
+        ORDER BY CASE WHEN user_group = $1 THEN 0 ELSE 1 END, user_group, rule_type
         "#,
     )
+    .bind(ALL_USER_GROUP)
     .fetch_all(&state.pool)
     .await?;
 
@@ -266,7 +273,7 @@ pub async fn create_rebate_rule(
     admin: AdminUser,
     Json(req): Json<RebateRuleRequest>,
 ) -> Result<Json<ApiResponse<RebateRule>>> {
-    let rebate_rate = validate_rebate_rule_request(&req)?;
+    let validated = validate_rebate_rule_request(&req)?;
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
@@ -279,17 +286,17 @@ pub async fn create_rebate_rule(
                   effective_time, created_at, updated_at
         "#,
     )
-    .bind(req.user_group.trim())
-    .bind(req.rule_type.trim())
-    .bind(rebate_rate)
+    .bind(&validated.user_group)
+    .bind(&validated.rule_type)
+    .bind(validated.rebate_rate)
     .bind(now)
     .fetch_one(&state.pool)
     .await?;
 
     tracing::info!(
         admin_id = admin.0.id,
-        user_group = req.user_group,
-        rule_type = req.rule_type,
+        user_group = validated.user_group,
+        rule_type = validated.rule_type,
         "Admin saved rebate rule"
     );
 
@@ -306,7 +313,7 @@ pub async fn update_rebate_rule(
     if id <= 0 {
         return Err(AppError::BadRequest("无效的规则 ID".to_string()));
     }
-    let rebate_rate = validate_rebate_rule_request(&req)?;
+    let validated = validate_rebate_rule_request(&req)?;
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
@@ -318,9 +325,9 @@ pub async fn update_rebate_rule(
                   effective_time, created_at, updated_at
         "#,
     )
-    .bind(req.user_group.trim())
-    .bind(req.rule_type.trim())
-    .bind(rebate_rate)
+    .bind(&validated.user_group)
+    .bind(&validated.rule_type)
+    .bind(validated.rebate_rate)
     .bind(now)
     .bind(id)
     .fetch_optional(&state.pool)
@@ -1424,7 +1431,7 @@ fn rebate_rule_from_row(row: &PgRow) -> Result<RebateRule> {
     })
 }
 
-fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<f64> {
+fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<ValidatedRebateRuleRequest> {
     let user_group = req.user_group.trim();
     if user_group.is_empty() || user_group.len() > 64 {
         return Err(AppError::BadRequest(
@@ -1449,7 +1456,11 @@ fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<f64> {
         return Err(AppError::BadRequest("返利比例必须在 0-1 之间".to_string()));
     }
 
-    Ok(rate)
+    Ok(ValidatedRebateRuleRequest {
+        user_group: user_group.to_string(),
+        rule_type: rule_type.to_string(),
+        rebate_rate: rate,
+    })
 }
 
 async fn get_config_value(pool: &sqlx::PgPool, key: &str) -> Result<i64> {
@@ -1711,7 +1722,24 @@ mod tests {
             rebate_rate: serde_json::json!("0.05"),
         };
 
-        assert_eq!(validate_rebate_rule_request(&req).unwrap(), 0.05);
+        let validated = validate_rebate_rule_request(&req).unwrap();
+        assert_eq!(validated.user_group, "default");
+        assert_eq!(validated.rule_type, "topup");
+        assert_eq!(validated.rebate_rate, 0.05);
+    }
+
+    #[test]
+    fn validates_all_user_group_rebate_rule() {
+        let req = RebateRuleRequest {
+            user_group: ALL_USER_GROUP.to_string(),
+            rule_type: "subscription".to_string(),
+            rebate_rate: serde_json::json!("0.08"),
+        };
+
+        let validated = validate_rebate_rule_request(&req).unwrap();
+        assert_eq!(validated.user_group, ALL_USER_GROUP);
+        assert_eq!(validated.rule_type, "subscription");
+        assert_eq!(validated.rebate_rate, 0.08);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::error::{AppError, Result};
 
 pub const INITIALIZATION_SECONDS: i64 = 2 * 24 * 60 * 60;
 pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const ALL_USER_GROUP: &str = "__all__";
 
 const QUOTA_UNITS_PER_YUAN: f64 = 500_000.0;
 
@@ -58,10 +59,22 @@ pub async fn current_rebate_rate(
     order_type: &str,
 ) -> Result<Option<f64>> {
     let row = sqlx::query(
-        "SELECT rebate_rate::TEXT AS rebate_rate FROM rebate_rules WHERE user_group = $1 AND rule_type = $2",
+        r#"
+        SELECT rebate_rate::TEXT AS rebate_rate
+        FROM rebate_rules
+        WHERE rule_type = $2
+          AND user_group IN ($1, $3)
+        ORDER BY CASE
+            WHEN user_group = $1 THEN 0
+            WHEN user_group = $3 THEN 1
+            ELSE 2
+        END
+        LIMIT 1
+        "#,
     )
     .bind(user_group)
     .bind(order_type)
+    .bind(ALL_USER_GROUP)
     .fetch_optional(pool)
     .await?;
 
