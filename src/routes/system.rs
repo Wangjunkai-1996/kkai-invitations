@@ -88,15 +88,19 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
             // money 是实际金额（元），需要转换为 new-api 的额度单位（通常 1 元 = 500000 额度）
             let rebate_amount = (money * rebate_rate * 500000.0).round() as i64;
 
+            // 生成 ULID
+            let ulid = ulid::Ulid::new().to_string();
+
             // 插入返利记录
             let result = sqlx::query(
                 r#"
                 INSERT INTO rebate_records
-                (inviter_id, invitee_id, order_type, order_id, order_amount, rebate_amount, rebate_rate, status, created_at, updated_at)
-                VALUES ($1, $2, 'topup', $3, $4, $5, $6, 'pending', $7, $7)
+                (ulid, inviter_id, invitee_id, order_type, order_id, order_amount, rebate_amount, rebate_rate, status, created_at, updated_at)
+                VALUES ($1, $2, $3, 'topup', $4, $5, $6, $7, 'pending', $8, $8)
                 ON CONFLICT (order_type, order_id) DO NOTHING
                 "#
             )
+            .bind(&ulid)
             .bind(inviter_id)
             .bind(user_id)
             .bind(order_id)
@@ -187,15 +191,19 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
             // money 是实际金额（元），需要转换为 new-api 的额度单位（通常 1 元 = 500000 额度）
             let rebate_amount = (money * rebate_rate * 500000.0).round() as i64;
 
+            // 生成 ULID
+            let ulid = ulid::Ulid::new().to_string();
+
             // 插入返利记录
             let result = sqlx::query(
                 r#"
                 INSERT INTO rebate_records
-                (inviter_id, invitee_id, order_type, order_id, order_amount, rebate_amount, rebate_rate, status, created_at, updated_at)
-                VALUES ($1, $2, 'subscription', $3, $4, $5, $6, 'pending', $7, $7)
+                (ulid, inviter_id, invitee_id, order_type, order_id, order_amount, rebate_amount, rebate_rate, status, created_at, updated_at)
+                VALUES ($1, $2, $3, 'subscription', $4, $5, $6, $7, 'pending', $8, $8)
                 ON CONFLICT (order_type, order_id) DO NOTHING
                 "#
             )
+            .bind(&ulid)
             .bind(inviter_id)
             .bind(user_id)
             .bind(order_id)

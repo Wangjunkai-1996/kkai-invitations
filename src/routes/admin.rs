@@ -437,6 +437,7 @@ pub async fn get_user_rebates(
         r#"
         SELECT
             id,
+            ulid,
             order_type,
             order_amount::TEXT as order_amount,
             rebate_amount,
@@ -457,6 +458,7 @@ pub async fn get_user_rebates(
         .map(|row| {
             Ok(crate::routes::user::RebateRecord {
                 id: row.try_get("id")?,
+                ulid: row.try_get("ulid")?,
                 order_type: row.try_get("order_type")?,
                 order_amount: row.try_get("order_amount")?,
                 rebate_amount: row.try_get("rebate_amount")?,

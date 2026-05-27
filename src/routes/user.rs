@@ -20,6 +20,7 @@ pub struct InvitationStats {
 #[derive(Serialize)]
 pub struct RebateRecord {
     pub id: i64,
+    pub ulid: Option<String>,
     pub order_type: String,
     pub order_amount: String,
     pub rebate_amount: i64,
@@ -104,6 +105,7 @@ pub async fn rebate_records(
         r#"
         SELECT
             id,
+            ulid,
             order_type,
             order_amount::TEXT as order_amount,
             rebate_amount,
@@ -125,6 +127,7 @@ pub async fn rebate_records(
         .map(|row| {
             Ok(RebateRecord {
                 id: row.try_get("id")?,
+                ulid: row.try_get("ulid")?,
                 order_type: row.try_get("order_type")?,
                 order_amount: row.try_get("order_amount")?,
                 rebate_amount: row.try_get("rebate_amount")?,
@@ -147,6 +150,7 @@ pub async fn available_rebates(
         r#"
         SELECT
             id,
+            ulid,
             order_type,
             order_amount::TEXT as order_amount,
             rebate_amount,
@@ -167,6 +171,7 @@ pub async fn available_rebates(
         .map(|row| {
             Ok(RebateRecord {
                 id: row.try_get("id")?,
+                ulid: row.try_get("ulid")?,
                 order_type: row.try_get("order_type")?,
                 order_amount: row.try_get("order_amount")?,
                 rebate_amount: row.try_get("rebate_amount")?,

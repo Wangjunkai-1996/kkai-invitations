@@ -49,6 +49,7 @@ async fn migrate(pool: &PgPool) {
         r#"
         CREATE TABLE IF NOT EXISTS rebate_records (
             id BIGSERIAL PRIMARY KEY,
+            ulid VARCHAR(26),
             inviter_id BIGINT NOT NULL,
             invitee_id BIGINT NOT NULL,
             order_type VARCHAR(20) NOT NULL,
@@ -66,6 +67,20 @@ async fn migrate(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("failed to create rebate_records table");
+
+    // 为现有表添加 ulid 列（如果不存在）
+    sqlx::query("ALTER TABLE rebate_records ADD COLUMN IF NOT EXISTS ulid VARCHAR(26)")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 为 ulid 列添加唯一索引
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_ulid ON rebate_records(ulid)",
+    )
+    .execute(pool)
+    .await
+    .ok();
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_rebate_records_inviter ON rebate_records(inviter_id)",
