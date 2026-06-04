@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
@@ -8,8 +6,9 @@ use sqlx::Row;
 
 use crate::error::{AppError, Result};
 use crate::invitation_signup::{
-    insert_invitation_signup_reward_record, upsert_invitation_registration,
-    InsertInvitationSignupReward, UpsertInvitationRegistration,
+    fetch_paid_invitee_ids, insert_invitation_signup_reward_record,
+    resolve_invitation_signup_reward_unlocked_at, unlock_paid_invitation_signup_rewards,
+    upsert_invitation_registration, InsertInvitationSignupReward, UpsertInvitationRegistration,
 };
 use crate::rebate_lifecycle::{
     finalize_ready_initializing_records, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
@@ -238,6 +237,16 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
         "Invitation signup reward sync loaded invited users"
     );
 
+    let invitee_ids = users
+        .iter()
+        .map(|row| row.try_get::<i64, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let paid_invitee_ids = if inviter_unlock_required || invitee_unlock_required {
+        fetch_paid_invitee_ids(&state.newapi_pool, &invitee_ids).await?
+    } else {
+        Default::default()
+    };
+
     let mut synced = 0;
     let mut max_processed_id = last_sync_id;
 
@@ -257,6 +266,11 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
                     user_group,
                     reward_amount: inviter_reward_amount,
                     unlock_required: inviter_unlock_required,
+                    unlocked_at: resolve_invitation_signup_reward_unlocked_at(
+                        inviter_unlock_required,
+                        paid_invitee_ids.contains(&invitee_id),
+                        now,
+                    ),
                     now,
                 },
             )
@@ -274,6 +288,11 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
                     user_group,
                     reward_amount: invitee_reward_amount,
                     unlock_required: invitee_unlock_required,
+                    unlocked_at: resolve_invitation_signup_reward_unlocked_at(
+                        invitee_unlock_required,
+                        paid_invitee_ids.contains(&invitee_id),
+                        now,
+                    ),
                     now,
                 },
             )
@@ -296,96 +315,15 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
 }
 
 async fn sync_invitation_signup_reward_unlocks(state: &AppState, now: i64) -> Result<i64> {
-    let locked_rows = sqlx::query(
-        r#"
-        SELECT DISTINCT invitee_id
-        FROM rebate_records
-        WHERE order_type IN ($1, $2)
-          AND unlock_required = TRUE
-          AND unlocked_at IS NULL
-        ORDER BY invitee_id
-        "#,
-    )
-    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
-    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
-    .fetch_all(&state.pool)
-    .await?;
-
-    let invitee_ids = locked_rows
-        .iter()
-        .map(|row| row.try_get::<i64, _>("invitee_id"))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let updated =
+        unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, now).await? as i64;
 
     tracing::info!(
-        locked_invitee_count = invitee_ids.len(),
-        "Invitation signup reward unlock sync loaded locked invitees"
-    );
-
-    if invitee_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let paid_rows = sqlx::query(
-        r#"
-        SELECT DISTINCT user_id
-        FROM (
-            SELECT user_id
-            FROM top_ups
-            WHERE status = 'success'
-              AND user_id = ANY($1)
-            UNION
-            SELECT user_id
-            FROM subscription_orders
-            WHERE status = 'success'
-              AND user_id = ANY($1)
-        ) paid_users
-        ORDER BY user_id
-        "#,
-    )
-    .bind(&invitee_ids)
-    .fetch_all(&state.newapi_pool)
-    .await?;
-
-    let paid_user_ids: HashSet<i64> = paid_rows
-        .iter()
-        .map(|row| row.try_get::<i64, _>("user_id"))
-        .collect::<std::result::Result<HashSet<_>, _>>()?;
-
-    if paid_user_ids.is_empty() {
-        tracing::info!("Invitation signup reward unlock sync found no paid invitees");
-        return Ok(0);
-    }
-
-    let paid_invitee_ids = invitee_ids
-        .into_iter()
-        .filter(|invitee_id| paid_user_ids.contains(invitee_id))
-        .collect::<Vec<_>>();
-
-    let updated = sqlx::query(
-        r#"
-        UPDATE rebate_records
-        SET unlocked_at = $1, updated_at = $1
-        WHERE order_type IN ($2, $3)
-          AND unlock_required = TRUE
-          AND unlocked_at IS NULL
-          AND invitee_id = ANY($4)
-        "#,
-    )
-    .bind(now)
-    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
-    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
-    .bind(&paid_invitee_ids)
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
-
-    tracing::info!(
-        paid_invitee_count = paid_invitee_ids.len(),
         unlocked_count = updated,
         "Invitation signup reward unlock sync processed"
     );
 
-    Ok(updated as i64)
+    Ok(updated)
 }
 
 async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {

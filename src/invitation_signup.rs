@@ -1,6 +1,11 @@
+use std::collections::HashSet;
+
 use sqlx::{PgPool, Row};
 
 use crate::error::{AppError, Result};
+use crate::rebate_types::{
+    INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RewardInsertOutcome {
@@ -31,6 +36,7 @@ pub struct InsertInvitationSignupReward<'a> {
     pub user_group: &'a str,
     pub reward_amount: i64,
     pub unlock_required: bool,
+    pub unlocked_at: Option<i64>,
     pub now: i64,
 }
 
@@ -40,7 +46,7 @@ pub async fn insert_invitation_signup_reward_record(
 ) -> Result<RewardInsertOutcome> {
     let ulid = ulid::Ulid::new().to_string();
     let unlocked_at = if params.unlock_required {
-        None
+        params.unlocked_at
     } else {
         Some(params.now)
     };
@@ -83,6 +89,118 @@ pub async fn insert_invitation_signup_reward_record(
             .await?;
 
     Ok(RewardInsertOutcome::Duplicate { record_id })
+}
+
+pub fn resolve_invitation_signup_reward_unlocked_at(
+    unlock_required: bool,
+    invitee_has_paid_order: bool,
+    now: i64,
+) -> Option<i64> {
+    if !unlock_required || invitee_has_paid_order {
+        Some(now)
+    } else {
+        None
+    }
+}
+
+pub async fn fetch_paid_invitee_ids(
+    newapi_pool: &PgPool,
+    invitee_ids: &[i64],
+) -> Result<HashSet<i64>> {
+    if invitee_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT user_id
+        FROM (
+            SELECT user_id
+            FROM top_ups
+            WHERE status = 'success'
+              AND user_id = ANY($1)
+            UNION
+            SELECT user_id
+            FROM subscription_orders
+            WHERE status = 'success'
+              AND user_id = ANY($1)
+            UNION
+            SELECT user_id
+            FROM user_subscriptions
+            WHERE status IN ('active', 'expired')
+              AND user_id = ANY($1)
+        ) paid_users
+        ORDER BY user_id
+        "#,
+    )
+    .bind(invitee_ids)
+    .fetch_all(newapi_pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| row.try_get::<i64, _>("user_id"))
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .map_err(AppError::from)
+}
+
+pub async fn unlock_paid_invitation_signup_rewards(
+    pool: &PgPool,
+    newapi_pool: &PgPool,
+    now: i64,
+) -> Result<u64> {
+    let locked_rows = sqlx::query(
+        r#"
+        SELECT DISTINCT invitee_id
+        FROM rebate_records
+        WHERE order_type IN ($1, $2)
+          AND unlock_required = TRUE
+          AND unlocked_at IS NULL
+        ORDER BY invitee_id
+        "#,
+    )
+    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
+    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
+    .fetch_all(pool)
+    .await?;
+
+    let invitee_ids = locked_rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("invitee_id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if invitee_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let paid_user_ids = fetch_paid_invitee_ids(newapi_pool, &invitee_ids).await?;
+    if paid_user_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let paid_invitee_ids = invitee_ids
+        .into_iter()
+        .filter(|invitee_id| paid_user_ids.contains(invitee_id))
+        .collect::<Vec<_>>();
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE rebate_records
+        SET unlocked_at = $1, updated_at = $1
+        WHERE order_type IN ($2, $3)
+          AND unlock_required = TRUE
+          AND unlocked_at IS NULL
+          AND invitee_id = ANY($4)
+        "#,
+    )
+    .bind(now)
+    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
+    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
+    .bind(&paid_invitee_ids)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(updated)
 }
 
 pub struct UpsertInvitationRegistration<'a> {
@@ -155,6 +273,22 @@ mod tests {
         assert_eq!(
             RewardInsertOutcome::Duplicate { record_id: None }.record_id(),
             None
+        );
+    }
+
+    #[test]
+    fn resolves_signup_reward_unlock_timestamp() {
+        assert_eq!(
+            resolve_invitation_signup_reward_unlocked_at(false, false, 1_000),
+            Some(1_000)
+        );
+        assert_eq!(
+            resolve_invitation_signup_reward_unlocked_at(true, false, 1_000),
+            None
+        );
+        assert_eq!(
+            resolve_invitation_signup_reward_unlocked_at(true, true, 1_000),
+            Some(1_000)
         );
     }
 }

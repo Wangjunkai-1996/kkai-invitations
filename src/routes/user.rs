@@ -8,6 +8,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
 use crate::error::{AppError, Result};
+use crate::invitation_signup::unlock_paid_invitation_signup_rewards;
 use crate::rebate_types::{
     is_invitation_signup_reward_order_type, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
     INVITATION_SIGNUP_INVITER_ORDER_TYPE,
@@ -244,6 +245,8 @@ pub async fn rebate_records(
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
     ensure_user_invitation_rebate_enabled(&state.pool).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, Utc::now().timestamp())
+        .await?;
 
     let records = fetch_rebate_records(
         &state.pool,
@@ -281,6 +284,7 @@ pub async fn available_rebates(
     ensure_user_invitation_rebate_enabled(&state.pool).await?;
     ensure_rebate_to_balance_enabled(&state.pool).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
+    let now = Utc::now().timestamp();
 
     if !source_filter.any_enabled() {
         return Ok(ok(AvailableRebates {
@@ -288,6 +292,8 @@ pub async fn available_rebates(
             record_ids: Vec::new(),
         }));
     }
+
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, now).await?;
 
     let rows = sqlx::query(
         r#"
@@ -313,7 +319,7 @@ pub async fn available_rebates(
         "#,
     )
     .bind(user.id)
-    .bind(Utc::now().timestamp())
+    .bind(now)
     .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
     .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
     .bind(source_filter.order_rebate_enabled)
@@ -340,6 +346,8 @@ pub async fn request_rebate(
     ensure_user_invitation_rebate_enabled(&state.pool).await?;
     ensure_rebate_to_balance_enabled(&state.pool).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
+    let now = Utc::now().timestamp();
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, now).await?;
 
     let rebate_record_ids = unique_ids(&req.rebate_record_ids)?;
     if rebate_record_ids.is_empty() {
@@ -355,7 +363,6 @@ pub async fn request_rebate(
     let mut tx = state.pool.begin().await?;
     let min_amount = get_config_value_tx(&mut tx, "min_rebate_request_amount").await?;
     let frequency_days = get_config_value_tx(&mut tx, "rebate_request_frequency_days").await?;
-    let now = Utc::now().timestamp();
 
     let rows = sqlx::query(
         r#"

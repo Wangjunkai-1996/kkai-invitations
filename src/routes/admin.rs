@@ -9,8 +9,10 @@ use sqlx::Row;
 
 use crate::error::{AppError, Result};
 use crate::invitation_signup::{
-    insert_invitation_signup_reward_record, upsert_invitation_registration,
-    InsertInvitationSignupReward, RewardInsertOutcome, UpsertInvitationRegistration,
+    fetch_paid_invitee_ids, insert_invitation_signup_reward_record,
+    resolve_invitation_signup_reward_unlocked_at, unlock_paid_invitation_signup_rewards,
+    upsert_invitation_registration, InsertInvitationSignupReward, RewardInsertOutcome,
+    UpsertInvitationRegistration,
 };
 use crate::middleware::AdminUser;
 use crate::rebate_lifecycle::{
@@ -1146,6 +1148,9 @@ pub async fn get_rebate_records(
     Query(params): Query<AdminRebateRecordListParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
     let source_filter = params.source_filter();
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, Utc::now().timestamp())
+        .await?;
+
     let records = fetch_rebate_records(
         &state.pool,
         None,
@@ -1636,6 +1641,7 @@ pub async fn get_invitation_registrations(
         .iter()
         .map(|registration| registration.invitee_id)
         .collect::<Vec<_>>();
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, now).await?;
     let local_map = fetch_local_invitation_registration_map(&state, &invitee_ids).await?;
     let reward_map = fetch_invitation_registration_reward_map(&state, &invitee_ids).await?;
     let total_reward_map =
@@ -1721,6 +1727,8 @@ pub async fn get_user_rebates(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
     validate_id(user_id)?;
+    unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, Utc::now().timestamp())
+        .await?;
 
     let records = fetch_user_related_rebate_records(
         &state.pool,
@@ -1784,6 +1792,11 @@ async fn generate_invitation_registration_reward(
     };
     let unlock_required = get_config_bool(&state.pool, unlock_required_key).await?;
     let now = Utc::now().timestamp();
+    let paid_invitee_ids = if unlock_required {
+        fetch_paid_invitee_ids(&state.newapi_pool, &[registration.invitee_id]).await?
+    } else {
+        Default::default()
+    };
 
     let outcome = insert_invitation_signup_reward_record(
         &state.pool,
@@ -1794,6 +1807,11 @@ async fn generate_invitation_registration_reward(
             user_group: &registration.user_group,
             reward_amount,
             unlock_required,
+            unlocked_at: resolve_invitation_signup_reward_unlocked_at(
+                unlock_required,
+                paid_invitee_ids.contains(&registration.invitee_id),
+                now,
+            ),
             now,
         },
     )
