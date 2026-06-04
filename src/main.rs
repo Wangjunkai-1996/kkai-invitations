@@ -8,6 +8,7 @@ mod rebate_types;
 mod response;
 mod routes;
 mod session;
+mod sync_scheduler;
 mod system_config;
 
 use axum::{
@@ -46,6 +47,7 @@ async fn main() {
         pool,
         newapi_pool,
     };
+    sync_scheduler::spawn_rebate_sync_scheduler(state.clone());
 
     let b = &base_path;
     let mut app = Router::new()

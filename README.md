@@ -26,14 +26,14 @@
 - **统计报表**：系统返利统计、返利趋势图、用户返利详情
 
 ### 系统功能
-- **自动同步**：定时从 new-api 数据库同步订单，自动计算返利
+- **自动同步**：服务内置后台任务，默认每小时从 new-api 数据库同步订单并自动计算返利
 - **ULID 标识**：每条返利记录使用 ULID 唯一标识，支持幂等性
 
 ## 工作原理
 
 1. **同域部署**：Invitations API 通过 nginx 反向代理挂载在主站 `/invitations/api/` 路径下
 2. **Session 解析**：直接解析 gorilla/securecookie 格式（HMAC-SHA256 验证 + gob 反序列化）
-3. **数据同步**：定时任务从 new-api 数据库读取订单，计算返利并写入 invitations 数据库
+3. **数据同步**：内置后台任务从 new-api 数据库读取订单，计算返利并写入 invitations 数据库
 4. **前端集成**：new-api 前端通过 `/invitations/api/*` 调用 API，页面路由为 `/invitations`
 
 ## 前置条件
@@ -57,7 +57,7 @@ cp .env.example .env
 # 必须与 new-api 的 SESSION_SECRET 环境变量相同
 SESSION_SECRET=your-new-api-session-secret
 
-# 系统同步接口密钥（cron 需要携带）
+# 系统同步接口密钥（手动触发同步接口时需要携带）
 SYNC_SECRET=change-this-random-sync-secret
 
 # Invitations 数据库（读写）
@@ -71,6 +71,12 @@ LISTEN_ADDR=0.0.0.0:6212
 
 # 路径前缀（留空，由 nginx 处理路径重写）
 BASE_PATH=
+
+# 内置自动同步间隔，默认 3600 秒（每小时一次）；设置为 0 可关闭
+AUTO_SYNC_INTERVAL_SECONDS=3600
+
+# 服务启动后首次自动同步延迟，默认 10 秒
+AUTO_SYNC_INITIAL_DELAY_SECONDS=10
 ```
 
 ### 2. 初始化数据库
@@ -125,16 +131,31 @@ location /invitations {
 
 完整配置参考 `nginx/invitations.conf`。
 
-### 5. 配置定时任务
+### 5. 配置自动同步
 
-使用 cron 定期同步返利数据：
+服务默认启用内置自动同步：启动后 10 秒先同步一次，之后每 3600 秒同步一次。一般不再需要配置 cron。
+
+如需调整间隔：
+
+```env
+AUTO_SYNC_INTERVAL_SECONDS=1800
+AUTO_SYNC_INITIAL_DELAY_SECONDS=10
+```
+
+如需完全关闭内置自动同步，改用外部 cron 或 systemd timer：
+
+```env
+AUTO_SYNC_INTERVAL_SECONDS=0
+```
+
+外部 cron 示例：
 
 ```bash
 # 每小时同步一次
 0 * * * * curl -X POST http://localhost:6212/api/system/sync-rebates -H "X-Sync-Secret: change-this-random-sync-secret"
 ```
 
-或使用 systemd timer：
+外部 systemd timer 示例：
 
 ```ini
 # /etc/systemd/system/invitations-sync.timer
@@ -316,10 +337,11 @@ cargo clippy
 ## 故障排查
 
 ### 返利未同步
-1. 检查定时任务是否正常运行
-2. 检查 new-api 数据库连接是否正常
-3. 检查返利规则是否配置正确
-4. 查看日志：`RUST_LOG=debug ./target/release/invitations`
+1. 检查服务日志中是否有 `Automatic rebate sync scheduler started`
+2. 确认 `AUTO_SYNC_INTERVAL_SECONDS` 未设置为 `0`
+3. 检查 new-api 数据库连接是否正常
+4. 检查返利规则是否配置正确
+5. 查看日志：`RUST_LOG=debug ./target/release/invitations`
 
 ### Session 解析失败
 1. 确认 `SESSION_SECRET` 与 new-api 一致

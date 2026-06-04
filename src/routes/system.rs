@@ -26,6 +26,8 @@ use crate::system_config::{
 };
 use crate::AppState;
 
+const REBATE_SYNC_ADVISORY_LOCK_ID: i64 = 6_212_202_606_050;
+
 // POST /api/system/sync-rebates
 pub async fn sync_rebates(
     State(state): State<AppState>,
@@ -34,6 +36,54 @@ pub async fn sync_rebates(
 ) -> Result<Json<ApiResponse<SyncResponse>>> {
     authorize_sync(&state, &headers, params.secret.as_deref())?;
 
+    let result = run_rebate_sync(&state).await?;
+    let message_text = if result.skipped {
+        "同步正在运行"
+    } else {
+        "同步完成"
+    };
+
+    Ok(message(result, message_text))
+}
+
+pub async fn run_rebate_sync(state: &AppState) -> Result<SyncResponse> {
+    let mut lock_conn = state.pool.acquire().await?;
+    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(REBATE_SYNC_ADVISORY_LOCK_ID)
+        .fetch_one(&mut *lock_conn)
+        .await?;
+
+    if !lock_acquired {
+        tracing::info!("Rebate sync skipped: another sync is already running");
+        return Ok(SyncResponse::skipped());
+    }
+
+    let result = run_rebate_sync_unlocked(state).await;
+    let unlock_result: std::result::Result<bool, sqlx::Error> =
+        sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(REBATE_SYNC_ADVISORY_LOCK_ID)
+            .fetch_one(&mut *lock_conn)
+            .await;
+
+    match (result, unlock_result) {
+        (Ok(response), Ok(true)) => Ok(response),
+        (Ok(response), Ok(false)) => {
+            tracing::warn!("Rebate sync advisory lock was not held while unlocking");
+            Ok(response)
+        }
+        (Ok(_), Err(err)) => Err(AppError::from(err)),
+        (Err(err), Ok(_)) => Err(err),
+        (Err(sync_err), Err(unlock_err)) => {
+            tracing::error!(
+                error = %unlock_err,
+                "Failed to release rebate sync advisory lock after sync error"
+            );
+            Err(sync_err)
+        }
+    }
+}
+
+async fn run_rebate_sync_unlocked(state: &AppState) -> Result<SyncResponse> {
     let now = chrono::Utc::now().timestamp();
     tracing::info!("Starting rebate sync");
 
@@ -43,19 +93,19 @@ pub async fn sync_rebates(
         "Initializing rebate records finalized"
     );
 
-    let invitation_registrations_synced = sync_invitation_registrations(&state, now).await?;
+    let invitation_registrations_synced = sync_invitation_registrations(state, now).await?;
     tracing::info!(
         synced_count = invitation_registrations_synced,
         "Invitation registrations synced"
     );
 
-    let invitation_signup_synced = sync_invitation_signup_rewards(&state, now).await?;
+    let invitation_signup_synced = sync_invitation_signup_rewards(state, now).await?;
     tracing::info!(
         synced_count = invitation_signup_synced,
         "Invitation signup rewards synced"
     );
 
-    let invitation_signup_unlocked = sync_invitation_signup_reward_unlocks(&state, now).await?;
+    let invitation_signup_unlocked = sync_invitation_signup_reward_unlocks(state, now).await?;
     tracing::info!(
         unlocked_count = invitation_signup_unlocked,
         "Invitation signup rewards unlocked"
@@ -63,10 +113,10 @@ pub async fn sync_rebates(
 
     let order_rebate_enabled = get_config_bool(&state.pool, ORDER_REBATE_ENABLED_KEY).await?;
     let (topup_synced, subscription_synced) = if order_rebate_enabled {
-        let topup_synced = sync_topup_orders(&state, now).await?;
+        let topup_synced = sync_topup_orders(state, now).await?;
         tracing::info!(synced_count = topup_synced, "Topup orders synced");
 
-        let subscription_synced = sync_subscription_orders(&state, now).await?;
+        let subscription_synced = sync_subscription_orders(state, now).await?;
         tracing::info!(
             synced_count = subscription_synced,
             "Subscription orders synced"
@@ -78,17 +128,15 @@ pub async fn sync_rebates(
         (0, 0)
     };
 
-    Ok(message(
-        SyncResponse {
-            finalized,
-            invitation_registrations_synced,
-            invitation_signup_synced,
-            invitation_signup_unlocked,
-            topup_synced,
-            subscription_synced,
-        },
-        "同步完成",
-    ))
+    Ok(SyncResponse {
+        skipped: false,
+        finalized,
+        invitation_registrations_synced,
+        invitation_signup_synced,
+        invitation_signup_unlocked,
+        topup_synced,
+        subscription_synced,
+    })
 }
 
 #[derive(Deserialize)]
@@ -98,12 +146,27 @@ pub struct SyncParams {
 
 #[derive(Serialize)]
 pub struct SyncResponse {
+    pub skipped: bool,
     pub finalized: i64,
     pub invitation_registrations_synced: i64,
     pub invitation_signup_synced: i64,
     pub invitation_signup_unlocked: i64,
     pub topup_synced: i64,
     pub subscription_synced: i64,
+}
+
+impl SyncResponse {
+    fn skipped() -> Self {
+        Self {
+            skipped: true,
+            finalized: 0,
+            invitation_registrations_synced: 0,
+            invitation_signup_synced: 0,
+            invitation_signup_unlocked: 0,
+            topup_synced: 0,
+            subscription_synced: 0,
+        }
+    }
 }
 
 async fn sync_invitation_registrations(state: &AppState, now: i64) -> Result<i64> {
@@ -631,5 +694,18 @@ mod tests {
     #[test]
     fn insert_outcome_distinguishes_duplicate() {
         assert_eq!(InsertOutcome::Duplicate, InsertOutcome::Duplicate);
+    }
+
+    #[test]
+    fn skipped_sync_response_has_zero_counts() {
+        let response = SyncResponse::skipped();
+
+        assert!(response.skipped);
+        assert_eq!(response.finalized, 0);
+        assert_eq!(response.invitation_registrations_synced, 0);
+        assert_eq!(response.invitation_signup_synced, 0);
+        assert_eq!(response.invitation_signup_unlocked, 0);
+        assert_eq!(response.topup_synced, 0);
+        assert_eq!(response.subscription_synced, 0);
     }
 }
