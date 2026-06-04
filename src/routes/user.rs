@@ -728,6 +728,49 @@ pub async fn count_rebate_records(
     Ok(total)
 }
 
+pub async fn fetch_user_related_rebate_records(
+    pool: &PgPool,
+    user_id: i64,
+    page_size: i64,
+    offset: i64,
+) -> Result<Vec<RebateRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
+               rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
+               unlock_required, unlocked_at, created_at, updated_at, status
+        FROM rebate_records
+        WHERE inviter_id = $1 OR invitee_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(user_id)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    let now = Utc::now().timestamp();
+    rows.iter()
+        .map(|row| rebate_record_from_row(row, now))
+        .collect()
+}
+
+pub async fn count_user_related_rebate_records(pool: &PgPool, user_id: i64) -> Result<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM rebate_records
+        WHERE inviter_id = $1 OR invitee_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from)
+}
+
 pub fn quota_to_cents(amount: i64) -> i64 {
     (amount * CENTS_PER_YUAN + QUOTA_UNITS_PER_YUAN / 2) / QUOTA_UNITS_PER_YUAN
 }

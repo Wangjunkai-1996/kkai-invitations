@@ -18,12 +18,14 @@ use crate::rebate_lifecycle::{
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::{
-    INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    is_invitation_signup_reward_order_type, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
+    INVITATION_SIGNUP_INVITER_ORDER_TYPE,
 };
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::routes::user::{
-    cents_to_quota, count_rebate_records, fetch_rebate_records, quota_to_cents, PaginationParams,
-    RebateRecord,
+    cents_to_quota, count_rebate_records, count_user_related_rebate_records, fetch_rebate_records,
+    fetch_user_related_rebate_records, quota_to_cents, PaginationParams, RebateRecord,
+    RebateRecordSourceFilter,
 };
 use crate::system_config::{
     get_config_bool, get_config_i64, get_config_i64_or_fallback,
@@ -179,6 +181,13 @@ pub struct InvitationRegistrationRewardResponse {
     pub record_id: Option<i64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationRegistrationRewardRevokeResponse {
+    pub revoked: bool,
+    pub record_id: Option<i64>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebateRequestListParams {
@@ -212,6 +221,7 @@ impl RebateRequestListParams {
 #[serde(rename_all = "camelCase")]
 pub struct AdminRebateRecordListParams {
     pub status: Option<String>,
+    pub source: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -234,6 +244,20 @@ impl AdminRebateRecordListParams {
             Some("pending" | "requested" | "approved" | "completed" | "rejected") => {
                 self.status.as_deref()
             }
+            _ => None,
+        }
+    }
+
+    fn source_filter(&self) -> Option<RebateRecordSourceFilter> {
+        match self.source.as_deref() {
+            Some("order") => Some(RebateRecordSourceFilter {
+                order_rebate_enabled: true,
+                invitation_signup_reward_enabled: false,
+            }),
+            Some("signup") => Some(RebateRecordSourceFilter {
+                order_rebate_enabled: false,
+                invitation_signup_reward_enabled: true,
+            }),
             _ => None,
         }
     }
@@ -1028,6 +1052,57 @@ pub async fn complete_rebate_request(
     Ok(message(serde_json::json!({ "id": id }), "返利处理已完成"))
 }
 
+// POST /api/admin/rebate-requests/:id/undo-complete
+pub async fn undo_complete_rebate_request(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    validate_id(id)?;
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+
+    let row = sqlx::query(
+        "SELECT rebate_record_ids FROM rebate_requests WHERE id = $1 AND status = 'completed' FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("申请不存在或状态不正确".to_string()))?;
+    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
+
+    sqlx::query(
+        "UPDATE rebate_requests SET status = 'approved', completed_at = NULL, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    let updated_records = sqlx::query(
+        "UPDATE rebate_records SET status = 'approved', updated_at = $1 WHERE id = ANY($2) AND status = 'completed'",
+    )
+    .bind(now)
+    .bind(&rebate_record_ids)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    tx.commit().await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        request_id = id,
+        updated_records,
+        "Admin withdrew completed rebate request"
+    );
+
+    Ok(message(
+        serde_json::json!({ "id": id }),
+        "返利完成状态已撤回",
+    ))
+}
+
 // GET /api/admin/rebate-stats
 pub async fn get_rebate_stats(
     State(state): State<AppState>,
@@ -1070,17 +1145,25 @@ pub async fn get_rebate_records(
     _admin: AdminUser,
     Query(params): Query<AdminRebateRecordListParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
+    let source_filter = params.source_filter();
     let records = fetch_rebate_records(
         &state.pool,
         None,
         params.status_filter(),
         true,
-        None,
+        source_filter,
         params.page_size(),
         params.offset(),
     )
     .await?;
-    let total = count_rebate_records(&state.pool, None, params.status_filter(), true, None).await?;
+    let total = count_rebate_records(
+        &state.pool,
+        None,
+        params.status_filter(),
+        true,
+        source_filter,
+    )
+    .await?;
 
     Ok(ok(PaginatedResponse {
         items: records,
@@ -1088,6 +1171,60 @@ pub async fn get_rebate_records(
         page: params.page(),
         page_size: params.page_size(),
     }))
+}
+
+// POST /api/admin/rebate-records/:id/revoke-signup-reward
+pub async fn revoke_signup_reward_rebate_record(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardRevokeResponse>>> {
+    validate_id(id)?;
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT id, order_type, status
+        FROM rebate_records
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("返利记录不存在".to_string()))?;
+
+    let record_id: i64 = row.try_get("id")?;
+    let order_type: String = row.try_get("order_type")?;
+    if !is_invitation_signup_reward_order_type(&order_type) {
+        return Err(AppError::BadRequest(
+            "只有邀请注册奖励记录可以撤回".to_string(),
+        ));
+    }
+
+    let status: String = row.try_get("status")?;
+    let linked_request_count =
+        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, &status, now).await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        record_id,
+        order_type,
+        linked_request_count,
+        "Admin revoked invitation signup reward rebate record"
+    );
+
+    Ok(message(
+        InvitationRegistrationRewardRevokeResponse {
+            revoked: true,
+            record_id: Some(record_id),
+        },
+        "邀请注册奖励已撤回",
+    ))
 }
 
 // GET /api/admin/rebate-order-records
@@ -1556,6 +1693,26 @@ pub async fn generate_invitation_registration_invitee_reward(
     .await
 }
 
+// POST /api/admin/invitation-registrations/:id/inviter-reward/revoke
+pub async fn revoke_invitation_registration_inviter_reward(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardRevokeResponse>>> {
+    revoke_invitation_registration_reward(&state, &admin, id, INVITATION_SIGNUP_INVITER_ORDER_TYPE)
+        .await
+}
+
+// POST /api/admin/invitation-registrations/:id/invitee-reward/revoke
+pub async fn revoke_invitation_registration_invitee_reward(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardRevokeResponse>>> {
+    revoke_invitation_registration_reward(&state, &admin, id, INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
+        .await
+}
+
 // GET /api/admin/user-rebates/:user_id
 pub async fn get_user_rebates(
     State(state): State<AppState>,
@@ -1565,17 +1722,14 @@ pub async fn get_user_rebates(
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
     validate_id(user_id)?;
 
-    let records = fetch_rebate_records(
+    let records = fetch_user_related_rebate_records(
         &state.pool,
-        Some(user_id),
-        None,
-        false,
-        None,
+        user_id,
         params.page_size(),
         params.offset(),
     )
     .await?;
-    let total = count_rebate_records(&state.pool, Some(user_id), None, false, None).await?;
+    let total = count_user_related_rebate_records(&state.pool, user_id).await?;
 
     Ok(ok(PaginatedResponse {
         items: records,
@@ -1665,6 +1819,75 @@ async fn generate_invitation_registration_reward(
     };
 
     Ok(message(response, message_text))
+}
+
+async fn revoke_invitation_registration_reward(
+    state: &AppState,
+    admin: &AdminUser,
+    registration_id: i64,
+    order_type: &str,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardRevokeResponse>>> {
+    validate_id(registration_id)?;
+    let registration = fetch_local_invitation_registration(state, registration_id).await?;
+    let reward_owner_id = if order_type == INVITATION_SIGNUP_INVITER_ORDER_TYPE {
+        registration.inviter_id
+    } else {
+        registration.invitee_id
+    };
+    let now = Utc::now().timestamp();
+
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, status
+        FROM rebate_records
+        WHERE order_type = $1
+          AND order_id = $2
+          AND invitee_id = $2
+          AND inviter_id = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(order_type)
+    .bind(registration.invitee_id)
+    .bind(reward_owner_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(message(
+            InvitationRegistrationRewardRevokeResponse {
+                revoked: false,
+                record_id: None,
+            },
+            "邀请注册奖励不存在",
+        ));
+    };
+
+    let record_id: i64 = row.try_get("id")?;
+    let status: String = row.try_get("status")?;
+    let linked_request_count =
+        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, &status, now).await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        registration_id,
+        order_type,
+        record_id,
+        linked_request_count,
+        "Admin revoked invitation signup reward"
+    );
+
+    Ok(message(
+        InvitationRegistrationRewardRevokeResponse {
+            revoked: true,
+            record_id: Some(record_id),
+        },
+        "邀请注册奖励已撤回",
+    ))
 }
 
 async fn count_newapi_invitation_registrations(state: &AppState) -> Result<i64> {
@@ -2545,6 +2768,100 @@ async fn lock_rebate_records(
     .map_err(AppError::from)
 }
 
+async fn rebate_records_total_amount(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record_ids: &[i64],
+) -> Result<i64> {
+    if record_ids.is_empty() {
+        return Ok(0);
+    }
+
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(rebate_amount), 0)::BIGINT FROM rebate_records WHERE id = ANY($1)",
+    )
+    .bind(record_ids)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(AppError::from)
+}
+
+async fn revoke_invitation_signup_reward_record_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record_id: i64,
+    status: &str,
+    now: i64,
+) -> Result<usize> {
+    if status == "completed" {
+        return Err(AppError::BadRequest(
+            "已完成的邀请注册奖励不能撤回，请先撤回返利完成状态".to_string(),
+        ));
+    }
+
+    let request_rows = sqlx::query(
+        r#"
+        SELECT id, status, rebate_record_ids
+        FROM rebate_requests
+        WHERE $1 = ANY(rebate_record_ids)
+        FOR UPDATE
+        "#,
+    )
+    .bind(record_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for request_row in &request_rows {
+        let request_status: String = request_row.try_get("status")?;
+        if request_status == "completed" {
+            return Err(AppError::BadRequest(
+                "该奖励关联的返利申请已完成，请先撤回完成状态".to_string(),
+            ));
+        }
+    }
+
+    let linked_request_count = request_rows.len();
+    for request_row in &request_rows {
+        let request_id: i64 = request_row.try_get("id")?;
+        let rebate_record_ids: Vec<i64> = request_row.try_get("rebate_record_ids")?;
+        let remaining_ids = without_rebate_record_id(&rebate_record_ids, record_id);
+
+        if remaining_ids.is_empty() {
+            sqlx::query("DELETE FROM rebate_requests WHERE id = $1")
+                .bind(request_id)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            let total_amount = rebate_records_total_amount(tx, &remaining_ids).await?;
+            sqlx::query(
+                r#"
+                UPDATE rebate_requests
+                SET rebate_record_ids = $1,
+                    total_amount = $2,
+                    updated_at = $3
+                WHERE id = $4
+                "#,
+            )
+            .bind(&remaining_ids)
+            .bind(total_amount)
+            .bind(now)
+            .bind(request_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    let deleted = sqlx::query("DELETE FROM rebate_records WHERE id = $1")
+        .bind(record_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+
+    if deleted == 0 {
+        return Err(AppError::NotFound("返利记录不存在".to_string()));
+    }
+
+    Ok(linked_request_count)
+}
+
 async fn lock_rebate_request_for_review(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: i64,
@@ -2597,6 +2914,14 @@ fn validate_operation_rows(
 
 fn is_rebate_record_mutable(status: &str) -> bool {
     matches!(status, "initializing" | "pending" | "rejected")
+}
+
+fn without_rebate_record_id(record_ids: &[i64], record_id: i64) -> Vec<i64> {
+    record_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != record_id)
+        .collect()
 }
 
 fn can_extend_initialization(status: &str) -> bool {
@@ -2680,11 +3005,19 @@ mod tests {
     }
 
     #[test]
+    fn removes_rebate_record_id_from_request_record_list() {
+        assert_eq!(without_rebate_record_id(&[1, 2, 3], 2), vec![1, 3]);
+        assert_eq!(without_rebate_record_id(&[7], 7), Vec::<i64>::new());
+        assert_eq!(without_rebate_record_id(&[4, 5], 9), vec![4, 5]);
+    }
+
+    #[test]
     fn admin_rebate_record_params_accept_record_statuses() {
         let requested = AdminRebateRecordListParams {
             page: None,
             page_size: None,
             status: Some("requested".to_string()),
+            source: None,
         };
         assert_eq!(requested.status_filter(), Some("requested"));
 
@@ -2692,8 +3025,32 @@ mod tests {
             page: None,
             page_size: None,
             status: Some("rejected".to_string()),
+            source: None,
         };
         assert_eq!(rejected.status_filter(), Some("rejected"));
+    }
+
+    #[test]
+    fn admin_rebate_record_params_filter_record_sources() {
+        let signup = AdminRebateRecordListParams {
+            page: None,
+            page_size: None,
+            status: None,
+            source: Some("signup".to_string()),
+        };
+        let signup_filter = signup.source_filter().expect("signup filter");
+        assert!(!signup_filter.order_rebate_enabled);
+        assert!(signup_filter.invitation_signup_reward_enabled);
+
+        let order = AdminRebateRecordListParams {
+            page: None,
+            page_size: None,
+            status: None,
+            source: Some("order".to_string()),
+        };
+        let order_filter = order.source_filter().expect("order filter");
+        assert!(order_filter.order_rebate_enabled);
+        assert!(!order_filter.invitation_signup_reward_enabled);
     }
 
     #[test]

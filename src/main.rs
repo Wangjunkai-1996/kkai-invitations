@@ -124,12 +124,20 @@ async fn main() {
             post(routes::admin::complete_rebate_request),
         )
         .route(
+            &format!("{b}/api/admin/rebate-requests/{{id}}/undo-complete"),
+            post(routes::admin::undo_complete_rebate_request),
+        )
+        .route(
             &format!("{b}/api/admin/rebate-stats"),
             get(routes::admin::get_rebate_stats),
         )
         .route(
             &format!("{b}/api/admin/rebate-records"),
             get(routes::admin::get_rebate_records),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-records/{{id}}/revoke-signup-reward"),
+            post(routes::admin::revoke_signup_reward_rebate_record),
         )
         .route(
             &format!("{b}/api/admin/rebate-order-records"),
@@ -164,8 +172,16 @@ async fn main() {
             post(routes::admin::generate_invitation_registration_inviter_reward),
         )
         .route(
+            &format!("{b}/api/admin/invitation-registrations/{{id}}/inviter-reward/revoke"),
+            post(routes::admin::revoke_invitation_registration_inviter_reward),
+        )
+        .route(
             &format!("{b}/api/admin/invitation-registrations/{{id}}/invitee-reward"),
             post(routes::admin::generate_invitation_registration_invitee_reward),
+        )
+        .route(
+            &format!("{b}/api/admin/invitation-registrations/{{id}}/invitee-reward/revoke"),
+            post(routes::admin::revoke_invitation_registration_invitee_reward),
         )
         .route(
             &format!("{b}/api/admin/user-rebates/{{user_id}}"),
