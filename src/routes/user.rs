@@ -73,6 +73,7 @@ pub struct RebateRecord {
     pub inviter_id: i64,
     pub order_type: String,
     pub order_amount: i64,
+    pub order_time: String,
     pub rebate_amount: i64,
     pub rebate_ratio: Option<f64>,
     pub status: String,
@@ -658,7 +659,7 @@ pub async fn fetch_rebate_records(
     let rows = sqlx::query(
         r#"
         SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-               rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
+               order_time, rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
                unlock_required, unlocked_at, created_at, updated_at, status
         FROM rebate_records
         WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
@@ -744,7 +745,7 @@ pub async fn fetch_user_related_rebate_records(
     let rows = sqlx::query(
         r#"
         SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
-               rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
+               order_time, rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
                unlock_required, unlocked_at, created_at, updated_at, status
         FROM rebate_records
         WHERE inviter_id = $1 OR invitee_id = $1
@@ -811,6 +812,7 @@ fn rebate_record_from_row(row: &PgRow, now: i64) -> Result<RebateRecord> {
         inviter_id: row.try_get("inviter_id")?,
         order_type,
         order_amount: yuan_text_to_cents(row.try_get("order_amount")?),
+        order_time: timestamp_to_iso(row.try_get("order_time")?),
         rebate_amount: quota_to_cents(row.try_get("rebate_amount")?),
         rebate_ratio: rebate_rate.map(text_to_f64),
         status,

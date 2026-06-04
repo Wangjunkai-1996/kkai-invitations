@@ -35,6 +35,7 @@ pub struct InsertInvitationSignupReward<'a> {
     pub invitee_id: i64,
     pub user_group: &'a str,
     pub reward_amount: i64,
+    pub order_time: i64,
     pub unlock_required: bool,
     pub unlocked_at: Option<i64>,
     pub now: i64,
@@ -45,6 +46,7 @@ pub async fn insert_invitation_signup_reward_record(
     params: InsertInvitationSignupReward<'_>,
 ) -> Result<RewardInsertOutcome> {
     let ulid = ulid::Ulid::new().to_string();
+    let order_time = resolve_invitation_signup_reward_order_time(params.order_time, params.now);
     let unlocked_at = if params.unlock_required {
         params.unlocked_at
     } else {
@@ -60,7 +62,7 @@ pub async fn insert_invitation_signup_reward_record(
             status, scan_started_at, initialization_ends_at, finalized_at, unlock_required,
             unlocked_at, created_at, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $3, 0, $6, $6, $7, NULL, 'pending', $6, $6, $6, $8, $9, $6, $6)
+        VALUES ($1, $2, $3, $4, $5, $3, 0, $6, $6, $8, NULL, 'pending', $7, $7, $7, $9, $10, $7, $7)
         ON CONFLICT (order_type, order_id) DO NOTHING
         RETURNING id
         "#,
@@ -70,6 +72,7 @@ pub async fn insert_invitation_signup_reward_record(
     .bind(params.invitee_id)
     .bind(params.user_group)
     .bind(params.order_type)
+    .bind(order_time)
     .bind(params.now)
     .bind(params.reward_amount)
     .bind(params.unlock_required)
@@ -89,6 +92,14 @@ pub async fn insert_invitation_signup_reward_record(
             .await?;
 
     Ok(RewardInsertOutcome::Duplicate { record_id })
+}
+
+pub fn resolve_invitation_signup_reward_order_time(order_time: i64, now: i64) -> i64 {
+    if order_time > 0 {
+        order_time
+    } else {
+        now
+    }
 }
 
 pub fn resolve_invitation_signup_reward_unlocked_at(
@@ -148,6 +159,8 @@ pub async fn unlock_paid_invitation_signup_rewards(
     newapi_pool: &PgPool,
     now: i64,
 ) -> Result<u64> {
+    repair_invitation_signup_reward_order_times(pool, now).await?;
+
     let locked_rows = sqlx::query(
         r#"
         SELECT DISTINCT invitee_id
@@ -201,6 +214,28 @@ pub async fn unlock_paid_invitation_signup_rewards(
     .rows_affected();
 
     Ok(updated)
+}
+
+async fn repair_invitation_signup_reward_order_times(pool: &PgPool, now: i64) -> Result<u64> {
+    sqlx::query(
+        r#"
+        UPDATE rebate_records rr
+        SET order_time = ir.invited_at,
+            updated_at = $1
+        FROM invitation_registrations ir
+        WHERE rr.invitee_id = ir.invitee_id
+          AND rr.order_type IN ($2, $3)
+          AND ir.invited_at > 0
+          AND rr.order_time <> ir.invited_at
+        "#,
+    )
+    .bind(now)
+    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
+    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(AppError::from)
 }
 
 pub struct UpsertInvitationRegistration<'a> {
@@ -289,6 +324,16 @@ mod tests {
         assert_eq!(
             resolve_invitation_signup_reward_unlocked_at(true, true, 1_000),
             Some(1_000)
+        );
+    }
+
+    #[test]
+    fn resolves_signup_reward_order_timestamp() {
+        assert_eq!(resolve_invitation_signup_reward_order_time(900, 1_000), 900);
+        assert_eq!(resolve_invitation_signup_reward_order_time(0, 1_000), 1_000);
+        assert_eq!(
+            resolve_invitation_signup_reward_order_time(-1, 1_000),
+            1_000
         );
     }
 }

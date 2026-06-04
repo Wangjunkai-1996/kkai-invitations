@@ -218,7 +218,11 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
     let last_sync_id = last_sync_id(state, "invite_signup").await?;
     let users = sqlx::query(
         r#"
-        SELECT id, inviter_id, "group"
+        SELECT
+            id,
+            inviter_id,
+            "group",
+            COALESCE(NULLIF(created_at, 0), $2) AS invited_at
         FROM users
         WHERE id > $1
           AND inviter_id IS NOT NULL
@@ -228,6 +232,7 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
         "#,
     )
     .bind(last_sync_id)
+    .bind(now)
     .fetch_all(&state.newapi_pool)
     .await?;
 
@@ -254,6 +259,7 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
         let invitee_id: i64 = user.try_get("id")?;
         let inviter_id: i64 = user.try_get("inviter_id")?;
         let group: Option<String> = user.try_get("group")?;
+        let invited_at: i64 = user.try_get("invited_at")?;
         let user_group = group.as_deref().unwrap_or("default");
 
         if inviter_reward_amount > 0 {
@@ -265,6 +271,7 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
                     invitee_id,
                     user_group,
                     reward_amount: inviter_reward_amount,
+                    order_time: invited_at,
                     unlock_required: inviter_unlock_required,
                     unlocked_at: resolve_invitation_signup_reward_unlocked_at(
                         inviter_unlock_required,
@@ -287,6 +294,7 @@ async fn sync_invitation_signup_rewards(state: &AppState, now: i64) -> Result<i6
                     invitee_id,
                     user_group,
                     reward_amount: invitee_reward_amount,
+                    order_time: invited_at,
                     unlock_required: invitee_unlock_required,
                     unlocked_at: resolve_invitation_signup_reward_unlocked_at(
                         invitee_unlock_required,

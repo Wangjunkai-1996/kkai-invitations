@@ -1806,6 +1806,7 @@ async fn generate_invitation_registration_reward(
             invitee_id: registration.invitee_id,
             user_group: &registration.user_group,
             reward_amount,
+            order_time: registration.invited_at,
             unlock_required,
             unlocked_at: resolve_invitation_signup_reward_unlocked_at(
                 unlock_required,
