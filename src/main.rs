@@ -1,11 +1,14 @@
 mod config;
 mod db;
 mod error;
+mod invitation_signup;
 mod middleware;
 mod rebate_lifecycle;
+mod rebate_types;
 mod response;
 mod routes;
 mod session;
+mod system_config;
 
 use axum::{
     routing::{delete, get, patch, post, put},
@@ -113,12 +116,20 @@ async fn main() {
             post(routes::admin::reject_rebate_request),
         )
         .route(
+            &format!("{b}/api/admin/rebate-requests/{{id}}/reset"),
+            post(routes::admin::reset_rebate_request_review),
+        )
+        .route(
             &format!("{b}/api/admin/rebate-requests/{{id}}/complete"),
             post(routes::admin::complete_rebate_request),
         )
         .route(
             &format!("{b}/api/admin/rebate-stats"),
             get(routes::admin::get_rebate_stats),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-records"),
+            get(routes::admin::get_rebate_records),
         )
         .route(
             &format!("{b}/api/admin/rebate-order-records"),
@@ -143,6 +154,18 @@ async fn main() {
         .route(
             &format!("{b}/api/admin/rebate-order-records/extend-initialization"),
             post(routes::admin::extend_rebate_order_initialization),
+        )
+        .route(
+            &format!("{b}/api/admin/invitation-registrations"),
+            get(routes::admin::get_invitation_registrations),
+        )
+        .route(
+            &format!("{b}/api/admin/invitation-registrations/{{id}}/inviter-reward"),
+            post(routes::admin::generate_invitation_registration_inviter_reward),
+        )
+        .route(
+            &format!("{b}/api/admin/invitation-registrations/{{id}}/invitee-reward"),
+            post(routes::admin::generate_invitation_registration_invitee_reward),
         )
         .route(
             &format!("{b}/api/admin/user-rebates/{{user_id}}"),

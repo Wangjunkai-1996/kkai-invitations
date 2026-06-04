@@ -1,9 +1,16 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Executor;
 
-pub const USER_INVITATION_REBATE_ENABLED_KEY: &str = "user_invitation_rebate_enabled";
-
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
+
+use crate::system_config::{
+    INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY,
+    INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY, INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_REWARD_ENABLED_KEY, INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY,
+    ORDER_REBATE_ENABLED_KEY, REBATE_TO_BALANCE_ENABLED_KEY, USER_INVITATION_REBATE_ENABLED_KEY,
+};
 
 pub async fn init_pool(database_url: &str) -> PgPool {
     let pool = PgPoolOptions::new()
@@ -83,6 +90,8 @@ async fn migrate(pool: &PgPool) {
             finalized_at BIGINT,
             admin_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
             closed_at BIGINT,
+            unlock_required BOOLEAN NOT NULL DEFAULT FALSE,
+            unlocked_at BIGINT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             UNIQUE(order_type, order_id)
@@ -132,6 +141,45 @@ async fn migrate(pool: &PgPool) {
         .await
         .ok();
 
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rebate_records_signup_unlock ON rebate_records(order_type, unlock_required, unlocked_at, invitee_id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    // 邀请注册关系表
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS invitation_registrations (
+            id BIGSERIAL PRIMARY KEY,
+            inviter_id BIGINT NOT NULL,
+            invitee_id BIGINT NOT NULL UNIQUE,
+            user_group VARCHAR(64) NOT NULL,
+            invited_at BIGINT NOT NULL,
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failed to create invitation_registrations table");
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_invitation_registrations_inviter ON invitation_registrations(inviter_id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_invitation_registrations_invited_at ON invitation_registrations(invited_at DESC, id DESC)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     // 返利申请表
     sqlx::query(
         r#"
@@ -170,7 +218,7 @@ async fn migrate(pool: &PgPool) {
         r#"
         CREATE TABLE IF NOT EXISTS sync_log (
             id BIGSERIAL PRIMARY KEY,
-            sync_type VARCHAR(20) NOT NULL,
+            sync_type VARCHAR(64) NOT NULL,
             last_sync_id BIGINT NOT NULL,
             last_sync_time BIGINT NOT NULL,
             created_at BIGINT NOT NULL
@@ -180,6 +228,11 @@ async fn migrate(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("failed to create sync_log table");
+
+    sqlx::query("ALTER TABLE sync_log ALTER COLUMN sync_type TYPE VARCHAR(64)")
+        .execute(pool)
+        .await
+        .ok();
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_sync_log_type_id ON sync_log(sync_type, last_sync_id)",
@@ -210,10 +263,29 @@ async fn migrate(pool: &PgPool) {
         VALUES
             ('min_rebate_request_amount', '1000000', '最低返利申请金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
             ('rebate_request_frequency_days', '7', '返利申请频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ('user_invitation_rebate_enabled', 'true', '用户侧邀请返利界面开关', EXTRACT(EPOCH FROM NOW())::BIGINT)
+            ($1, 'true', '用户侧邀请返利界面开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($2, 'true', '订单返利开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($3, 'false', '邀请注册奖励开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($4, '1000000', '邀请注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($5, '1000000', '邀请人注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($6, '1000000', '被邀请人注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($7, 'true', '邀请注册奖励是否需要审核', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($8, 'false', '邀请人注册奖励是否等待被邀请人首次充值/订阅', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($9, 'false', '被邀请人注册奖励是否等待首次充值/订阅', EXTRACT(EPOCH FROM NOW())::BIGINT),
+            ($10, 'true', '返利到余额开关', EXTRACT(EPOCH FROM NOW())::BIGINT)
         ON CONFLICT (key) DO NOTHING
         "#,
     )
+    .bind(USER_INVITATION_REBATE_ENABLED_KEY)
+    .bind(ORDER_REBATE_ENABLED_KEY)
+    .bind(INVITATION_SIGNUP_REWARD_ENABLED_KEY)
+    .bind(INVITATION_SIGNUP_REWARD_AMOUNT_KEY)
+    .bind(INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY)
+    .bind(INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY)
+    .bind(INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY)
+    .bind(INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY)
+    .bind(INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY)
+    .bind(REBATE_TO_BALANCE_ENABLED_KEY)
     .execute(pool)
     .await
     .ok();

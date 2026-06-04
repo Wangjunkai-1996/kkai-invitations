@@ -7,17 +7,32 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 
-use crate::db::USER_INVITATION_REBATE_ENABLED_KEY;
 use crate::error::{AppError, Result};
+use crate::invitation_signup::{
+    insert_invitation_signup_reward_record, upsert_invitation_registration,
+    InsertInvitationSignupReward, RewardInsertOutcome, UpsertInvitationRegistration,
+};
 use crate::middleware::AdminUser;
 use crate::rebate_lifecycle::{
     finalize_initializing_records_by_ids, rebate_amount_for_yuan, ALL_USER_GROUP,
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
+use crate::rebate_types::{
+    INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+};
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::routes::user::{
     cents_to_quota, count_rebate_records, fetch_rebate_records, quota_to_cents, PaginationParams,
     RebateRecord,
+};
+use crate::system_config::{
+    get_config_bool, get_config_i64, get_config_i64_or_fallback,
+    INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY,
+    INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY, INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+    INVITATION_SIGNUP_REWARD_ENABLED_KEY, INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY,
+    ORDER_REBATE_ENABLED_KEY, REBATE_TO_BALANCE_ENABLED_KEY, USER_INVITATION_REBATE_ENABLED_KEY,
 };
 use crate::AppState;
 
@@ -57,6 +72,18 @@ pub struct SystemConfig {
     pub min_rebate_request_amount: i64,
     pub rebate_request_frequency_days: i64,
     pub user_invitation_rebate_enabled: bool,
+    pub order_rebate_enabled: bool,
+    pub invitation_signup_reward_enabled: bool,
+    #[serde(default)]
+    pub invitation_signup_reward_amount: i64,
+    #[serde(default)]
+    pub invitation_signup_inviter_reward_amount: i64,
+    #[serde(default)]
+    pub invitation_signup_invitee_reward_amount: i64,
+    pub invitation_signup_reward_review_required: bool,
+    pub invitation_signup_inviter_reward_requires_paid_order: bool,
+    pub invitation_signup_invitee_reward_requires_paid_order: bool,
+    pub rebate_to_balance_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +106,7 @@ pub struct RebateRequestDetail {
     pub approved_at: Option<String>,
     pub completed_at: Option<String>,
     pub rejected_at: Option<String>,
+    pub review_note: Option<String>,
     pub reject_reason: Option<String>,
 }
 
@@ -123,6 +151,34 @@ pub struct AdminRebateOrderRecord {
     pub can_extend_initialization: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminInvitationRegistration {
+    pub id: i64,
+    pub inviter_id: i64,
+    pub inviter_name: Option<String>,
+    pub invitee_id: i64,
+    pub invitee_name: Option<String>,
+    pub user_group: String,
+    pub invited_at: String,
+    pub total_reward_amount: i64,
+    pub inviter_reward_generated: bool,
+    pub inviter_reward_record_id: Option<i64>,
+    pub inviter_reward_amount: i64,
+    pub inviter_reward_status: Option<String>,
+    pub invitee_reward_generated: bool,
+    pub invitee_reward_record_id: Option<i64>,
+    pub invitee_reward_amount: i64,
+    pub invitee_reward_status: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationRegistrationRewardResponse {
+    pub generated: bool,
+    pub record_id: Option<i64>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebateRequestListParams {
@@ -154,6 +210,37 @@ impl RebateRequestListParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminRebateRecordListParams {
+    pub status: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+impl AdminRebateRecordListParams {
+    fn page(&self) -> i64 {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    fn page_size(&self) -> i64 {
+        self.page_size.unwrap_or(100).clamp(1, 1000)
+    }
+
+    fn offset(&self) -> i64 {
+        (self.page() - 1) * self.page_size()
+    }
+
+    fn status_filter(&self) -> Option<&str> {
+        match self.status.as_deref() {
+            Some("pending" | "requested" | "approved" | "completed" | "rejected") => {
+                self.status.as_deref()
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RebateOrderRecordParams {
     pub order_type: Option<String>,
     pub page: Option<i64>,
@@ -178,6 +265,27 @@ impl RebateOrderRecordParams {
             Some("topup" | "subscription") => self.order_type.as_deref(),
             _ => None,
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationRegistrationParams {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+impl InvitationRegistrationParams {
+    fn page(&self) -> i64 {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    fn page_size(&self) -> i64 {
+        self.page_size.unwrap_or(20).clamp(1, 100)
+    }
+
+    fn offset(&self) -> i64 {
+        (self.page() - 1) * self.page_size()
     }
 }
 
@@ -218,6 +326,34 @@ struct NewApiRebateOrderDiagnostics {
     topup_rebate_orders: i64,
     subscription_success: i64,
     subscription_invited: i64,
+}
+
+struct NewApiInvitationRegistration {
+    inviter_id: i64,
+    inviter_name: Option<String>,
+    invitee_id: i64,
+    invitee_name: Option<String>,
+    user_group: String,
+    invited_at: i64,
+}
+
+struct LocalInvitationRegistration {
+    id: i64,
+    inviter_id: i64,
+    invitee_id: i64,
+    user_group: String,
+    invited_at: i64,
+}
+
+struct InvitationRegistrationReward {
+    record_id: i64,
+    rebate_amount: i64,
+    status: String,
+}
+
+struct InvitationSignupRewardAmounts {
+    inviter: i64,
+    invitee: i64,
 }
 
 #[derive(Deserialize)]
@@ -407,15 +543,59 @@ pub async fn get_system_config(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> Result<Json<ApiResponse<SystemConfig>>> {
-    let min_amount = get_config_value(&state.pool, "min_rebate_request_amount").await?;
-    let frequency_days = get_config_value(&state.pool, "rebate_request_frequency_days").await?;
+    let min_amount = get_config_i64(&state.pool, "min_rebate_request_amount").await?;
+    let frequency_days = get_config_i64(&state.pool, "rebate_request_frequency_days").await?;
     let user_invitation_rebate_enabled =
-        get_config_bool_value(&state.pool, USER_INVITATION_REBATE_ENABLED_KEY).await?;
+        get_config_bool(&state.pool, USER_INVITATION_REBATE_ENABLED_KEY).await?;
+    let order_rebate_enabled = get_config_bool(&state.pool, ORDER_REBATE_ENABLED_KEY).await?;
+    let invitation_signup_reward_enabled =
+        get_config_bool(&state.pool, INVITATION_SIGNUP_REWARD_ENABLED_KEY).await?;
+    let invitation_signup_reward_amount =
+        get_config_i64(&state.pool, INVITATION_SIGNUP_REWARD_AMOUNT_KEY).await?;
+    let invitation_signup_inviter_reward_amount = get_config_i64_or_fallback(
+        &state.pool,
+        INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
+        INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+    )
+    .await?;
+    let invitation_signup_invitee_reward_amount = get_config_i64_or_fallback(
+        &state.pool,
+        INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
+        INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+    )
+    .await?;
+    let invitation_signup_reward_review_required =
+        get_config_bool(&state.pool, INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY).await?;
+    let invitation_signup_inviter_reward_requires_paid_order = get_config_bool(
+        &state.pool,
+        INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY,
+    )
+    .await?;
+    let invitation_signup_invitee_reward_requires_paid_order = get_config_bool(
+        &state.pool,
+        INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY,
+    )
+    .await?;
+    let rebate_to_balance_enabled =
+        get_config_bool(&state.pool, REBATE_TO_BALANCE_ENABLED_KEY).await?;
 
     Ok(ok(SystemConfig {
         min_rebate_request_amount: quota_to_cents(min_amount),
         rebate_request_frequency_days: frequency_days,
         user_invitation_rebate_enabled,
+        order_rebate_enabled,
+        invitation_signup_reward_enabled,
+        invitation_signup_reward_amount: quota_to_cents(invitation_signup_reward_amount),
+        invitation_signup_inviter_reward_amount: quota_to_cents(
+            invitation_signup_inviter_reward_amount,
+        ),
+        invitation_signup_invitee_reward_amount: quota_to_cents(
+            invitation_signup_invitee_reward_amount,
+        ),
+        invitation_signup_reward_review_required,
+        invitation_signup_inviter_reward_requires_paid_order,
+        invitation_signup_invitee_reward_requires_paid_order,
+        rebate_to_balance_enabled,
     }))
 }
 
@@ -430,11 +610,30 @@ pub async fn update_system_config(
             "最低返利申请金额不能为负数".to_string(),
         ));
     }
-    if config.rebate_request_frequency_days < 1 {
+    if config.rebate_request_frequency_days < 0 {
         return Err(AppError::BadRequest(
-            "返利申请频率限制至少为 1 天".to_string(),
+            "返利申请频率限制不能为负数".to_string(),
         ));
     }
+    if config.invitation_signup_reward_amount < 0 {
+        return Err(AppError::BadRequest(
+            "邀请注册奖励金额不能为负数".to_string(),
+        ));
+    }
+    if config.invitation_signup_inviter_reward_amount < 0 {
+        return Err(AppError::BadRequest(
+            "邀请人注册奖励金额不能为负数".to_string(),
+        ));
+    }
+    if config.invitation_signup_invitee_reward_amount < 0 {
+        return Err(AppError::BadRequest(
+            "被邀请人注册奖励金额不能为负数".to_string(),
+        ));
+    }
+
+    let (inviter_reward_amount, invitee_reward_amount) =
+        resolve_signup_reward_amounts_for_update(&config);
+    let legacy_reward_amount = inviter_reward_amount.max(invitee_reward_amount);
 
     let now = Utc::now().timestamp();
     upsert_config_value(
@@ -465,10 +664,114 @@ pub async fn update_system_config(
         now,
     )
     .await?;
+    upsert_config_value(
+        &state.pool,
+        ORDER_REBATE_ENABLED_KEY,
+        if config.order_rebate_enabled {
+            "true"
+        } else {
+            "false"
+        },
+        "订单返利开关",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_REWARD_ENABLED_KEY,
+        if config.invitation_signup_reward_enabled {
+            "true"
+        } else {
+            "false"
+        },
+        "邀请注册奖励开关",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        REBATE_TO_BALANCE_ENABLED_KEY,
+        if config.rebate_to_balance_enabled {
+            "true"
+        } else {
+            "false"
+        },
+        "返利到余额开关",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+        &cents_to_quota(legacy_reward_amount).to_string(),
+        "邀请注册奖励金额兼容值（人民币分，API 层；数据库存 new-api 额度单位）",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
+        &cents_to_quota(inviter_reward_amount).to_string(),
+        "邀请人注册奖励金额（人民币分，API 层；数据库存 new-api 额度单位）",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
+        &cents_to_quota(invitee_reward_amount).to_string(),
+        "被邀请人注册奖励金额（人民币分，API 层；数据库存 new-api 额度单位）",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY,
+        if config.invitation_signup_reward_review_required {
+            "true"
+        } else {
+            "false"
+        },
+        "邀请注册奖励是否需要审核",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY,
+        if config.invitation_signup_inviter_reward_requires_paid_order {
+            "true"
+        } else {
+            "false"
+        },
+        "邀请人注册奖励是否等待被邀请人首次充值/订阅",
+        now,
+    )
+    .await?;
+    upsert_config_value(
+        &state.pool,
+        INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY,
+        if config.invitation_signup_invitee_reward_requires_paid_order {
+            "true"
+        } else {
+            "false"
+        },
+        "被邀请人注册奖励是否等待首次充值/订阅",
+        now,
+    )
+    .await?;
 
     tracing::info!(admin_id = admin.0.id, "Admin updated system config");
 
-    Ok(message(config, "系统配置已更新"))
+    Ok(message(
+        SystemConfig {
+            invitation_signup_reward_amount: legacy_reward_amount,
+            invitation_signup_inviter_reward_amount: inviter_reward_amount,
+            invitation_signup_invitee_reward_amount: invitee_reward_amount,
+            ..config
+        },
+        "系统配置已更新",
+    ))
 }
 
 // GET /api/admin/rebate-requests
@@ -506,19 +809,19 @@ pub async fn approve_rebate_request(
     let now = Utc::now().timestamp();
     let mut tx = state.pool.begin().await?;
 
-    let row = sqlx::query(
-        "SELECT rebate_record_ids FROM rebate_requests WHERE id = $1 AND status = 'pending' FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound("申请不存在或状态不正确".to_string()))?;
+    let row = lock_rebate_request_for_review(&mut tx, id).await?;
+    ensure_rebate_request_not_completed(&row)?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
     sqlx::query(
         r#"
         UPDATE rebate_requests
-        SET status = 'approved', admin_id = $1, admin_note = $2, approved_at = $3, updated_at = $3
+        SET status = 'approved',
+            admin_id = $1,
+            admin_note = $2,
+            approved_at = $3,
+            rejected_at = NULL,
+            updated_at = $3
         WHERE id = $4
         "#,
     )
@@ -530,7 +833,12 @@ pub async fn approve_rebate_request(
     .await?;
 
     sqlx::query(
-        "UPDATE rebate_records SET status = 'approved', updated_at = $1 WHERE id = ANY($2) AND status = 'requested'",
+        r#"
+        UPDATE rebate_records
+        SET status = 'approved', updated_at = $1
+        WHERE id = ANY($2)
+          AND status IN ('requested', 'pending', 'approved', 'rejected')
+        "#,
     )
     .bind(now)
     .bind(&rebate_record_ids)
@@ -567,19 +875,19 @@ pub async fn reject_rebate_request(
     }
 
     let mut tx = state.pool.begin().await?;
-    let row = sqlx::query(
-        "SELECT rebate_record_ids FROM rebate_requests WHERE id = $1 AND status = 'pending' FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound("申请不存在或状态不正确".to_string()))?;
+    let row = lock_rebate_request_for_review(&mut tx, id).await?;
+    ensure_rebate_request_not_completed(&row)?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
     sqlx::query(
         r#"
         UPDATE rebate_requests
-        SET status = 'rejected', admin_id = $1, admin_note = $2, rejected_at = $3, updated_at = $3
+        SET status = 'rejected',
+            admin_id = $1,
+            admin_note = $2,
+            approved_at = NULL,
+            rejected_at = $3,
+            updated_at = $3
         WHERE id = $4
         "#,
     )
@@ -591,7 +899,12 @@ pub async fn reject_rebate_request(
     .await?;
 
     sqlx::query(
-        "UPDATE rebate_records SET status = 'pending', updated_at = $1 WHERE id = ANY($2) AND status = 'requested'",
+        r#"
+        UPDATE rebate_records
+        SET status = 'pending', updated_at = $1
+        WHERE id = ANY($2)
+          AND status IN ('requested', 'pending', 'approved', 'rejected')
+        "#,
     )
     .bind(now)
     .bind(&rebate_record_ids)
@@ -608,6 +921,65 @@ pub async fn reject_rebate_request(
     );
 
     Ok(message(serde_json::json!({ "id": id }), "返利申请已拒绝"))
+}
+
+// POST /api/admin/rebate-requests/:id/reset
+pub async fn reset_rebate_request_review(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    validate_id(id)?;
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+
+    let row = lock_rebate_request_for_review(&mut tx, id).await?;
+    ensure_rebate_request_not_completed(&row)?;
+    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
+
+    sqlx::query(
+        r#"
+        UPDATE rebate_requests
+        SET status = 'pending',
+            admin_id = $1,
+            admin_note = NULL,
+            approved_at = NULL,
+            rejected_at = NULL,
+            updated_at = $2
+        WHERE id = $3
+        "#,
+    )
+    .bind(admin.0.id)
+    .bind(now)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE rebate_records
+        SET status = 'requested', updated_at = $1
+        WHERE id = ANY($2)
+          AND status IN ('requested', 'pending', 'approved', 'rejected')
+        "#,
+    )
+    .bind(now)
+    .bind(&rebate_record_ids)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        request_id = id,
+        "Admin reset rebate request review"
+    );
+
+    Ok(message(
+        serde_json::json!({ "id": id }),
+        "返利申请审核已撤回",
+    ))
 }
 
 // POST /api/admin/rebate-requests/:id/complete
@@ -692,6 +1064,32 @@ pub async fn get_rebate_stats(
     }))
 }
 
+// GET /api/admin/rebate-records
+pub async fn get_rebate_records(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Query(params): Query<AdminRebateRecordListParams>,
+) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
+    let records = fetch_rebate_records(
+        &state.pool,
+        None,
+        params.status_filter(),
+        true,
+        None,
+        params.page_size(),
+        params.offset(),
+    )
+    .await?;
+    let total = count_rebate_records(&state.pool, None, params.status_filter(), true, None).await?;
+
+    Ok(ok(PaginatedResponse {
+        items: records,
+        total,
+        page: params.page(),
+        page_size: params.page_size(),
+    }))
+}
+
 // GET /api/admin/rebate-order-records
 pub async fn get_rebate_order_records(
     State(state): State<AppState>,
@@ -746,7 +1144,17 @@ pub async fn get_rebate_order_records(
     );
 
     let now = Utc::now().timestamp();
-    let hydrated = hydrate_newapi_rebate_orders(&state, &orders, now).await?;
+    let order_rebate_enabled = get_config_bool(&state.pool, ORDER_REBATE_ENABLED_KEY).await?;
+    let hydrated = if order_rebate_enabled {
+        hydrate_newapi_rebate_orders(&state, &orders, now).await?
+    } else {
+        tracing::info!(
+            admin_id = admin.0.id,
+            requested_count = orders.len(),
+            "Admin order rebate hydration skipped: disabled"
+        );
+        0
+    };
     tracing::info!(
         admin_id = admin.0.id,
         requested_count = orders.len(),
@@ -1062,6 +1470,92 @@ pub async fn extend_rebate_order_initialization(
     ))
 }
 
+// GET /api/admin/invitation-registrations
+pub async fn get_invitation_registrations(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Query(params): Query<InvitationRegistrationParams>,
+) -> Result<Json<ApiResponse<PaginatedResponse<AdminInvitationRegistration>>>> {
+    let now = Utc::now().timestamp();
+    let total = count_newapi_invitation_registrations(&state).await?;
+    let registrations =
+        fetch_newapi_invitation_registrations(&state, params.page_size(), params.offset()).await?;
+
+    for registration in &registrations {
+        upsert_invitation_registration(
+            &state.pool,
+            UpsertInvitationRegistration {
+                inviter_id: registration.inviter_id,
+                invitee_id: registration.invitee_id,
+                user_group: &registration.user_group,
+                invited_at: registration.invited_at,
+                now,
+            },
+        )
+        .await?;
+    }
+
+    let invitee_ids = registrations
+        .iter()
+        .map(|registration| registration.invitee_id)
+        .collect::<Vec<_>>();
+    let local_map = fetch_local_invitation_registration_map(&state, &invitee_ids).await?;
+    let reward_map = fetch_invitation_registration_reward_map(&state, &invitee_ids).await?;
+    let total_reward_map =
+        fetch_invitation_registration_total_reward_map(&state, &invitee_ids).await?;
+    let reward_amounts = fetch_invitation_signup_reward_amounts(&state.pool).await?;
+
+    let mut items = Vec::with_capacity(registrations.len());
+    for registration in &registrations {
+        if let Some(local) = local_map.get(&registration.invitee_id) {
+            items.push(admin_invitation_registration_from_parts(
+                registration,
+                local,
+                &reward_map,
+                &total_reward_map,
+                &reward_amounts,
+            )?);
+        }
+    }
+
+    Ok(ok(PaginatedResponse {
+        items,
+        total,
+        page: params.page(),
+        page_size: params.page_size(),
+    }))
+}
+
+// POST /api/admin/invitation-registrations/:id/inviter-reward
+pub async fn generate_invitation_registration_inviter_reward(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardResponse>>> {
+    generate_invitation_registration_reward(
+        &state,
+        &admin,
+        id,
+        INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    )
+    .await
+}
+
+// POST /api/admin/invitation-registrations/:id/invitee-reward
+pub async fn generate_invitation_registration_invitee_reward(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardResponse>>> {
+    generate_invitation_registration_reward(
+        &state,
+        &admin,
+        id,
+        INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
+    )
+    .await
+}
+
 // GET /api/admin/user-rebates/:user_id
 pub async fn get_user_rebates(
     State(state): State<AppState>,
@@ -1076,11 +1570,12 @@ pub async fn get_user_rebates(
         Some(user_id),
         None,
         false,
+        None,
         params.page_size(),
         params.offset(),
     )
     .await?;
-    let total = count_rebate_records(&state.pool, Some(user_id), None, false).await?;
+    let total = count_rebate_records(&state.pool, Some(user_id), None, false, None).await?;
 
     Ok(ok(PaginatedResponse {
         items: records,
@@ -1088,6 +1583,323 @@ pub async fn get_user_rebates(
         page: params.page(),
         page_size: params.page_size(),
     }))
+}
+
+async fn generate_invitation_registration_reward(
+    state: &AppState,
+    admin: &AdminUser,
+    registration_id: i64,
+    order_type: &str,
+) -> Result<Json<ApiResponse<InvitationRegistrationRewardResponse>>> {
+    validate_id(registration_id)?;
+    if !get_config_bool(&state.pool, INVITATION_SIGNUP_REWARD_ENABLED_KEY).await? {
+        return Err(AppError::BadRequest("邀请注册奖励功能未开启".to_string()));
+    }
+
+    let is_inviter_reward = order_type == INVITATION_SIGNUP_INVITER_ORDER_TYPE;
+    let reward_amount_key = if is_inviter_reward {
+        INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY
+    } else {
+        INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY
+    };
+    let reward_amount = get_config_i64_or_fallback(
+        &state.pool,
+        reward_amount_key,
+        INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+    )
+    .await?;
+    if reward_amount <= 0 {
+        let message = if is_inviter_reward {
+            "邀请人注册奖励金额必须大于 0"
+        } else {
+            "被邀请人注册奖励金额必须大于 0"
+        };
+        return Err(AppError::BadRequest(message.to_string()));
+    }
+
+    let registration = fetch_local_invitation_registration(state, registration_id).await?;
+    let reward_owner_id = if is_inviter_reward {
+        registration.inviter_id
+    } else {
+        registration.invitee_id
+    };
+    let unlock_required_key = if is_inviter_reward {
+        INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY
+    } else {
+        INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY
+    };
+    let unlock_required = get_config_bool(&state.pool, unlock_required_key).await?;
+    let now = Utc::now().timestamp();
+
+    let outcome = insert_invitation_signup_reward_record(
+        &state.pool,
+        InsertInvitationSignupReward {
+            order_type,
+            reward_owner_id,
+            invitee_id: registration.invitee_id,
+            user_group: &registration.user_group,
+            reward_amount,
+            unlock_required,
+            now,
+        },
+    )
+    .await?;
+
+    tracing::info!(
+        admin_id = admin.0.id,
+        registration_id,
+        order_type,
+        generated = matches!(&outcome, RewardInsertOutcome::Inserted { .. }),
+        "Admin generated invitation signup reward"
+    );
+
+    let generated = matches!(&outcome, RewardInsertOutcome::Inserted { .. });
+    let response = InvitationRegistrationRewardResponse {
+        generated,
+        record_id: outcome.record_id(),
+    };
+    let message_text = if generated {
+        "邀请注册奖励已生成"
+    } else {
+        "邀请注册奖励已存在"
+    };
+
+    Ok(message(response, message_text))
+}
+
+async fn count_newapi_invitation_registrations(state: &AppState) -> Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE inviter_id IS NOT NULL AND inviter_id > 0")
+        .fetch_one(&state.newapi_pool)
+        .await
+        .map_err(AppError::from)
+}
+
+async fn fetch_newapi_invitation_registrations(
+    state: &AppState,
+    page_size: i64,
+    offset: i64,
+) -> Result<Vec<NewApiInvitationRegistration>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            u.inviter_id AS inviter_id,
+            COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
+            u.id AS invitee_id,
+            COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
+            COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
+            COALESCE(NULLIF(u.created_at, 0), 0) AS invited_at
+        FROM users u
+        LEFT JOIN users inviter ON inviter.id = u.inviter_id
+        WHERE u.inviter_id IS NOT NULL
+          AND u.inviter_id > 0
+        ORDER BY invited_at DESC, u.id DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.newapi_pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(NewApiInvitationRegistration {
+                inviter_id: row.try_get("inviter_id")?,
+                inviter_name: row.try_get("inviter_name")?,
+                invitee_id: row.try_get("invitee_id")?,
+                invitee_name: row.try_get("invitee_name")?,
+                user_group: row.try_get("user_group")?,
+                invited_at: row.try_get("invited_at")?,
+            })
+        })
+        .collect()
+}
+
+async fn fetch_local_invitation_registration(
+    state: &AppState,
+    registration_id: i64,
+) -> Result<LocalInvitationRegistration> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, inviter_id, invitee_id, user_group, invited_at
+        FROM invitation_registrations
+        WHERE id = $1
+        "#,
+    )
+    .bind(registration_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("邀请注册记录不存在".to_string()))?;
+
+    local_invitation_registration_from_row(&row)
+}
+
+async fn fetch_local_invitation_registration_map(
+    state: &AppState,
+    invitee_ids: &[i64],
+) -> Result<HashMap<i64, LocalInvitationRegistration>> {
+    if invitee_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, inviter_id, invitee_id, user_group, invited_at
+        FROM invitation_registrations
+        WHERE invitee_id = ANY($1)
+        "#,
+    )
+    .bind(invitee_ids)
+    .fetch_all(&state.pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let registration = local_invitation_registration_from_row(row)?;
+            Ok((registration.invitee_id, registration))
+        })
+        .collect()
+}
+
+async fn fetch_invitation_registration_reward_map(
+    state: &AppState,
+    invitee_ids: &[i64],
+) -> Result<HashMap<(String, i64), InvitationRegistrationReward>> {
+    if invitee_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, order_type, order_id, rebate_amount, status
+        FROM rebate_records
+        WHERE order_type IN ($1, $2)
+          AND order_id = ANY($3)
+        "#,
+    )
+    .bind(INVITATION_SIGNUP_INVITER_ORDER_TYPE)
+    .bind(INVITATION_SIGNUP_INVITEE_ORDER_TYPE)
+    .bind(invitee_ids)
+    .fetch_all(&state.pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let order_type: String = row.try_get("order_type")?;
+            let invitee_id: i64 = row.try_get("order_id")?;
+            Ok((
+                (order_type, invitee_id),
+                InvitationRegistrationReward {
+                    record_id: row.try_get("id")?,
+                    rebate_amount: quota_to_cents(row.try_get("rebate_amount")?),
+                    status: row.try_get("status")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+async fn fetch_invitation_registration_total_reward_map(
+    state: &AppState,
+    invitee_ids: &[i64],
+) -> Result<HashMap<(i64, i64), i64>> {
+    if invitee_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT inviter_id, invitee_id, COALESCE(SUM(rebate_amount), 0)::BIGINT AS total
+        FROM rebate_records
+        WHERE invitee_id = ANY($1)
+          AND status NOT IN ('initializing', 'closed')
+        GROUP BY inviter_id, invitee_id
+        "#,
+    )
+    .bind(invitee_ids)
+    .fetch_all(&state.pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let inviter_id: i64 = row.try_get("inviter_id")?;
+            let invitee_id: i64 = row.try_get("invitee_id")?;
+            let total: i64 = row.try_get("total")?;
+            Ok(((inviter_id, invitee_id), quota_to_cents(total)))
+        })
+        .collect()
+}
+
+async fn fetch_invitation_signup_reward_amounts(
+    pool: &sqlx::PgPool,
+) -> Result<InvitationSignupRewardAmounts> {
+    Ok(InvitationSignupRewardAmounts {
+        inviter: get_config_i64_or_fallback(
+            pool,
+            INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
+            INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+        )
+        .await?,
+        invitee: get_config_i64_or_fallback(
+            pool,
+            INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
+            INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
+        )
+        .await?,
+    })
+}
+
+fn admin_invitation_registration_from_parts(
+    source: &NewApiInvitationRegistration,
+    local: &LocalInvitationRegistration,
+    reward_map: &HashMap<(String, i64), InvitationRegistrationReward>,
+    total_reward_map: &HashMap<(i64, i64), i64>,
+    reward_amounts: &InvitationSignupRewardAmounts,
+) -> Result<AdminInvitationRegistration> {
+    let inviter_reward = reward_map.get(&(
+        INVITATION_SIGNUP_INVITER_ORDER_TYPE.to_string(),
+        source.invitee_id,
+    ));
+    let invitee_reward = reward_map.get(&(
+        INVITATION_SIGNUP_INVITEE_ORDER_TYPE.to_string(),
+        source.invitee_id,
+    ));
+
+    Ok(AdminInvitationRegistration {
+        id: local.id,
+        inviter_id: source.inviter_id,
+        inviter_name: source.inviter_name.clone(),
+        invitee_id: source.invitee_id,
+        invitee_name: source.invitee_name.clone(),
+        user_group: local.user_group.clone(),
+        invited_at: timestamp_to_iso(local.invited_at),
+        total_reward_amount: total_reward_map
+            .get(&(local.inviter_id, local.invitee_id))
+            .copied()
+            .unwrap_or_default(),
+        inviter_reward_generated: inviter_reward.is_some(),
+        inviter_reward_record_id: inviter_reward.map(|reward| reward.record_id),
+        inviter_reward_amount: inviter_reward
+            .map(|reward| reward.rebate_amount)
+            .unwrap_or_else(|| quota_to_cents(reward_amounts.inviter)),
+        inviter_reward_status: inviter_reward.map(|reward| reward.status.clone()),
+        invitee_reward_generated: invitee_reward.is_some(),
+        invitee_reward_record_id: invitee_reward.map(|reward| reward.record_id),
+        invitee_reward_amount: invitee_reward
+            .map(|reward| reward.rebate_amount)
+            .unwrap_or_else(|| quota_to_cents(reward_amounts.invitee)),
+        invitee_reward_status: invitee_reward.map(|reward| reward.status.clone()),
+    })
+}
+
+fn local_invitation_registration_from_row(row: &PgRow) -> Result<LocalInvitationRegistration> {
+    Ok(LocalInvitationRegistration {
+        id: row.try_get("id")?,
+        inviter_id: row.try_get("inviter_id")?,
+        invitee_id: row.try_get("invitee_id")?,
+        user_group: row.try_get("user_group")?,
+        invited_at: row.try_get("invited_at")?,
+    })
 }
 
 async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) -> Result<i64> {
@@ -1533,34 +2345,6 @@ fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<ValidatedReba
     })
 }
 
-async fn get_config_value(pool: &sqlx::PgPool, key: &str) -> Result<i64> {
-    let value: String = sqlx::query_scalar("SELECT value FROM system_config WHERE key = $1")
-        .bind(key)
-        .fetch_one(pool)
-        .await?;
-
-    value
-        .parse::<i64>()
-        .map_err(|_| AppError::Internal("配置值格式错误".to_string()))
-}
-
-async fn get_config_bool_value(pool: &sqlx::PgPool, key: &str) -> Result<bool> {
-    let value: String = sqlx::query_scalar("SELECT value FROM system_config WHERE key = $1")
-        .bind(key)
-        .fetch_one(pool)
-        .await?;
-
-    parse_config_bool(&value)
-}
-
-fn parse_config_bool(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(AppError::Internal("配置值格式错误".to_string())),
-    }
-}
-
 async fn upsert_config_value(
     pool: &sqlx::PgPool,
     key: &str,
@@ -1584,6 +2368,23 @@ async fn upsert_config_value(
     .await?;
 
     Ok(())
+}
+
+fn resolve_signup_reward_amounts_for_update(config: &SystemConfig) -> (i64, i64) {
+    if config.invitation_signup_inviter_reward_amount == 0
+        && config.invitation_signup_invitee_reward_amount == 0
+        && config.invitation_signup_reward_amount > 0
+    {
+        return (
+            config.invitation_signup_reward_amount,
+            config.invitation_signup_reward_amount,
+        );
+    }
+
+    (
+        config.invitation_signup_inviter_reward_amount,
+        config.invitation_signup_invitee_reward_amount,
+    )
 }
 
 async fn count_rebate_requests(state: &AppState, status: Option<&str>) -> Result<i64> {
@@ -1678,20 +2479,27 @@ fn rebate_request_detail_from_row(
     user_map: &std::collections::HashMap<i64, String>,
 ) -> Result<RebateRequestDetail> {
     let user_id: i64 = row.try_get("user_id")?;
+    let status: String = row.try_get("status")?;
+    let admin_note: Option<String> = row.try_get("admin_note")?;
 
     Ok(RebateRequestDetail {
         id: row.try_get("id")?,
         user_id,
         user_name: user_map.get(&user_id).cloned().unwrap_or_default(),
         amount: quota_to_cents(row.try_get("total_amount")?),
-        status: row.try_get("status")?,
+        status: status.clone(),
         rebate_record_ids: row.try_get("rebate_record_ids")?,
         created_at: timestamp_to_iso(row.try_get("created_at")?),
         updated_at: timestamp_to_iso(row.try_get("updated_at")?),
         approved_at: optional_timestamp_to_iso(row.try_get("approved_at")?),
         completed_at: optional_timestamp_to_iso(row.try_get("completed_at")?),
         rejected_at: optional_timestamp_to_iso(row.try_get("rejected_at")?),
-        reject_reason: row.try_get("admin_note")?,
+        review_note: admin_note.clone(),
+        reject_reason: if status == "rejected" {
+            admin_note
+        } else {
+            None
+        },
     })
 }
 
@@ -1735,6 +2543,33 @@ async fn lock_rebate_records(
     .fetch_all(&mut **tx)
     .await
     .map_err(AppError::from)
+}
+
+async fn lock_rebate_request_for_review(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+) -> Result<PgRow> {
+    sqlx::query(
+        r#"
+        SELECT id, status, rebate_record_ids
+        FROM rebate_requests
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("返利申请不存在".to_string()))
+}
+
+fn ensure_rebate_request_not_completed(row: &PgRow) -> Result<()> {
+    let status: String = row.try_get("status")?;
+    if status == "completed" {
+        return Err(AppError::BadRequest("已完成的返利申请不能修改".to_string()));
+    }
+
+    Ok(())
 }
 
 fn validate_operation_rows(
@@ -1845,6 +2680,23 @@ mod tests {
     }
 
     #[test]
+    fn admin_rebate_record_params_accept_record_statuses() {
+        let requested = AdminRebateRecordListParams {
+            page: None,
+            page_size: None,
+            status: Some("requested".to_string()),
+        };
+        assert_eq!(requested.status_filter(), Some("requested"));
+
+        let rejected = AdminRebateRecordListParams {
+            page: None,
+            page_size: None,
+            status: Some("rejected".to_string()),
+        };
+        assert_eq!(rejected.status_filter(), Some("rejected"));
+    }
+
+    #[test]
     fn derives_estimated_status_before_rebate_effective_time() {
         assert_eq!(
             derive_admin_rebate_status(1_000, 2_000, false, "pending"),
@@ -1905,5 +2757,41 @@ mod tests {
         assert!(!can_extend_initialization("requested"));
         assert!(!can_extend_initialization("approved"));
         assert!(!can_extend_initialization("completed"));
+    }
+
+    #[test]
+    fn resolves_split_signup_reward_amounts_with_legacy_fallback() {
+        let legacy = test_system_config(300, 0, 0);
+        assert_eq!(
+            resolve_signup_reward_amounts_for_update(&legacy),
+            (300, 300)
+        );
+
+        let split = test_system_config(300, 500, 100);
+        assert_eq!(resolve_signup_reward_amounts_for_update(&split), (500, 100));
+
+        let disabled = test_system_config(0, 0, 0);
+        assert_eq!(resolve_signup_reward_amounts_for_update(&disabled), (0, 0));
+    }
+
+    fn test_system_config(
+        legacy_amount: i64,
+        inviter_amount: i64,
+        invitee_amount: i64,
+    ) -> SystemConfig {
+        SystemConfig {
+            min_rebate_request_amount: 0,
+            rebate_request_frequency_days: 0,
+            user_invitation_rebate_enabled: true,
+            order_rebate_enabled: true,
+            invitation_signup_reward_enabled: true,
+            invitation_signup_reward_amount: legacy_amount,
+            invitation_signup_inviter_reward_amount: inviter_amount,
+            invitation_signup_invitee_reward_amount: invitee_amount,
+            invitation_signup_reward_review_required: true,
+            invitation_signup_inviter_reward_requires_paid_order: false,
+            invitation_signup_invitee_reward_requires_paid_order: false,
+            rebate_to_balance_enabled: true,
+        }
     }
 }
