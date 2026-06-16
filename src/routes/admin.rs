@@ -20,8 +20,9 @@ use crate::rebate_lifecycle::{
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::{
-    is_invitation_signup_reward_order_type, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
-    INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    is_invitation_signup_reward_order_type, is_order_rebate_order_type,
+    INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    REDEMPTION_ORDER_TYPE,
 };
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::routes::user::{
@@ -288,7 +289,9 @@ impl RebateOrderRecordParams {
 
     fn order_type_filter(&self) -> Option<&str> {
         match self.order_type.as_deref() {
-            Some("topup" | "subscription") => self.order_type.as_deref(),
+            Some(order_type) if is_order_rebate_order_type(order_type) => {
+                self.order_type.as_deref()
+            }
             _ => None,
         }
     }
@@ -352,6 +355,8 @@ struct NewApiRebateOrderDiagnostics {
     topup_rebate_orders: i64,
     subscription_success: i64,
     subscription_invited: i64,
+    redemption_used: i64,
+    redemption_invited: i64,
 }
 
 struct NewApiInvitationRegistration {
@@ -1271,6 +1276,8 @@ pub async fn get_rebate_order_records(
             topup_rebate_orders = diagnostics.topup_rebate_orders,
             subscription_success = diagnostics.subscription_success,
             subscription_invited = diagnostics.subscription_invited,
+            redemption_used = diagnostics.redemption_used,
+            redemption_invited = diagnostics.redemption_invited,
             "No new-api rebate orders matched admin rebate order query"
         );
     }
@@ -2166,6 +2173,15 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
             WHERE s.status = 'success'
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
+            UNION ALL
+            SELECT 'redemption'::TEXT AS order_type
+            FROM redemptions r
+            JOIN users u ON r.used_user_id = u.id
+            WHERE r.status = 3
+              AND r.used_user_id > 0
+              AND r.redeemed_time > 0
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
         ) rebate_orders
         WHERE ($1::TEXT IS NULL OR order_type = $1)
         "#,
@@ -2213,7 +2229,18 @@ async fn fetch_newapi_rebate_order_diagnostics(
                 WHERE s.status = 'success'
                   AND u.inviter_id IS NOT NULL
                   AND u.inviter_id > 0
-            )::BIGINT AS subscription_invited
+            )::BIGINT AS subscription_invited,
+            (SELECT COUNT(*) FROM redemptions WHERE status = 3 AND used_user_id > 0 AND redeemed_time > 0)::BIGINT AS redemption_used,
+            (
+                SELECT COUNT(*)
+                FROM redemptions r
+                JOIN users u ON r.used_user_id = u.id
+                WHERE r.status = 3
+                  AND r.used_user_id > 0
+                  AND r.redeemed_time > 0
+                  AND u.inviter_id IS NOT NULL
+                  AND u.inviter_id > 0
+            )::BIGINT AS redemption_invited
         "#,
     )
     .fetch_one(&state.newapi_pool)
@@ -2226,6 +2253,8 @@ async fn fetch_newapi_rebate_order_diagnostics(
         topup_rebate_orders: row.try_get("topup_rebate_orders")?,
         subscription_success: row.try_get("subscription_success")?,
         subscription_invited: row.try_get("subscription_invited")?,
+        redemption_used: row.try_get("redemption_used")?,
+        redemption_invited: row.try_get("redemption_invited")?,
     })
 }
 
@@ -2286,13 +2315,33 @@ async fn fetch_newapi_rebate_orders(
             WHERE s.status = 'success'
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
+            UNION ALL
+            SELECT
+                'redemption'::TEXT AS order_type,
+                r.id::BIGINT AS order_id,
+                u.inviter_id AS inviter_id,
+                COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
+                r.used_user_id::BIGINT AS invitee_id,
+                COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
+                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
+                (r.quota::DOUBLE PRECISION / $2::DOUBLE PRECISION)::TEXT AS order_amount,
+                COALESCE(NULLIF(r.redeemed_time, 0), NULLIF(r.created_time, 0), 0) AS order_time
+            FROM redemptions r
+            JOIN users u ON r.used_user_id = u.id
+            LEFT JOIN users inviter ON inviter.id = u.inviter_id
+            WHERE r.status = 3
+              AND r.used_user_id > 0
+              AND r.redeemed_time > 0
+              AND u.inviter_id IS NOT NULL
+              AND u.inviter_id > 0
         ) rebate_orders
         WHERE ($1::TEXT IS NULL OR order_type = $1)
         ORDER BY order_time DESC, order_id DESC
-        LIMIT $2 OFFSET $3
+        LIMIT $3 OFFSET $4
         "#,
     )
     .bind(order_type)
+    .bind(state.config.quota_per_unit)
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.newapi_pool)
@@ -2383,8 +2432,16 @@ async fn fetch_local_rebate_record_map(
         .filter(|order| order.order_type == "subscription")
         .map(|order| order.order_id)
         .collect();
+    let redemption_order_ids: Vec<i64> = orders
+        .iter()
+        .filter(|order| order.order_type == REDEMPTION_ORDER_TYPE)
+        .map(|order| order.order_id)
+        .collect();
 
-    if topup_order_ids.is_empty() && subscription_order_ids.is_empty() {
+    if topup_order_ids.is_empty()
+        && subscription_order_ids.is_empty()
+        && redemption_order_ids.is_empty()
+    {
         return Ok(HashMap::new());
     }
 
@@ -2407,10 +2464,12 @@ async fn fetch_local_rebate_record_map(
         FROM rebate_records
         WHERE (order_type = 'topup' AND order_id = ANY($1))
            OR (order_type = 'subscription' AND order_id = ANY($2))
+           OR (order_type = 'redemption' AND order_id = ANY($3))
         "#,
     )
     .bind(&topup_order_ids)
     .bind(&subscription_order_ids)
+    .bind(&redemption_order_ids)
     .fetch_all(&state.pool)
     .await?;
 
@@ -2563,9 +2622,9 @@ fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<ValidatedReba
         ));
     }
     let rule_type = req.rule_type.trim();
-    if rule_type != "topup" && rule_type != "subscription" {
+    if !is_order_rebate_order_type(rule_type) {
         return Err(AppError::BadRequest(
-            "规则类型必须是 topup 或 subscription".to_string(),
+            "规则类型必须是 topup、subscription 或 redemption".to_string(),
         ));
     }
 
@@ -3013,6 +3072,19 @@ mod tests {
     }
 
     #[test]
+    fn validates_redemption_rebate_rule() {
+        let req = RebateRuleRequest {
+            user_group: "default".to_string(),
+            rule_type: "redemption".to_string(),
+            rebate_rate: serde_json::json!("0.12"),
+        };
+
+        let validated = validate_rebate_rule_request(&req).unwrap();
+        assert_eq!(validated.rule_type, "redemption");
+        assert_eq!(validated.rebate_rate, 0.12);
+    }
+
+    #[test]
     fn rejects_percentage_rebate_rate() {
         let req = RebateRuleRequest {
             user_group: "default".to_string(),
@@ -3047,6 +3119,17 @@ mod tests {
             source: None,
         };
         assert_eq!(rejected.status_filter(), Some("rejected"));
+    }
+
+    #[test]
+    fn rebate_order_record_params_accept_redemption_filter() {
+        let params = RebateOrderRecordParams {
+            order_type: Some("redemption".to_string()),
+            page: None,
+            page_size: None,
+        };
+
+        assert_eq!(params.order_type_filter(), Some("redemption"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::rebate_types::DEFAULT_QUOTA_UNITS_PER_YUAN;
+
 pub const DEFAULT_AUTO_SYNC_INTERVAL_SECONDS: u64 = 60 * 60;
 pub const DEFAULT_AUTO_SYNC_INITIAL_DELAY_SECONDS: u64 = 10;
 
@@ -13,6 +15,8 @@ pub struct Config {
     pub sync_secret: Option<String>,
     pub auto_sync_interval_seconds: u64,
     pub auto_sync_initial_delay_seconds: u64,
+    pub payout_enabled: bool,
+    pub quota_per_unit: i64,
 }
 
 impl Config {
@@ -36,8 +40,34 @@ impl Config {
                 "AUTO_SYNC_INITIAL_DELAY_SECONDS",
                 DEFAULT_AUTO_SYNC_INITIAL_DELAY_SECONDS,
             ),
+            payout_enabled: optional_bool_env("PAYOUT_ENABLED", false),
+            quota_per_unit: quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN),
         }
     }
+}
+
+fn optional_bool_env(name: &str, default_value: bool) -> bool {
+    optional_bool_env_value(name, env::var(name).ok().as_deref(), default_value)
+}
+
+fn optional_bool_env_value(name: &str, value: Option<&str>, default_value: bool) -> bool {
+    match value.map(str::trim) {
+        Some("") | None => default_value,
+        Some("true" | "1" | "yes" | "on") => true,
+        Some("false" | "0" | "no" | "off") => false,
+        Some(_) => panic!("{name} must be a boolean"),
+    }
+}
+
+fn quota_per_unit_env(name: &str, default_value: i64) -> i64 {
+    let value = match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => parse_i64_env_value(name, &value),
+        _ => default_value,
+    };
+    if value <= 0 || value % 100 != 0 {
+        panic!("{name} must be positive and divisible by 100");
+    }
+    value
 }
 
 fn optional_u64_env(name: &str, default_value: u64) -> u64 {
@@ -57,6 +87,13 @@ fn parse_u64_env_value(name: &str, value: &str) -> u64 {
         .trim()
         .parse::<u64>()
         .unwrap_or_else(|_| panic!("{name} must be a non-negative integer"))
+}
+
+fn parse_i64_env_value(name: &str, value: &str) -> i64 {
+    value
+        .trim()
+        .parse::<i64>()
+        .unwrap_or_else(|_| panic!("{name} must be an integer"))
 }
 
 #[cfg(test)]
@@ -83,5 +120,18 @@ mod tests {
     #[should_panic(expected = "TEST_SECONDS must be a non-negative integer")]
     fn invalid_u64_env_values_fail_fast() {
         parse_u64_env_value("TEST_SECONDS", "abc");
+    }
+
+    #[test]
+    fn parses_bool_env_values() {
+        assert!(optional_bool_env_value("TEST_BOOL", Some("true"), false));
+        assert!(optional_bool_env_value("TEST_BOOL", Some("1"), false));
+        assert!(!optional_bool_env_value("TEST_BOOL", Some("false"), true));
+        assert_eq!(optional_bool_env_value("TEST_BOOL", Some(""), true), true);
+    }
+
+    #[test]
+    fn parses_i64_env_values_with_whitespace() {
+        assert_eq!(parse_i64_env_value("TEST_QUOTA", " 500000 "), 500_000);
     }
 }

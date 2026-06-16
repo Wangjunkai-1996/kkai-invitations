@@ -15,6 +15,7 @@ use crate::rebate_lifecycle::{
 };
 use crate::rebate_types::{
     INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    REDEMPTION_ORDER_TYPE, SUBSCRIPTION_ORDER_TYPE, TOPUP_ORDER_TYPE,
 };
 use crate::response::{message, ApiResponse};
 use crate::system_config::{
@@ -112,7 +113,7 @@ async fn run_rebate_sync_unlocked(state: &AppState) -> Result<SyncResponse> {
     );
 
     let order_rebate_enabled = get_config_bool(&state.pool, ORDER_REBATE_ENABLED_KEY).await?;
-    let (topup_synced, subscription_synced) = if order_rebate_enabled {
+    let (topup_synced, subscription_synced, redemption_synced) = if order_rebate_enabled {
         let topup_synced = sync_topup_orders(state, now).await?;
         tracing::info!(synced_count = topup_synced, "Topup orders synced");
 
@@ -122,10 +123,13 @@ async fn run_rebate_sync_unlocked(state: &AppState) -> Result<SyncResponse> {
             "Subscription orders synced"
         );
 
-        (topup_synced, subscription_synced)
+        let redemption_synced = sync_redemption_orders(state, now).await?;
+        tracing::info!(synced_count = redemption_synced, "Redemption orders synced");
+
+        (topup_synced, subscription_synced, redemption_synced)
     } else {
         tracing::info!("Order rebate sync skipped: disabled");
-        (0, 0)
+        (0, 0, 0)
     };
 
     Ok(SyncResponse {
@@ -136,6 +140,7 @@ async fn run_rebate_sync_unlocked(state: &AppState) -> Result<SyncResponse> {
         invitation_signup_unlocked,
         topup_synced,
         subscription_synced,
+        redemption_synced,
     })
 }
 
@@ -153,6 +158,7 @@ pub struct SyncResponse {
     pub invitation_signup_unlocked: i64,
     pub topup_synced: i64,
     pub subscription_synced: i64,
+    pub redemption_synced: i64,
 }
 
 impl SyncResponse {
@@ -165,6 +171,7 @@ impl SyncResponse {
             invitation_signup_unlocked: 0,
             topup_synced: 0,
             subscription_synced: 0,
+            redemption_synced: 0,
         }
     }
 }
@@ -447,7 +454,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
         match insert_rebate_record(
             state,
             InsertRebateRecord {
-                order_type: "topup",
+                order_type: TOPUP_ORDER_TYPE,
                 order_id,
                 user_id,
                 inviter_id,
@@ -524,7 +531,7 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
         match insert_rebate_record(
             state,
             InsertRebateRecord {
-                order_type: "subscription",
+                order_type: SUBSCRIPTION_ORDER_TYPE,
                 order_id,
                 user_id,
                 inviter_id,
@@ -556,10 +563,110 @@ async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
     Ok(synced)
 }
 
+async fn sync_redemption_orders(state: &AppState, now: i64) -> Result<i64> {
+    let cursor = last_sync_cursor(state, REDEMPTION_ORDER_TYPE).await?;
+    let orders = sqlx::query(
+        r#"
+        SELECT
+            r.id::BIGINT AS id,
+            r.used_user_id::BIGINT AS user_id,
+            r.quota::BIGINT AS quota,
+            r.redeemed_time AS order_time,
+            u.inviter_id,
+            u."group"
+        FROM redemptions r
+        JOIN users u ON r.used_user_id = u.id
+        WHERE r.status = 3
+          AND r.used_user_id > 0
+          AND r.redeemed_time > 0
+          AND (
+              r.redeemed_time > $1
+              OR (r.redeemed_time = $1 AND r.id > $2)
+          )
+          AND u.inviter_id IS NOT NULL
+          AND u.inviter_id > 0
+        ORDER BY r.redeemed_time, r.id
+        LIMIT 1000
+        "#,
+    )
+    .bind(cursor.last_time)
+    .bind(cursor.last_id)
+    .fetch_all(&state.newapi_pool)
+    .await?;
+
+    tracing::info!(
+        last_sync_id = cursor.last_id,
+        last_sync_time = cursor.last_time,
+        fetched_count = orders.len(),
+        "Redemption rebate sync loaded new-api orders"
+    );
+
+    let mut synced = 0;
+    let mut max_processed = cursor;
+
+    for order in orders {
+        let order_id: i64 = order.try_get("id")?;
+        let user_id: i64 = order.try_get("user_id")?;
+        let quota: i64 = order.try_get("quota")?;
+        let order_time: i64 = order.try_get("order_time")?;
+        let inviter_id: i64 = order.try_get("inviter_id")?;
+        let group: Option<String> = order.try_get("group")?;
+        let money = quota_to_yuan(quota, state.config.quota_per_unit);
+
+        match insert_rebate_record(
+            state,
+            InsertRebateRecord {
+                order_type: REDEMPTION_ORDER_TYPE,
+                order_id,
+                user_id,
+                inviter_id,
+                money,
+                order_time,
+                group: group.as_deref().unwrap_or("default"),
+                now,
+            },
+        )
+        .await?
+        {
+            InsertOutcome::Inserted => {
+                synced += 1;
+                max_processed = SyncCursor {
+                    last_id: order_id,
+                    last_time: order_time,
+                };
+            }
+            InsertOutcome::Duplicate => {
+                max_processed = SyncCursor {
+                    last_id: order_id,
+                    last_time: order_time,
+                };
+            }
+        }
+    }
+
+    update_sync_cursor_if_advanced(state, REDEMPTION_ORDER_TYPE, max_processed, cursor, now)
+        .await?;
+    tracing::info!(
+        last_sync_id = cursor.last_id,
+        last_sync_time = cursor.last_time,
+        max_processed_id = max_processed.last_id,
+        max_processed_time = max_processed.last_time,
+        inserted_count = synced,
+        "Redemption rebate sync processed"
+    );
+    Ok(synced)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum InsertOutcome {
     Inserted,
     Duplicate,
+}
+
+#[derive(Clone, Copy)]
+struct SyncCursor {
+    last_id: i64,
+    last_time: i64,
 }
 
 struct InsertRebateRecord<'a> {
@@ -620,12 +727,43 @@ async fn insert_rebate_record(
     }
 }
 
+fn quota_to_yuan(quota: i64, quota_per_unit: i64) -> f64 {
+    quota as f64 / quota_per_unit as f64
+}
+
 async fn last_sync_id(state: &AppState, sync_type: &str) -> Result<i64> {
     sqlx::query_scalar("SELECT COALESCE(MAX(last_sync_id), 0) FROM sync_log WHERE sync_type = $1")
         .bind(sync_type)
         .fetch_one(&state.pool)
         .await
         .map_err(AppError::from)
+}
+
+async fn last_sync_cursor(state: &AppState, sync_type: &str) -> Result<SyncCursor> {
+    let row = sqlx::query(
+        r#"
+        SELECT COALESCE(last_sync_id, 0) AS last_sync_id,
+               COALESCE(last_sync_time, 0) AS last_sync_time
+        FROM sync_log
+        WHERE sync_type = $1
+        ORDER BY last_sync_time DESC, last_sync_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(sync_type)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(match row {
+        Some(row) => SyncCursor {
+            last_id: row.try_get("last_sync_id")?,
+            last_time: row.try_get("last_sync_time")?,
+        },
+        None => SyncCursor {
+            last_id: 0,
+            last_time: 0,
+        },
+    })
 }
 
 async fn update_sync_log_if_advanced(
@@ -652,6 +790,38 @@ async fn update_sync_log_if_advanced(
     .await?;
 
     Ok(())
+}
+
+async fn update_sync_cursor_if_advanced(
+    state: &AppState,
+    sync_type: &str,
+    max_processed: SyncCursor,
+    previous: SyncCursor,
+    now: i64,
+) -> Result<()> {
+    if !sync_cursor_advanced(max_processed, previous) {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO sync_log (sync_type, last_sync_id, last_sync_time, created_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(sync_type)
+    .bind(max_processed.last_id)
+    .bind(max_processed.last_time)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(())
+}
+
+fn sync_cursor_advanced(next: SyncCursor, previous: SyncCursor) -> bool {
+    next.last_time > previous.last_time
+        || (next.last_time == previous.last_time && next.last_id > previous.last_id)
 }
 
 fn authorize_sync(state: &AppState, headers: &HeaderMap, query_secret: Option<&str>) -> Result<()> {
@@ -707,5 +877,48 @@ mod tests {
         assert_eq!(response.invitation_signup_unlocked, 0);
         assert_eq!(response.topup_synced, 0);
         assert_eq!(response.subscription_synced, 0);
+        assert_eq!(response.redemption_synced, 0);
+    }
+
+    #[test]
+    fn converts_redemption_quota_to_yuan() {
+        assert_eq!(quota_to_yuan(2_500_000, 500_000), 5.0);
+        assert_eq!(quota_to_yuan(500_000, 500_000), 1.0);
+    }
+
+    #[test]
+    fn compares_sync_cursors_by_time_then_id() {
+        let previous = SyncCursor {
+            last_id: 10,
+            last_time: 100,
+        };
+        assert!(sync_cursor_advanced(
+            SyncCursor {
+                last_id: 1,
+                last_time: 101,
+            },
+            previous,
+        ));
+        assert!(sync_cursor_advanced(
+            SyncCursor {
+                last_id: 11,
+                last_time: 100,
+            },
+            previous,
+        ));
+        assert!(!sync_cursor_advanced(
+            SyncCursor {
+                last_id: 10,
+                last_time: 100,
+            },
+            previous,
+        ));
+        assert!(!sync_cursor_advanced(
+            SyncCursor {
+                last_id: 99,
+                last_time: 99,
+            },
+            previous,
+        ));
     }
 }

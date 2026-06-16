@@ -3,6 +3,7 @@ mod db;
 mod error;
 mod invitation_signup;
 mod middleware;
+mod payout;
 mod rebate_lifecycle;
 mod rebate_types;
 mod response;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub config: Config,
     pub pool: PgPool,
     pub newapi_pool: PgPool,
+    pub newapi_write_pool: PgPool,
 }
 
 #[tokio::main]
@@ -39,6 +41,10 @@ async fn main() {
     let config = Config::from_env();
     let pool = db::init_pool(&config.database_url).await;
     let newapi_pool = db::init_readonly_pool(&config.newapi_database_url).await;
+    let newapi_write_pool = db::init_external_pool(&config.newapi_database_url).await;
+    if config.payout_enabled {
+        db::migrate_newapi_payout_tables(&newapi_write_pool).await;
+    }
     let listen_addr = config.listen_addr.clone();
     let base_path = config.base_path.clone();
 
@@ -46,6 +52,7 @@ async fn main() {
         config,
         pool,
         newapi_pool,
+        newapi_write_pool,
     };
     sync_scheduler::spawn_rebate_sync_scheduler(state.clone());
 
@@ -140,6 +147,18 @@ async fn main() {
         .route(
             &format!("{b}/api/admin/rebate-records/{{id}}/revoke-signup-reward"),
             post(routes::admin::revoke_signup_reward_rebate_record),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-payouts/{{id}}/status"),
+            get(payout::get_payout_status),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-payouts/{{id}}/pay"),
+            post(payout::pay_rebate_payout),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-payouts/{{id}}/reverse"),
+            post(payout::reverse_rebate_payout),
         )
         .route(
             &format!("{b}/api/admin/rebate-order-records"),

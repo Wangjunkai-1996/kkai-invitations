@@ -40,6 +40,7 @@ pub fn spawn_rebate_sync_scheduler(state: AppState) {
                         invitation_signup_unlocked = response.invitation_signup_unlocked,
                         topup_synced = response.topup_synced,
                         subscription_synced = response.subscription_synced,
+                        redemption_synced = response.redemption_synced,
                         "Automatic rebate sync completed"
                     );
                 }

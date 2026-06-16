@@ -10,7 +10,8 @@ use sqlx::{PgPool, Row};
 use crate::error::{AppError, Result};
 use crate::invitation_signup::unlock_paid_invitation_signup_rewards;
 use crate::rebate_types::{
-    is_invitation_signup_reward_order_type, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
+    is_invitation_signup_reward_order_type, is_order_rebate_order_type, CENTS_PER_YUAN,
+    DEFAULT_QUOTA_UNITS_PER_YUAN, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
     INVITATION_SIGNUP_INVITER_ORDER_TYPE,
 };
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
@@ -22,8 +23,7 @@ use crate::system_config::{
 };
 use crate::AppState;
 
-const QUOTA_UNITS_PER_YUAN: i64 = 500_000;
-const CENTS_PER_YUAN: i64 = 100;
+const QUOTA_UNITS_PER_YUAN: i64 = DEFAULT_QUOTA_UNITS_PER_YUAN;
 const DEFAULT_PAGE_SIZE: i64 = 10;
 const MAX_PAGE_SIZE: i64 = 1000;
 
@@ -39,7 +39,7 @@ impl RebateRecordSourceFilter {
     }
 
     fn allows_order_type(&self, order_type: &str) -> bool {
-        (self.order_rebate_enabled && matches!(order_type, "topup" | "subscription"))
+        (self.order_rebate_enabled && is_order_rebate_order_type(order_type))
             || (self.invitation_signup_reward_enabled
                 && is_invitation_signup_reward_order_type(order_type))
     }
@@ -216,7 +216,7 @@ pub async fn my_code(
         FROM rebate_records
         WHERE inviter_id = $1 AND status NOT IN ('initializing', 'closed')
           AND (
-              ($2::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription'))
+              ($2::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
               OR ($3::BOOLEAN = TRUE AND order_type IN ($4, $5))
           )
         "#,
@@ -309,7 +309,7 @@ pub async fn available_rebates(
               OR order_type IN ($3, $4)
           )
           AND (
-              ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription'))
+              ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
               OR ($6::BOOLEAN = TRUE AND order_type IN ($3, $4))
           )
           AND (
@@ -667,7 +667,7 @@ pub async fn fetch_rebate_records(
           AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
           AND (
               $4::BOOLEAN = FALSE
-              OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription'))
+              OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
               OR ($6::BOOLEAN = TRUE AND order_type IN ($7, $8))
           )
         ORDER BY created_at DESC
@@ -717,7 +717,7 @@ pub async fn count_rebate_records(
           AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
           AND (
               $4::BOOLEAN = FALSE
-              OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription'))
+              OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
               OR ($6::BOOLEAN = TRUE AND order_type IN ($7, $8))
           )
         "#,

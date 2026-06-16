@@ -41,6 +41,17 @@ pub async fn init_readonly_pool(database_url: &str) -> PgPool {
     pool
 }
 
+pub async fn init_external_pool(database_url: &str) -> PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await
+        .expect("failed to connect to external database");
+
+    tracing::info!("external writable database pool connected");
+    pool
+}
+
 async fn migrate(pool: &PgPool) {
     tracing::info!("Starting invitations database migration");
 
@@ -213,6 +224,96 @@ async fn migrate(pool: &PgPool) {
         .await
         .ok();
 
+    // 返利余额发放流水表
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS invitation_rebate_payouts (
+            id BIGSERIAL PRIMARY KEY,
+            rebate_record_id BIGINT NOT NULL,
+            rebate_request_id BIGINT,
+            inviter_user_id BIGINT NOT NULL,
+            invitee_user_id BIGINT NOT NULL,
+            order_id BIGINT NOT NULL,
+            order_type VARCHAR(64) NOT NULL,
+            amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
+            quota_delta BIGINT NOT NULL CHECK (quota_delta <> 0),
+            kind VARCHAR(32) NOT NULL CHECK (kind IN ('payout', 'reversal')),
+            status VARCHAR(32) NOT NULL CHECK (status IN ('pending', 'newapi_applied', 'completed', 'reversed', 'failed', 'reversal_pending')),
+            request_id VARCHAR(128) NOT NULL,
+            admin_user_id BIGINT,
+            admin_username TEXT,
+            newapi_mark_id BIGINT,
+            newapi_log_id BIGINT,
+            original_payout_id BIGINT REFERENCES invitation_rebate_payouts(id),
+            error_message TEXT,
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL,
+            completed_at BIGINT,
+            reversed_at BIGINT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failed to create invitation_rebate_payouts table");
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_invitation_rebate_payouts_record_pay
+        ON invitation_rebate_payouts(rebate_record_id)
+        WHERE kind = 'payout'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_invitation_rebate_payouts_original_reverse
+        ON invitation_rebate_payouts(original_payout_id)
+        WHERE kind = 'reversal'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_invitation_rebate_payouts_status ON invitation_rebate_payouts(status, updated_at)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS invitation_rebate_payout_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            rebate_record_id BIGINT,
+            action VARCHAR(32) NOT NULL,
+            request_id VARCHAR(128) NOT NULL,
+            admin_user_id BIGINT,
+            admin_username TEXT,
+            status VARCHAR(64) NOT NULL,
+            http_status INTEGER NOT NULL,
+            error_message TEXT,
+            created_at BIGINT NOT NULL,
+            completed_at BIGINT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failed to create invitation_rebate_payout_attempts table");
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_invitation_rebate_payout_attempts_record ON invitation_rebate_payout_attempts(rebate_record_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     // 同步日志表
     sqlx::query(
         r#"
@@ -291,4 +392,67 @@ async fn migrate(pool: &PgPool) {
     .ok();
 
     tracing::info!("Invitations database migration completed");
+}
+
+pub async fn migrate_newapi_payout_tables(pool: &PgPool) {
+    tracing::info!("Starting new-api payout database migration");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS kkai_invitation_rebate_balance_marks (
+            id BIGSERIAL PRIMARY KEY,
+            kind VARCHAR(32) NOT NULL CHECK (kind IN ('payout', 'reversal')),
+            rebate_record_id BIGINT NOT NULL,
+            payout_id BIGINT NOT NULL,
+            original_payout_id BIGINT,
+            user_id BIGINT NOT NULL,
+            quota_delta BIGINT NOT NULL CHECK (quota_delta <> 0),
+            amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
+            log_id BIGINT,
+            request_id VARCHAR(128) NOT NULL,
+            created_at BIGINT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failed to create kkai_invitation_rebate_balance_marks table");
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_record_pay
+        ON kkai_invitation_rebate_balance_marks(rebate_record_id)
+        WHERE kind = 'payout'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_original_reverse
+        ON kkai_invitation_rebate_balance_marks(original_payout_id)
+        WHERE kind = 'reversal'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_request ON kkai_invitation_rebate_balance_marks(request_id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_kkai_invitation_rebate_balance_marks_user ON kkai_invitation_rebate_balance_marks(user_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    tracing::info!("new-api payout database migration completed");
 }
