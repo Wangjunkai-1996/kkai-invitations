@@ -24,7 +24,7 @@ impl Config {
         Self {
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:6212".to_string()),
             base_path: env::var("BASE_PATH").unwrap_or_else(|_| "".to_string()),
-            database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+            database_url: database_url_env(),
             newapi_database_url: env::var("NEWAPI_DATABASE_URL")
                 .expect("NEWAPI_DATABASE_URL must be set"),
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),
@@ -44,6 +44,28 @@ impl Config {
             quota_per_unit: quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN),
         }
     }
+}
+
+fn database_url_env() -> String {
+    let database_url = env::var("DATABASE_URL").ok();
+    let legacy_database_url = env::var("INVITATIONS_DATABASE_URL").ok();
+    database_url_env_value(database_url.as_deref(), legacy_database_url.as_deref())
+        .expect("DATABASE_URL or INVITATIONS_DATABASE_URL must be set")
+}
+
+fn database_url_env_value(
+    database_url: Option<&str>,
+    legacy_database_url: Option<&str>,
+) -> Option<String> {
+    database_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            legacy_database_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn optional_bool_env(name: &str, default_value: bool) -> bool {
@@ -133,5 +155,24 @@ mod tests {
     #[test]
     fn parses_i64_env_values_with_whitespace() {
         assert_eq!(parse_i64_env_value("TEST_QUOTA", " 500000 "), 500_000);
+    }
+
+    #[test]
+    fn database_url_prefers_primary_env_name() {
+        assert_eq!(
+            database_url_env_value(
+                Some("postgres://primary/invitations"),
+                Some("postgres://legacy/invitations")
+            ),
+            Some("postgres://primary/invitations".to_string())
+        );
+    }
+
+    #[test]
+    fn database_url_falls_back_to_legacy_env_name() {
+        assert_eq!(
+            database_url_env_value(Some(" "), Some("postgres://legacy/invitations")),
+            Some("postgres://legacy/invitations".to_string())
+        );
     }
 }
