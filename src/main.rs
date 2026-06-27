@@ -117,8 +117,16 @@ async fn main() {
             get(routes::admin::get_rebate_requests),
         )
         .route(
+            &format!("{b}/api/admin/rebate-requests/approve-and-pay-batch"),
+            post(routes::admin::batch_approve_and_pay_rebate_requests),
+        )
+        .route(
             &format!("{b}/api/admin/rebate-requests/{{id}}/approve"),
             post(routes::admin::approve_rebate_request),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-requests/{{id}}/approve-and-pay"),
+            post(routes::admin::approve_and_pay_rebate_request),
         )
         .route(
             &format!("{b}/api/admin/rebate-requests/{{id}}/reject"),

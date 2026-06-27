@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use crate::invitation_signup::{
     UpsertInvitationRegistration,
 };
 use crate::middleware::AdminUser;
+use crate::payout::{pay_rebate_record, request_id_from_headers, PayRecordInput, PayResult};
 use crate::rebate_lifecycle::{
     finalize_initializing_records_by_ids, rebate_amount_for_yuan, ALL_USER_GROUP,
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
@@ -40,6 +42,9 @@ use crate::system_config::{
     ORDER_REBATE_ENABLED_KEY, REBATE_TO_BALANCE_ENABLED_KEY, USER_INVITATION_REBATE_ENABLED_KEY,
 };
 use crate::AppState;
+
+const MAX_APPROVE_AND_PAY_BATCH_SIZE: usize = 100;
+const MAX_PAYOUT_REQUEST_ID_LEN: usize = 128;
 
 #[derive(Serialize, Deserialize)]
 pub struct RebateRule {
@@ -95,6 +100,74 @@ pub struct SystemConfig {
 pub struct ApproveRequest {
     pub note: Option<String>,
     pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ApproveAndPayRequest {
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchApproveAndPayRequest {
+    pub request_ids: Vec<i64>,
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveAndPayRecordResult {
+    pub record_id: i64,
+    pub outcome: String,
+    pub amount_cents: Option<i64>,
+    pub quota_delta: Option<i64>,
+    pub payout_id: Option<i64>,
+    pub newapi_log_id: Option<i64>,
+    pub newapi_mark_id: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveAndPayResponse {
+    pub request_id: i64,
+    pub status: String,
+    pub total_amount: i64,
+    pub paid_count: usize,
+    pub already_paid_count: usize,
+    pub failed_count: usize,
+    pub items: Vec<ApproveAndPayRecordResult>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchApproveAndPayError {
+    pub request_id: i64,
+    pub error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchApproveAndPayResponse {
+    pub total_requests: usize,
+    pub succeeded_requests: usize,
+    pub failed_requests: usize,
+    pub paid_count: usize,
+    pub already_paid_count: usize,
+    pub failed_count: usize,
+    pub items: Vec<ApproveAndPayResponse>,
+    pub errors: Vec<BatchApproveAndPayError>,
+}
+
+enum PreparedApproveAndPayRequest {
+    Pay {
+        rebate_record_ids: Vec<i64>,
+        total_amount: i64,
+    },
+    AlreadyCompleted {
+        rebate_record_ids: Vec<i64>,
+        total_amount: i64,
+    },
 }
 
 #[derive(Serialize)]
@@ -889,6 +962,77 @@ pub async fn approve_rebate_request(
         serde_json::json!({ "id": id }),
         "返利申请已通过，等待处理",
     ))
+}
+
+// POST /api/admin/rebate-requests/:id/approve-and-pay
+pub async fn approve_and_pay_rebate_request(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(req): Json<ApproveAndPayRequest>,
+) -> Result<Json<ApiResponse<ApproveAndPayResponse>>> {
+    validate_id(id)?;
+    let base_request_id = request_id_from_headers(&headers)?;
+    let result =
+        approve_and_pay_request(&state, &admin, id, req.note.as_deref(), &base_request_id).await?;
+
+    Ok(message(result, "返利申请已审批并发放"))
+}
+
+// POST /api/admin/rebate-requests/approve-and-pay-batch
+pub async fn batch_approve_and_pay_rebate_requests(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    headers: HeaderMap,
+    Json(req): Json<BatchApproveAndPayRequest>,
+) -> Result<Json<ApiResponse<BatchApproveAndPayResponse>>> {
+    let request_ids = validate_approve_and_pay_batch_ids(&req.request_ids)?;
+    let base_request_id = request_id_from_headers(&headers)?;
+
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    let mut paid_count = 0;
+    let mut already_paid_count = 0;
+    let mut failed_count = 0;
+
+    for request_id in request_ids.iter().copied() {
+        match approve_and_pay_request(
+            &state,
+            &admin,
+            request_id,
+            req.note.as_deref(),
+            &derive_payout_request_id(&base_request_id, request_id, 0),
+        )
+        .await
+        {
+            Ok(item) => {
+                paid_count += item.paid_count;
+                already_paid_count += item.already_paid_count;
+                failed_count += item.failed_count;
+                items.push(item);
+            }
+            Err(error) => {
+                errors.push(BatchApproveAndPayError {
+                    request_id,
+                    error: app_error_message(&error).to_string(),
+                });
+            }
+        }
+    }
+
+    let result = BatchApproveAndPayResponse {
+        total_requests: request_ids.len(),
+        succeeded_requests: items.len(),
+        failed_requests: errors.len(),
+        paid_count,
+        already_paid_count,
+        failed_count,
+        items,
+        errors,
+    };
+
+    Ok(message(result, "批量审批并发放已完成"))
 }
 
 // POST /api/admin/rebate-requests/:id/reject
@@ -2741,6 +2885,283 @@ async fn fetch_rebate_requests(
     Ok(rows)
 }
 
+async fn approve_and_pay_request(
+    state: &AppState,
+    admin: &AdminUser,
+    request_id: i64,
+    note: Option<&str>,
+    base_payout_request_id: &str,
+) -> Result<ApproveAndPayResponse> {
+    let prepared = prepare_approve_and_pay_request(state, admin, request_id, note).await?;
+
+    match prepared {
+        PreparedApproveAndPayRequest::AlreadyCompleted {
+            rebate_record_ids,
+            total_amount,
+        } => Ok(ApproveAndPayResponse {
+            request_id,
+            status: "completed".to_string(),
+            total_amount: quota_to_cents(total_amount),
+            paid_count: 0,
+            already_paid_count: rebate_record_ids.len(),
+            failed_count: 0,
+            items: rebate_record_ids
+                .into_iter()
+                .map(already_completed_record_result)
+                .collect(),
+        }),
+        PreparedApproveAndPayRequest::Pay {
+            rebate_record_ids,
+            total_amount,
+        } => {
+            let mut items = Vec::with_capacity(rebate_record_ids.len());
+            let mut paid_count = 0;
+            let mut already_paid_count = 0;
+            let mut failed_count = 0;
+
+            for record_id in rebate_record_ids {
+                let payout_request_id =
+                    derive_payout_request_id(base_payout_request_id, request_id, record_id);
+                match pay_rebate_record(
+                    state,
+                    PayRecordInput {
+                        record_id,
+                        request_id: payout_request_id,
+                        admin,
+                        now: Utc::now().timestamp(),
+                    },
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if result.outcome == "already_paid" {
+                            already_paid_count += 1;
+                        } else {
+                            paid_count += 1;
+                        }
+                        items.push(record_result_from_pay_result(result));
+                    }
+                    Err(error) => {
+                        failed_count += 1;
+                        items.push(failed_record_result(record_id, &error));
+                    }
+                }
+            }
+
+            let status = finalize_approve_and_pay_request(state, request_id).await?;
+            Ok(ApproveAndPayResponse {
+                request_id,
+                status,
+                total_amount: quota_to_cents(total_amount),
+                paid_count,
+                already_paid_count,
+                failed_count,
+                items,
+            })
+        }
+    }
+}
+
+async fn prepare_approve_and_pay_request(
+    state: &AppState,
+    admin: &AdminUser,
+    request_id: i64,
+    note: Option<&str>,
+) -> Result<PreparedApproveAndPayRequest> {
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+    let row = lock_rebate_request_for_review(&mut tx, request_id).await?;
+    let status: String = row.try_get("status")?;
+    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
+
+    let total_amount = rebate_records_total_amount(&mut tx, &rebate_record_ids).await?;
+    match status.as_str() {
+        "completed" => {
+            tx.commit().await?;
+            Ok(PreparedApproveAndPayRequest::AlreadyCompleted {
+                rebate_record_ids,
+                total_amount,
+            })
+        }
+        "pending" | "approved" => {
+            sqlx::query(
+                r#"
+                UPDATE rebate_requests
+                SET status = 'approved',
+                    admin_id = $1,
+                    admin_note = $2,
+                    approved_at = COALESCE(approved_at, $3),
+                    rejected_at = NULL,
+                    updated_at = $3
+                WHERE id = $4
+                "#,
+            )
+            .bind(admin.0.id)
+            .bind(note)
+            .bind(now)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                UPDATE rebate_records
+                SET status = 'approved', updated_at = $1
+                WHERE id = ANY($2)
+                  AND status IN ('requested', 'pending', 'approved', 'rejected')
+                "#,
+            )
+            .bind(now)
+            .bind(&rebate_record_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(PreparedApproveAndPayRequest::Pay {
+                rebate_record_ids,
+                total_amount,
+            })
+        }
+        "rejected" => Err(AppError::Conflict("已拒绝的返利申请不能发放".to_string())),
+        _ => Err(AppError::Conflict(format!(
+            "返利申请状态不支持审批并发放：{status}"
+        ))),
+    }
+}
+
+async fn finalize_approve_and_pay_request(state: &AppState, request_id: i64) -> Result<String> {
+    let now = Utc::now().timestamp();
+    let mut tx = state.pool.begin().await?;
+    let row = lock_rebate_request_for_review(&mut tx, request_id).await?;
+    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
+    let all_completed: bool = sqlx::query_scalar(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM rebate_records
+            WHERE id = ANY($1)
+              AND status <> 'completed'
+        )
+        "#,
+    )
+    .bind(&rebate_record_ids)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !all_completed {
+        tx.commit().await?;
+        return Ok("approved".to_string());
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE rebate_requests
+        SET status = 'completed',
+            completed_at = COALESCE(completed_at, $2),
+            updated_at = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(request_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok("completed".to_string())
+}
+
+fn validate_approve_and_pay_batch_ids(ids: &[i64]) -> Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Err(AppError::BadRequest("请选择返利申请".to_string()));
+    }
+    if ids.len() > MAX_APPROVE_AND_PAY_BATCH_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "一次最多处理 {MAX_APPROVE_AND_PAY_BATCH_SIZE} 个返利申请"
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for id in ids.iter().copied() {
+        validate_id(id)?;
+        if seen.insert(id) {
+            result.push(id);
+        }
+    }
+    Ok(result)
+}
+
+fn derive_payout_request_id(base: &str, request_id: i64, record_id: i64) -> String {
+    let suffix = format!(":req{request_id}:rec{record_id}");
+    let max_base_len = MAX_PAYOUT_REQUEST_ID_LEN.saturating_sub(suffix.len());
+    let truncated_base = truncate_utf8_by_bytes(base, max_base_len);
+    format!("{truncated_base}{suffix}")
+}
+
+fn truncate_utf8_by_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn record_result_from_pay_result(result: PayResult) -> ApproveAndPayRecordResult {
+    ApproveAndPayRecordResult {
+        record_id: result.record_id,
+        outcome: result.outcome,
+        amount_cents: Some(result.amount_cents),
+        quota_delta: Some(result.quota_delta),
+        payout_id: result.payout_id,
+        newapi_log_id: result.newapi_log_id,
+        newapi_mark_id: result.newapi_mark_id,
+        error: None,
+    }
+}
+
+fn failed_record_result(record_id: i64, error: &AppError) -> ApproveAndPayRecordResult {
+    ApproveAndPayRecordResult {
+        record_id,
+        outcome: "failed".to_string(),
+        amount_cents: None,
+        quota_delta: None,
+        payout_id: None,
+        newapi_log_id: None,
+        newapi_mark_id: None,
+        error: Some(app_error_message(error).to_string()),
+    }
+}
+
+fn already_completed_record_result(record_id: i64) -> ApproveAndPayRecordResult {
+    ApproveAndPayRecordResult {
+        record_id,
+        outcome: "already_completed".to_string(),
+        amount_cents: None,
+        quota_delta: None,
+        payout_id: None,
+        newapi_log_id: None,
+        newapi_mark_id: None,
+        error: None,
+    }
+}
+
+fn app_error_message(error: &AppError) -> &str {
+    match error {
+        AppError::Unauthorized => "未授权",
+        AppError::Forbidden => "无权限",
+        AppError::NotFound(message)
+        | AppError::BadRequest(message)
+        | AppError::Conflict(message)
+        | AppError::Locked(message)
+        | AppError::Internal(message) => message,
+        AppError::Database(_) => "数据库错误",
+    }
+}
+
 async fn fetch_user_map(
     state: &AppState,
     rebate_request_rows: &[PgRow],
@@ -3216,6 +3637,38 @@ mod tests {
         assert!(!can_extend_initialization("requested"));
         assert!(!can_extend_initialization("approved"));
         assert!(!can_extend_initialization("completed"));
+    }
+
+    #[test]
+    fn validates_approve_and_pay_batch_ids() {
+        assert_eq!(
+            validate_approve_and_pay_batch_ids(&[3, 2, 3, 1]).unwrap(),
+            vec![3, 2, 1]
+        );
+        assert!(validate_approve_and_pay_batch_ids(&[]).is_err());
+        assert!(validate_approve_and_pay_batch_ids(&[0]).is_err());
+
+        let too_many = vec![1; MAX_APPROVE_AND_PAY_BATCH_SIZE + 1];
+        assert!(validate_approve_and_pay_batch_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn derives_payout_request_id_within_limit() {
+        let base = "x".repeat(200);
+        let request_id = derive_payout_request_id(&base, 123, 456);
+
+        assert!(request_id.len() <= MAX_PAYOUT_REQUEST_ID_LEN);
+        assert!(request_id.ends_with(":req123:rec456"));
+    }
+
+    #[test]
+    fn derives_payout_request_id_on_utf8_boundary() {
+        let base = "批量".repeat(80);
+        let request_id = derive_payout_request_id(&base, 7, 9);
+
+        assert!(request_id.len() <= MAX_PAYOUT_REQUEST_ID_LEN);
+        assert!(request_id.ends_with(":req7:rec9"));
+        assert!(std::str::from_utf8(request_id.as_bytes()).is_ok());
     }
 
     #[test]

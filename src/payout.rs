@@ -70,6 +70,13 @@ pub struct PayResult {
     pub payout_enabled: bool,
 }
 
+pub struct PayRecordInput<'a> {
+    pub record_id: i64,
+    pub request_id: String,
+    pub admin: &'a AdminUser,
+    pub now: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayoutStatusResult {
@@ -169,103 +176,18 @@ pub async fn pay_rebate_payout(
         return preview_pay(&state, record_id, request_id, &admin, now).await;
     }
 
-    let payout = match reserve_payout(&state, record_id, &request_id, &admin, now).await {
-        Ok(ReservePayoutResult::Reserved(payout)) => payout,
-        Ok(ReservePayoutResult::AlreadyPaid(payout)) => {
-            record_attempt(
-                &state.pool,
-                record_id,
-                "pay",
-                &request_id,
-                &admin,
-                "already_paid",
-                200,
-                "",
-                now,
-            )
-            .await;
-            return Ok(ok(pay_result_from_payout(
-                "already_paid",
-                &payout,
-                None,
-                state.config.payout_enabled,
-            )));
-        }
-        Err(err) => {
-            return fail_pay(&state.pool, record_id, &request_id, &admin, err, now).await;
-        }
-    };
-
-    let mark = match apply_newapi_payout(&state.newapi_write_pool, &payout, now).await {
-        Ok(mark) => mark,
-        Err(err) => {
-            mark_payout_failed(&state.pool, payout.id, &err.to_string(), now).await;
-            record_attempt(
-                &state.pool,
-                record_id,
-                "pay",
-                &request_id,
-                &admin,
-                "failed",
-                500,
-                &err.to_string(),
-                now,
-            )
-            .await;
-            tracing::error!(
-                record_id,
-                payout_id = payout.id,
-                error = %err,
-                "New API payout apply failed"
-            );
-            return Err(AppError::Internal("余额发放失败，请稍后重试".to_string()));
-        }
-    };
-
-    if let Err(err) = complete_payout(&state.pool, &payout, &mark, now).await {
-        record_attempt(
-            &state.pool,
+    let result = pay_rebate_record(
+        &state,
+        PayRecordInput {
             record_id,
-            "pay",
-            &request_id,
-            &admin,
-            "newapi_applied_completion_failed",
-            500,
-            &err.to_string(),
+            request_id,
+            admin: &admin,
             now,
-        )
-        .await;
-        tracing::error!(
-            record_id,
-            payout_id = payout.id,
-            mark_id = mark.id,
-            error = %err,
-            "Payout completion failed after New API balance apply"
-        );
-        return Err(AppError::Internal(
-            "余额已发放，但返利状态回写失败；请重试发放以补齐状态".to_string(),
-        ));
-    }
-
-    record_attempt(
-        &state.pool,
-        record_id,
-        "pay",
-        &request_id,
-        &admin,
-        "paid",
-        200,
-        "",
-        now,
+        },
     )
-    .await;
+    .await?;
 
-    Ok(ok(pay_result_from_payout(
-        "paid",
-        &payout,
-        Some(&mark),
-        state.config.payout_enabled,
-    )))
+    Ok(ok(result))
 }
 
 // POST /api/admin/rebate-payouts/:id/reverse
@@ -471,6 +393,138 @@ async fn preview_pay_record(state: &AppState, record_id: i64) -> PayoutResult<Re
     }
     tx.commit().await?;
     Ok(record)
+}
+
+pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> Result<PayResult> {
+    if !state.config.payout_enabled {
+        record_attempt(
+            &state.pool,
+            input.record_id,
+            "pay",
+            &input.request_id,
+            input.admin,
+            "disabled",
+            423,
+            "payout is disabled",
+            input.now,
+        )
+        .await;
+        return Err(AppError::Locked("返利余额发放开关未开启".to_string()));
+    }
+
+    let payout = match reserve_payout(
+        state,
+        input.record_id,
+        &input.request_id,
+        input.admin,
+        input.now,
+    )
+    .await
+    {
+        Ok(ReservePayoutResult::Reserved(payout)) => payout,
+        Ok(ReservePayoutResult::AlreadyPaid(payout)) => {
+            record_attempt(
+                &state.pool,
+                input.record_id,
+                "pay",
+                &input.request_id,
+                input.admin,
+                "already_paid",
+                200,
+                "",
+                input.now,
+            )
+            .await;
+            return Ok(pay_result_from_payout(
+                "already_paid",
+                &payout,
+                None,
+                state.config.payout_enabled,
+            ));
+        }
+        Err(err) => {
+            return record_failed_pay_attempt(
+                &state.pool,
+                input.record_id,
+                &input.request_id,
+                input.admin,
+                err,
+                input.now,
+            )
+            .await;
+        }
+    };
+
+    let mark = match apply_newapi_payout(&state.newapi_write_pool, &payout, input.now).await {
+        Ok(mark) => mark,
+        Err(err) => {
+            mark_payout_failed(&state.pool, payout.id, &err.to_string(), input.now).await;
+            record_attempt(
+                &state.pool,
+                input.record_id,
+                "pay",
+                &input.request_id,
+                input.admin,
+                "failed",
+                500,
+                &err.to_string(),
+                input.now,
+            )
+            .await;
+            tracing::error!(
+                record_id = input.record_id,
+                payout_id = payout.id,
+                error = %err,
+                "New API payout apply failed"
+            );
+            return Err(AppError::Internal("余额发放失败，请稍后重试".to_string()));
+        }
+    };
+
+    if let Err(err) = complete_payout(&state.pool, &payout, &mark, input.now).await {
+        record_attempt(
+            &state.pool,
+            input.record_id,
+            "pay",
+            &input.request_id,
+            input.admin,
+            "newapi_applied_completion_failed",
+            500,
+            &err.to_string(),
+            input.now,
+        )
+        .await;
+        tracing::error!(
+            record_id = input.record_id,
+            payout_id = payout.id,
+            mark_id = mark.id,
+            error = %err,
+            "Payout completion failed after New API balance apply"
+        );
+        return Err(AppError::Internal(
+            "余额已发放，但返利状态回写失败；请重试发放以补齐状态".to_string(),
+        ));
+    }
+
+    record_attempt(
+        &state.pool,
+        input.record_id,
+        "pay",
+        &input.request_id,
+        input.admin,
+        "paid",
+        200,
+        "",
+        input.now,
+    )
+    .await;
+
+    Ok(pay_result_from_payout(
+        "paid",
+        &payout,
+        Some(&mark),
+        state.config.payout_enabled,
+    ))
 }
 
 async fn read_payout_status(state: &AppState, record_id: i64) -> Result<PayoutStatusResult> {
@@ -1247,6 +1301,30 @@ async fn fail_pay(
     Err(app_error)
 }
 
+async fn record_failed_pay_attempt(
+    pool: &PgPool,
+    record_id: i64,
+    request_id: &str,
+    admin: &AdminUser,
+    err: PayoutError,
+    now: i64,
+) -> Result<PayResult> {
+    let (status, http_status, app_error) = pay_error_response(err);
+    record_attempt(
+        pool,
+        record_id,
+        "pay",
+        request_id,
+        admin,
+        status,
+        http_status,
+        app_error_message(&app_error),
+        now,
+    )
+    .await;
+    Err(app_error)
+}
+
 async fn fail_reverse(
     pool: &PgPool,
     record_id: i64,
@@ -1413,7 +1491,7 @@ fn require_payout_action_header(headers: &HeaderMap, expected: &str) -> Result<(
     }
 }
 
-fn request_id_from_headers(headers: &HeaderMap) -> Result<String> {
+pub fn request_id_from_headers(headers: &HeaderMap) -> Result<String> {
     for key in ["idempotency-key", "x-request-id"] {
         if let Some(value) = headers.get(key).and_then(|value| value.to_str().ok()) {
             let value = value.trim();
