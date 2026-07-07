@@ -2730,7 +2730,9 @@ fn derive_admin_rebate_status(
     match local_status {
         "initializing" => "initializing",
         "closed" => "closed",
-        "requested" | "approved" | "completed" => "paid",
+        "requested" => "requested",
+        "approved" => "approved",
+        "completed" => "paid",
         "pending" | "rejected" => {
             if rule_missing || now < effective_at {
                 "estimated"
@@ -3597,10 +3599,14 @@ mod tests {
     }
 
     #[test]
-    fn derives_paid_status_for_rebate_request_flow() {
+    fn preserves_rebate_request_flow_statuses() {
         assert_eq!(
             derive_admin_rebate_status(1_000, 2_000, false, "requested"),
-            "paid"
+            "requested"
+        );
+        assert_eq!(
+            derive_admin_rebate_status(1_000, 2_000, false, "approved"),
+            "approved"
         );
         assert_eq!(
             derive_admin_rebate_status(1_000, 2_000, false, "completed"),
