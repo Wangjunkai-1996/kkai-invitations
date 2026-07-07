@@ -833,7 +833,9 @@ fn derive_rebate_display_status(
     waiting_unlock: bool,
 ) -> &'static str {
     match status {
-        "requested" | "approved" | "completed" => "paid",
+        "requested" => "requested",
+        "approved" => "approved",
+        "completed" => "paid",
         "pending" | "rejected" => {
             if waiting_unlock {
                 "waiting_unlock"
@@ -1031,6 +1033,14 @@ mod tests {
         assert_eq!(
             derive_rebate_display_status("pending", 2_000, 1_000, true, false),
             "estimated"
+        );
+        assert_eq!(
+            derive_rebate_display_status("requested", 2_000, 1_000, false, false),
+            "requested"
+        );
+        assert_eq!(
+            derive_rebate_display_status("approved", 2_000, 1_000, false, false),
+            "approved"
         );
         assert_eq!(
             derive_rebate_display_status("completed", 1_000, 2_000, false, true),
