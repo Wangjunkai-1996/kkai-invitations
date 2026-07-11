@@ -1,5 +1,7 @@
-use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, Method};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -7,7 +9,10 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
-use crate::error::{AppError, Result};
+use crate::config::SettlementMode;
+use crate::error::{
+    AppError, Result, FUNDS_MAINTENANCE_MESSAGE, LEGACY_COMPLETION_DISABLED_MESSAGE,
+};
 use crate::middleware::AdminUser;
 use crate::response::{ok, ApiResponse};
 use crate::AppState;
@@ -148,6 +153,40 @@ enum ReserveReversalResult {
     AlreadyReversed(Payout),
 }
 
+struct PayoutAttempt<'a> {
+    record_id: i64,
+    action: &'a str,
+    request_id: &'a str,
+    admin: &'a AdminUser,
+    status: &'a str,
+    http_status: i32,
+    message: &'a str,
+    occurred_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettlementWriteRoute {
+    Current,
+    LegacyCompletion,
+}
+
+pub async fn enforce_settlement_mode(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response> {
+    match settlement_write_route(request.method(), request.uri().path()) {
+        Some(SettlementWriteRoute::LegacyCompletion) => {
+            return Err(AppError::LegacyCompletionDisabled);
+        }
+        Some(SettlementWriteRoute::Current) => {
+            require_settlement_writes_enabled(state.config.settlement_mode)?;
+        }
+        None => {}
+    }
+    Ok(next.run(request).await)
+}
+
 // GET /api/admin/rebate-payouts/:id/status
 pub async fn get_payout_status(
     State(state): State<AppState>,
@@ -169,11 +208,12 @@ pub async fn pay_rebate_payout(
 ) -> Result<Json<ApiResponse<PayResult>>> {
     validate_record_id(record_id)?;
     require_payout_action_header(&headers, "pay")?;
+    require_settlement_writes_enabled(state.config.settlement_mode)?;
     let request_id = request_id_from_headers(&headers)?;
     let now = Utc::now().timestamp();
 
-    if !state.config.payout_enabled || params.is_dry_run() {
-        return preview_pay(&state, record_id, request_id, &admin, now).await;
+    if params.is_dry_run() {
+        return preview_pay(&state, record_id, request_id).await;
     }
 
     let result = pay_rebate_record(
@@ -199,24 +239,9 @@ pub async fn reverse_rebate_payout(
 ) -> Result<Json<ApiResponse<PayResult>>> {
     validate_record_id(record_id)?;
     require_payout_action_header(&headers, "reverse")?;
+    require_settlement_writes_enabled(state.config.settlement_mode)?;
     let request_id = request_id_from_headers(&headers)?;
     let now = Utc::now().timestamp();
-
-    if !state.config.payout_enabled {
-        record_attempt(
-            &state.pool,
-            record_id,
-            "reverse",
-            &request_id,
-            &admin,
-            "disabled",
-            423,
-            "payout is disabled",
-            now,
-        )
-        .await;
-        return Err(AppError::Locked("返利余额发放开关未开启".to_string()));
-    }
 
     let (payout, reversal) =
         match reserve_reversal(&state, record_id, &request_id, &admin, now).await {
@@ -224,21 +249,23 @@ pub async fn reverse_rebate_payout(
             Ok(ReserveReversalResult::AlreadyReversed(reversal)) => {
                 record_attempt(
                     &state.pool,
-                    record_id,
-                    "reverse",
-                    &request_id,
-                    &admin,
-                    "already_reversed",
-                    200,
-                    "",
-                    now,
+                    PayoutAttempt {
+                        record_id,
+                        action: "reverse",
+                        request_id: &request_id,
+                        admin: &admin,
+                        status: "already_reversed",
+                        http_status: 200,
+                        message: "",
+                        occurred_at: now,
+                    },
                 )
                 .await;
                 return Ok(ok(pay_result_from_payout(
                     "already_reversed",
                     &reversal,
                     None,
-                    state.config.payout_enabled,
+                    state.config.settlement_mode,
                 )));
             }
             Err(err) => {
@@ -260,14 +287,16 @@ pub async fn reverse_rebate_payout(
             .await;
             record_attempt(
                 &state.pool,
-                record_id,
-                "reverse",
-                &request_id,
-                &admin,
-                "reversal_pending",
-                409,
-                "user quota is insufficient for reversal",
-                now,
+                PayoutAttempt {
+                    record_id,
+                    action: "reverse",
+                    request_id: &request_id,
+                    admin: &admin,
+                    status: "reversal_pending",
+                    http_status: 409,
+                    message: "user quota is insufficient for reversal",
+                    occurred_at: now,
+                },
             )
             .await;
             return Err(AppError::Conflict(
@@ -277,14 +306,16 @@ pub async fn reverse_rebate_payout(
         Err(err) => {
             record_attempt(
                 &state.pool,
-                record_id,
-                "reverse",
-                &request_id,
-                &admin,
-                "failed",
-                500,
-                &err.to_string(),
-                now,
+                PayoutAttempt {
+                    record_id,
+                    action: "reverse",
+                    request_id: &request_id,
+                    admin: &admin,
+                    status: "failed",
+                    http_status: 500,
+                    message: &err.to_string(),
+                    occurred_at: now,
+                },
             )
             .await;
             tracing::error!(record_id, error = %err, "Payout reversal failed");
@@ -295,14 +326,16 @@ pub async fn reverse_rebate_payout(
     if let Err(err) = complete_reversal(&state.pool, &payout, &reversal, &mark, now).await {
         record_attempt(
             &state.pool,
-            record_id,
-            "reverse",
-            &request_id,
-            &admin,
-            "newapi_applied_completion_failed",
-            500,
-            &err.to_string(),
-            now,
+            PayoutAttempt {
+                record_id,
+                action: "reverse",
+                request_id: &request_id,
+                admin: &admin,
+                status: "newapi_applied_completion_failed",
+                http_status: 500,
+                message: &err.to_string(),
+                occurred_at: now,
+            },
         )
         .await;
         tracing::error!(
@@ -320,14 +353,16 @@ pub async fn reverse_rebate_payout(
 
     record_attempt(
         &state.pool,
-        record_id,
-        "reverse",
-        &request_id,
-        &admin,
-        "reversed",
-        200,
-        "",
-        now,
+        PayoutAttempt {
+            record_id,
+            action: "reverse",
+            request_id: &request_id,
+            admin: &admin,
+            status: "reversed",
+            http_status: 200,
+            message: "",
+            occurred_at: now,
+        },
     )
     .await;
 
@@ -335,7 +370,7 @@ pub async fn reverse_rebate_payout(
         "reversed",
         &reversal,
         Some(&mark),
-        state.config.payout_enabled,
+        state.config.settlement_mode,
     )))
 }
 
@@ -343,38 +378,22 @@ async fn preview_pay(
     state: &AppState,
     record_id: i64,
     request_id: String,
-    admin: &AdminUser,
-    now: i64,
 ) -> Result<Json<ApiResponse<PayResult>>> {
     match preview_pay_record(state, record_id).await {
-        Ok(record) => {
-            record_attempt(
-                &state.pool,
-                record_id,
-                "pay",
-                &request_id,
-                admin,
-                "dry_run",
-                200,
-                "",
-                now,
-            )
-            .await;
-            Ok(ok(PayResult {
-                outcome: "dry_run".to_string(),
-                payout_id: None,
-                record_id: record.id,
-                request_id,
-                amount_cents: record.amount_cents,
-                quota_delta: record.rebate_quota,
-                balance_after: None,
-                newapi_log_id: None,
-                newapi_mark_id: None,
-                message: Some("payout is disabled".to_string()),
-                payout_enabled: state.config.payout_enabled,
-            }))
-        }
-        Err(err) => fail_pay(&state.pool, record_id, &request_id, admin, err, now).await,
+        Ok(record) => Ok(ok(PayResult {
+            outcome: "dry_run".to_string(),
+            payout_id: None,
+            record_id: record.id,
+            request_id,
+            amount_cents: record.amount_cents,
+            quota_delta: record.rebate_quota,
+            balance_after: None,
+            newapi_log_id: None,
+            newapi_mark_id: None,
+            message: Some("dry run; no balance or payout state was changed".to_string()),
+            payout_enabled: state.config.settlement_mode.is_enabled(),
+        })),
+        Err(err) => Err(pay_error_response(err).2),
     }
 }
 
@@ -391,26 +410,12 @@ async fn preview_pay_record(state: &AppState, record_id: i64) -> PayoutResult<Re
     if record.status != "approved" {
         return Err(PayoutError::NotApproved);
     }
-    tx.commit().await?;
+    tx.rollback().await?;
     Ok(record)
 }
 
 pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> Result<PayResult> {
-    if !state.config.payout_enabled {
-        record_attempt(
-            &state.pool,
-            input.record_id,
-            "pay",
-            &input.request_id,
-            input.admin,
-            "disabled",
-            423,
-            "payout is disabled",
-            input.now,
-        )
-        .await;
-        return Err(AppError::Locked("返利余额发放开关未开启".to_string()));
-    }
+    require_settlement_writes_enabled(state.config.settlement_mode)?;
 
     let payout = match reserve_payout(
         state,
@@ -425,21 +430,23 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
         Ok(ReservePayoutResult::AlreadyPaid(payout)) => {
             record_attempt(
                 &state.pool,
-                input.record_id,
-                "pay",
-                &input.request_id,
-                input.admin,
-                "already_paid",
-                200,
-                "",
-                input.now,
+                PayoutAttempt {
+                    record_id: input.record_id,
+                    action: "pay",
+                    request_id: &input.request_id,
+                    admin: input.admin,
+                    status: "already_paid",
+                    http_status: 200,
+                    message: "",
+                    occurred_at: input.now,
+                },
             )
             .await;
             return Ok(pay_result_from_payout(
                 "already_paid",
                 &payout,
                 None,
-                state.config.payout_enabled,
+                state.config.settlement_mode,
             ));
         }
         Err(err) => {
@@ -461,14 +468,16 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
             mark_payout_failed(&state.pool, payout.id, &err.to_string(), input.now).await;
             record_attempt(
                 &state.pool,
-                input.record_id,
-                "pay",
-                &input.request_id,
-                input.admin,
-                "failed",
-                500,
-                &err.to_string(),
-                input.now,
+                PayoutAttempt {
+                    record_id: input.record_id,
+                    action: "pay",
+                    request_id: &input.request_id,
+                    admin: input.admin,
+                    status: "failed",
+                    http_status: 500,
+                    message: &err.to_string(),
+                    occurred_at: input.now,
+                },
             )
             .await;
             tracing::error!(
@@ -484,14 +493,16 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
     if let Err(err) = complete_payout(&state.pool, &payout, &mark, input.now).await {
         record_attempt(
             &state.pool,
-            input.record_id,
-            "pay",
-            &input.request_id,
-            input.admin,
-            "newapi_applied_completion_failed",
-            500,
-            &err.to_string(),
-            input.now,
+            PayoutAttempt {
+                record_id: input.record_id,
+                action: "pay",
+                request_id: &input.request_id,
+                admin: input.admin,
+                status: "newapi_applied_completion_failed",
+                http_status: 500,
+                message: &err.to_string(),
+                occurred_at: input.now,
+            },
         )
         .await;
         tracing::error!(
@@ -508,14 +519,16 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
 
     record_attempt(
         &state.pool,
-        input.record_id,
-        "pay",
-        &input.request_id,
-        input.admin,
-        "paid",
-        200,
-        "",
-        input.now,
+        PayoutAttempt {
+            record_id: input.record_id,
+            action: "pay",
+            request_id: &input.request_id,
+            admin: input.admin,
+            status: "paid",
+            http_status: 200,
+            message: "",
+            occurred_at: input.now,
+        },
     )
     .await;
 
@@ -523,7 +536,7 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
         "paid",
         &payout,
         Some(&mark),
-        state.config.payout_enabled,
+        state.config.settlement_mode,
     ))
 }
 
@@ -1244,17 +1257,7 @@ async fn mark_reversal_pending(
     .await;
 }
 
-async fn record_attempt(
-    pool: &PgPool,
-    record_id: i64,
-    action: &str,
-    request_id: &str,
-    admin: &AdminUser,
-    status: &str,
-    http_status: i32,
-    message: &str,
-    now: i64,
-) {
+async fn record_attempt(pool: &PgPool, attempt: PayoutAttempt<'_>) {
     let _ = sqlx::query(
         r#"
         INSERT INTO invitation_rebate_payout_attempts(
@@ -1264,41 +1267,17 @@ async fn record_attempt(
         VALUES ($1, $2, $3, $4, $5, $6, $7, LEFT($8::TEXT, 1000), $9, $9)
         "#,
     )
-    .bind(record_id)
-    .bind(action)
-    .bind(request_id)
-    .bind(admin.0.id)
-    .bind(&admin.0.username)
-    .bind(status)
-    .bind(http_status)
-    .bind(message)
-    .bind(now)
+    .bind(attempt.record_id)
+    .bind(attempt.action)
+    .bind(attempt.request_id)
+    .bind(attempt.admin.0.id)
+    .bind(&attempt.admin.0.username)
+    .bind(attempt.status)
+    .bind(attempt.http_status)
+    .bind(attempt.message)
+    .bind(attempt.occurred_at)
     .execute(pool)
     .await;
-}
-
-async fn fail_pay(
-    pool: &PgPool,
-    record_id: i64,
-    request_id: &str,
-    admin: &AdminUser,
-    err: PayoutError,
-    now: i64,
-) -> Result<Json<ApiResponse<PayResult>>> {
-    let (status, http_status, app_error) = pay_error_response(err);
-    record_attempt(
-        pool,
-        record_id,
-        "pay",
-        request_id,
-        admin,
-        status,
-        http_status,
-        app_error_message(&app_error),
-        now,
-    )
-    .await;
-    Err(app_error)
 }
 
 async fn record_failed_pay_attempt(
@@ -1312,14 +1291,16 @@ async fn record_failed_pay_attempt(
     let (status, http_status, app_error) = pay_error_response(err);
     record_attempt(
         pool,
-        record_id,
-        "pay",
-        request_id,
-        admin,
-        status,
-        http_status,
-        app_error_message(&app_error),
-        now,
+        PayoutAttempt {
+            record_id,
+            action: "pay",
+            request_id,
+            admin,
+            status,
+            http_status,
+            message: app_error_message(&app_error),
+            occurred_at: now,
+        },
     )
     .await;
     Err(app_error)
@@ -1336,14 +1317,16 @@ async fn fail_reverse(
     let (status, http_status, app_error) = reverse_error_response(err);
     record_attempt(
         pool,
-        record_id,
-        "reverse",
-        request_id,
-        admin,
-        status,
-        http_status,
-        app_error_message(&app_error),
-        now,
+        PayoutAttempt {
+            record_id,
+            action: "reverse",
+            request_id,
+            admin,
+            status,
+            http_status,
+            message: app_error_message(&app_error),
+            occurred_at: now,
+        },
     )
     .await;
     Err(app_error)
@@ -1421,6 +1404,8 @@ fn app_error_message(error: &AppError) -> &str {
     match error {
         AppError::Unauthorized => "未授权",
         AppError::Forbidden => "无权限",
+        AppError::FundsMaintenance => FUNDS_MAINTENANCE_MESSAGE,
+        AppError::LegacyCompletionDisabled => LEGACY_COMPLETION_DISABLED_MESSAGE,
         AppError::NotFound(message)
         | AppError::BadRequest(message)
         | AppError::Conflict(message)
@@ -1434,7 +1419,7 @@ fn pay_result_from_payout(
     outcome: &str,
     payout: &Payout,
     mark: Option<&NewApiBalanceMark>,
-    payout_enabled: bool,
+    settlement_mode: SettlementMode,
 ) -> PayResult {
     PayResult {
         outcome: outcome.to_string(),
@@ -1447,8 +1432,36 @@ fn pay_result_from_payout(
         newapi_log_id: mark.and_then(|mark| mark.log_id).or(payout.newapi_log_id),
         newapi_mark_id: mark.map(|mark| mark.id).or(payout.newapi_mark_id),
         message: None,
-        payout_enabled,
+        payout_enabled: settlement_mode.is_enabled(),
     }
+}
+
+fn require_settlement_writes_enabled(mode: SettlementMode) -> Result<()> {
+    if mode.is_enabled() {
+        return Ok(());
+    }
+    Err(AppError::FundsMaintenance)
+}
+
+fn settlement_write_route(method: &Method, path: &str) -> Option<SettlementWriteRoute> {
+    if method != Method::POST {
+        return None;
+    }
+
+    let payout_action = path.contains("/api/admin/rebate-payouts/")
+        && (path.ends_with("/pay") || path.ends_with("/reverse"));
+    let request_payout = path.contains("/api/admin/rebate-requests/")
+        && (path.ends_with("/approve-and-pay") || path.ends_with("/approve-and-pay-batch"));
+    let legacy_completion = path.contains("/api/admin/rebate-requests/")
+        && (path.ends_with("/complete") || path.ends_with("/undo-complete"));
+
+    if legacy_completion {
+        return Some(SettlementWriteRoute::LegacyCompletion);
+    }
+    if payout_action || request_payout {
+        return Some(SettlementWriteRoute::Current);
+    }
+    None
 }
 
 fn quota_to_whole_cents(quota_delta: i64, quota_per_unit: i64) -> PayoutResult<i64> {
@@ -1523,9 +1536,272 @@ fn payout_log_other(kind: &str, payout: &Payout) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::extract::FromRequestParts;
+    use axum::http::{request::Parts, HeaderValue, Request as HttpRequest, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Extension, Router};
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
 
     use super::*;
+    use crate::config::{Config, SettlementMode};
+
+    const CURRENT_SETTLEMENT_PATHS: &[&str] = &[
+        "/api/admin/rebate-payouts/1/pay",
+        "/api/admin/rebate-payouts/1/reverse",
+        "/api/admin/rebate-requests/1/approve-and-pay",
+        "/api/admin/rebate-requests/approve-and-pay-batch",
+    ];
+    const LEGACY_COMPLETION_PATHS: &[&str] = &[
+        "/api/admin/rebate-requests/1/complete",
+        "/api/admin/rebate-requests/1/undo-complete",
+    ];
+
+    #[derive(Default)]
+    struct RouteExecutionProbe {
+        extractor_calls: AtomicUsize,
+        handler_calls: AtomicUsize,
+    }
+
+    struct CountedExtractor(Arc<RouteExecutionProbe>);
+
+    impl FromRequestParts<AppState> for CountedExtractor {
+        type Rejection = StatusCode;
+
+        async fn from_request_parts(
+            parts: &mut Parts,
+            _state: &AppState,
+        ) -> std::result::Result<Self, Self::Rejection> {
+            let probe = parts
+                .extensions
+                .get::<Arc<RouteExecutionProbe>>()
+                .cloned()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            probe.extractor_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Self(probe))
+        }
+    }
+
+    async fn counted_handler(CountedExtractor(probe): CountedExtractor) -> StatusCode {
+        probe.handler_calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
+
+    fn settlement_contract_router(mode: SettlementMode) -> (Router, Arc<RouteExecutionProbe>) {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/unreachable")
+            .unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://invalid/invitations".to_string(),
+                newapi_database_url: "postgresql://invalid/newapi".to_string(),
+                session_secret: "test-only-session-secret".to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                settlement_mode: mode,
+                quota_per_unit: 500_000,
+            },
+            pool: pool.clone(),
+            newapi_pool: pool.clone(),
+            newapi_write_pool: pool,
+        };
+        let probe = Arc::new(RouteExecutionProbe::default());
+        let guard = axum::middleware::from_fn_with_state(state.clone(), enforce_settlement_mode);
+        let app = Router::new()
+            .route("/api/admin/rebate-payouts/{id}/pay", post(counted_handler))
+            .route(
+                "/api/admin/rebate-payouts/{id}/reverse",
+                post(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-payouts/{id}/status",
+                get(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-requests/{id}/approve-and-pay",
+                post(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-requests/approve-and-pay-batch",
+                post(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-requests/{id}/complete",
+                post(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-requests/{id}/undo-complete",
+                post(counted_handler),
+            )
+            .layer(guard)
+            .layer(Extension(probe.clone()))
+            .with_state(state);
+        (app, probe)
+    }
+
+    async fn call_contract_route(app: &Router, method: Method, path: &str) -> Response {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn assert_error_contract(
+        response: Response,
+        status: StatusCode,
+        code: &str,
+        message: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), 2048).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["code"], code);
+        assert_eq!(json["message"], message);
+    }
+
+    #[tokio::test]
+    async fn disabled_and_read_only_block_writes_before_extractors_or_handlers() {
+        for mode in [SettlementMode::Disabled, SettlementMode::ReadOnly] {
+            let (app, probe) = settlement_contract_router(mode);
+
+            for path in CURRENT_SETTLEMENT_PATHS {
+                let response = call_contract_route(&app, Method::POST, path).await;
+                assert_error_contract(
+                    response,
+                    StatusCode::LOCKED,
+                    "funds_maintenance",
+                    "资金结算维护中，请稍后重试",
+                )
+                .await;
+            }
+            for path in LEGACY_COMPLETION_PATHS {
+                let response = call_contract_route(&app, Method::POST, path).await;
+                assert_error_contract(
+                    response,
+                    StatusCode::GONE,
+                    "legacy_completion_disabled",
+                    "旧版返利完成接口已停用，请使用余额发放与冲正接口",
+                )
+                .await;
+            }
+
+            assert_eq!(probe.extractor_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.handler_calls.load(Ordering::SeqCst), 0);
+
+            let response =
+                call_contract_route(&app, Method::GET, "/api/admin/rebate-payouts/1/status").await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(probe.extractor_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.handler_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_allows_current_writes_but_never_legacy_completion() {
+        let (app, probe) = settlement_contract_router(SettlementMode::Enabled);
+
+        for path in CURRENT_SETTLEMENT_PATHS {
+            let response = call_contract_route(&app, Method::POST, path).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        let extractor_calls = probe.extractor_calls.load(Ordering::SeqCst);
+        let handler_calls = probe.handler_calls.load(Ordering::SeqCst);
+        assert_eq!(extractor_calls, CURRENT_SETTLEMENT_PATHS.len());
+        assert_eq!(handler_calls, CURRENT_SETTLEMENT_PATHS.len());
+
+        for path in LEGACY_COMPLETION_PATHS {
+            let response = call_contract_route(&app, Method::POST, path).await;
+            assert_error_contract(
+                response,
+                StatusCode::GONE,
+                "legacy_completion_disabled",
+                "旧版返利完成接口已停用，请使用余额发放与冲正接口",
+            )
+            .await;
+        }
+        assert_eq!(
+            probe.extractor_calls.load(Ordering::SeqCst),
+            extractor_calls
+        );
+        assert_eq!(probe.handler_calls.load(Ordering::SeqCst), handler_calls);
+    }
+
+    #[test]
+    fn settlement_write_gate_fails_closed_with_stable_error_code() {
+        for mode in [SettlementMode::Disabled, SettlementMode::ReadOnly] {
+            assert!(matches!(
+                require_settlement_writes_enabled(mode),
+                Err(AppError::FundsMaintenance)
+            ));
+        }
+    }
+
+    #[test]
+    fn settlement_write_gate_allows_enabled_mode() {
+        assert!(require_settlement_writes_enabled(SettlementMode::Enabled).is_ok());
+    }
+
+    #[tokio::test]
+    async fn settlement_write_gate_returns_locked_with_stable_error_code() {
+        let response = require_settlement_writes_enabled(SettlementMode::Disabled)
+            .unwrap_err()
+            .into_response();
+
+        assert_eq!(response.status(), 423);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["code"], "funds_maintenance");
+        assert_eq!(json["message"], "资金结算维护中，请稍后重试");
+    }
+
+    #[test]
+    fn classifies_current_and_legacy_writes_without_blocking_reads() {
+        for path in [
+            "/api/admin/rebate-payouts/1/pay",
+            "/api/admin/rebate-payouts/1/reverse",
+            "/api/admin/rebate-requests/1/approve-and-pay",
+            "/api/admin/rebate-requests/approve-and-pay-batch",
+            "/invitations/api/admin/rebate-requests/1/approve-and-pay",
+        ] {
+            assert_eq!(
+                settlement_write_route(&Method::POST, path),
+                Some(SettlementWriteRoute::Current),
+                "{path}"
+            );
+        }
+
+        for path in LEGACY_COMPLETION_PATHS {
+            assert_eq!(
+                settlement_write_route(&Method::POST, path),
+                Some(SettlementWriteRoute::LegacyCompletion),
+                "{path}"
+            );
+        }
+
+        for (method, path) in [
+            (Method::GET, "/api/admin/rebate-payouts/1/status"),
+            (Method::POST, "/api/admin/rebate-requests/1/approve"),
+            (Method::POST, "/api/admin/tools/pay"),
+        ] {
+            assert_eq!(settlement_write_route(&method, path), None, "{path}");
+        }
+    }
 
     #[test]
     fn quota_to_whole_cents_converts_exact_amounts() {

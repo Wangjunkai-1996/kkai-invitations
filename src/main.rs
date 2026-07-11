@@ -38,11 +38,17 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()
+        .unwrap_or_else(|error| panic!("invalid settlement configuration: {error}"));
     let pool = db::init_pool(&config.database_url).await;
     let newapi_pool = db::init_readonly_pool(&config.newapi_database_url).await;
-    let newapi_write_pool = db::init_external_pool(&config.newapi_database_url).await;
-    if config.payout_enabled {
+    let newapi_write_pool = if config.settlement_mode.is_enabled() {
+        db::init_external_pool(&config.newapi_database_url).await
+    } else {
+        newapi_pool.clone()
+    };
+    tracing::info!(settlement_mode = ?config.settlement_mode, "Settlement mode configured");
+    if config.settlement_mode.is_enabled() {
         db::migrate_newapi_payout_tables(&newapi_write_pool).await;
     }
     let listen_addr = config.listen_addr.clone();
@@ -230,7 +236,12 @@ async fn main() {
         app = app.route(b, get(|| async { "Invitations API" }));
     }
 
-    let app = app.layer(CorsLayer::permissive()).with_state(state);
+    let settlement_guard =
+        axum::middleware::from_fn_with_state(state.clone(), payout::enforce_settlement_mode);
+    let app = app
+        .layer(settlement_guard)
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await

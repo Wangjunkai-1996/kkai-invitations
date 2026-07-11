@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 
-use crate::error::{AppError, Result};
+use crate::error::{
+    AppError, Result, FUNDS_MAINTENANCE_MESSAGE, LEGACY_COMPLETION_DISABLED_MESSAGE,
+};
 use crate::invitation_signup::{
     fetch_paid_invitee_ids, insert_invitation_signup_reward_record,
     resolve_invitation_signup_reward_unlocked_at, unlock_paid_invitation_signup_rewards,
@@ -1158,100 +1160,13 @@ pub async fn reset_rebate_request_review(
 }
 
 // POST /api/admin/rebate-requests/:id/complete
-pub async fn complete_rebate_request(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<i64>,
-) -> Result<Json<ApiResponse<serde_json::Value>>> {
-    validate_id(id)?;
-    let now = Utc::now().timestamp();
-    let mut tx = state.pool.begin().await?;
-
-    let row = sqlx::query(
-        "SELECT rebate_record_ids FROM rebate_requests WHERE id = $1 AND status = 'approved' FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound("申请不存在或状态不正确".to_string()))?;
-    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
-
-    sqlx::query(
-        "UPDATE rebate_requests SET status = 'completed', completed_at = $1, updated_at = $1 WHERE id = $2",
-    )
-    .bind(now)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE rebate_records SET status = 'completed', updated_at = $1 WHERE id = ANY($2) AND status = 'approved'",
-    )
-    .bind(now)
-    .bind(&rebate_record_ids)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    tracing::info!(
-        admin_id = admin.0.id,
-        request_id = id,
-        "Admin marked rebate request as completed"
-    );
-
-    Ok(message(serde_json::json!({ "id": id }), "返利处理已完成"))
+pub async fn complete_rebate_request() -> Result<Json<ApiResponse<serde_json::Value>>> {
+    Err(AppError::LegacyCompletionDisabled)
 }
 
 // POST /api/admin/rebate-requests/:id/undo-complete
-pub async fn undo_complete_rebate_request(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<i64>,
-) -> Result<Json<ApiResponse<serde_json::Value>>> {
-    validate_id(id)?;
-    let now = Utc::now().timestamp();
-    let mut tx = state.pool.begin().await?;
-
-    let row = sqlx::query(
-        "SELECT rebate_record_ids FROM rebate_requests WHERE id = $1 AND status = 'completed' FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound("申请不存在或状态不正确".to_string()))?;
-    let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
-
-    sqlx::query(
-        "UPDATE rebate_requests SET status = 'approved', completed_at = NULL, updated_at = $1 WHERE id = $2",
-    )
-    .bind(now)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-    let updated_records = sqlx::query(
-        "UPDATE rebate_records SET status = 'approved', updated_at = $1 WHERE id = ANY($2) AND status = 'completed'",
-    )
-    .bind(now)
-    .bind(&rebate_record_ids)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    tx.commit().await?;
-
-    tracing::info!(
-        admin_id = admin.0.id,
-        request_id = id,
-        updated_records,
-        "Admin withdrew completed rebate request"
-    );
-
-    Ok(message(
-        serde_json::json!({ "id": id }),
-        "返利完成状态已撤回",
-    ))
+pub async fn undo_complete_rebate_request() -> Result<Json<ApiResponse<serde_json::Value>>> {
+    Err(AppError::LegacyCompletionDisabled)
 }
 
 // GET /api/admin/rebate-stats
@@ -3155,6 +3070,8 @@ fn app_error_message(error: &AppError) -> &str {
     match error {
         AppError::Unauthorized => "未授权",
         AppError::Forbidden => "无权限",
+        AppError::FundsMaintenance => FUNDS_MAINTENANCE_MESSAGE,
+        AppError::LegacyCompletionDisabled => LEGACY_COMPLETION_DISABLED_MESSAGE,
         AppError::NotFound(message)
         | AppError::BadRequest(message)
         | AppError::Conflict(message)
@@ -3465,6 +3382,18 @@ fn optional_timestamp_to_iso(timestamp: Option<i64>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_completion_handlers_return_typed_disabled_error() {
+        assert!(matches!(
+            complete_rebate_request().await,
+            Err(AppError::LegacyCompletionDisabled)
+        ));
+        assert!(matches!(
+            undo_complete_rebate_request().await,
+            Err(AppError::LegacyCompletionDisabled)
+        ));
+    }
 
     #[test]
     fn validates_string_rebate_rate() {
