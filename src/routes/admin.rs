@@ -980,8 +980,9 @@ pub async fn approve_and_pay_rebate_request(
     let base_request_id = request_id_from_headers(&headers)?;
     let result =
         approve_and_pay_request(&state, &admin, id, req.note.as_deref(), &base_request_id).await?;
+    let response_message = approve_and_pay_message(&result);
 
-    Ok(message(result, "返利申请已提交，等待结算"))
+    Ok(message(result, response_message))
 }
 
 // POST /api/admin/rebate-requests/approve-and-pay-batch
@@ -1036,8 +1037,9 @@ pub async fn batch_approve_and_pay_rebate_requests(
         items,
         errors,
     };
+    let response_message = batch_approve_and_pay_message(&result);
 
-    Ok(message(result, "批量返利申请已提交，等待结算"))
+    Ok(message(result, response_message))
 }
 
 // POST /api/admin/rebate-requests/:id/reject
@@ -2873,14 +2875,9 @@ async fn approve_and_pay_request(
             }
 
             let finalized_status = finalize_approve_and_pay_request(state, request_id).await?;
-            let status = if pending_count > 0 {
-                "pending".to_string()
-            } else {
-                finalized_status
-            };
             Ok(ApproveAndPayResponse {
                 request_id,
-                status,
+                status: finalized_status,
                 total_amount: quota_to_cents(total_amount),
                 paid_count,
                 already_paid_count,
@@ -2894,6 +2891,69 @@ async fn approve_and_pay_request(
 
 fn aggregate_pending_count(items: &[ApproveAndPayResponse]) -> usize {
     items.iter().map(|item| item.pending_count).sum()
+}
+
+fn approve_and_pay_message(response: &ApproveAndPayResponse) -> String {
+    let details = settlement_outcome_details(
+        response.pending_count,
+        response.paid_count,
+        response.already_paid_count,
+        response.failed_count,
+    );
+    let prefix = if response.pending_count > 0 {
+        "返利申请已提交"
+    } else {
+        "返利申请处理完成"
+    };
+    response_message(prefix, details)
+}
+
+fn batch_approve_and_pay_message(response: &BatchApproveAndPayResponse) -> String {
+    let mut details = settlement_outcome_details(
+        response.pending_count,
+        response.paid_count,
+        response.already_paid_count,
+        response.failed_count,
+    );
+    if response.failed_requests > 0 {
+        details.push(format!("{} 个申请处理失败", response.failed_requests));
+    }
+    let prefix = if response.pending_count > 0 {
+        "批量返利申请已提交"
+    } else {
+        "批量返利申请处理完成"
+    };
+    response_message(prefix, details)
+}
+
+fn settlement_outcome_details(
+    pending_count: usize,
+    paid_count: usize,
+    already_paid_count: usize,
+    failed_count: usize,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if pending_count > 0 {
+        details.push(format!("{pending_count} 条等待结算"));
+    }
+    if paid_count > 0 {
+        details.push(format!("{paid_count} 条已结算"));
+    }
+    if already_paid_count > 0 {
+        details.push(format!("{already_paid_count} 条无需重复结算"));
+    }
+    if failed_count > 0 {
+        details.push(format!("{failed_count} 条记录处理失败"));
+    }
+    details
+}
+
+fn response_message(prefix: &str, details: Vec<String>) -> String {
+    if details.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}：{}", details.join("，"))
+    }
 }
 
 async fn prepare_approve_and_pay_request(
@@ -3608,7 +3668,7 @@ mod tests {
     fn approve_and_pay_response_serializes_pending_count_in_camel_case() {
         let response = ApproveAndPayResponse {
             request_id: 10,
-            status: "pending".to_string(),
+            status: "approved".to_string(),
             total_amount: 100,
             paid_count: 0,
             already_paid_count: 0,
@@ -3618,6 +3678,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["status"], "approved");
         assert_eq!(json["pendingCount"], 2);
         assert!(json.get("pending_count").is_none());
     }
@@ -3645,6 +3706,57 @@ mod tests {
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["pendingCount"], 3);
         assert!(json.get("pending_count").is_none());
+    }
+
+    #[test]
+    fn approve_and_pay_message_reports_actual_settlement_outcomes() {
+        let mut response = approve_and_pay_response_for_count_test("approved", 2);
+        assert_eq!(
+            approve_and_pay_message(&response),
+            "返利申请已提交：2 条等待结算"
+        );
+
+        response.pending_count = 0;
+        response.paid_count = 2;
+        assert_eq!(
+            approve_and_pay_message(&response),
+            "返利申请处理完成：2 条已结算"
+        );
+
+        response.paid_count = 0;
+        response.already_paid_count = 2;
+        assert_eq!(
+            approve_and_pay_message(&response),
+            "返利申请处理完成：2 条无需重复结算"
+        );
+
+        response.pending_count = 1;
+        response.already_paid_count = 0;
+        response.failed_count = 1;
+        assert_eq!(
+            approve_and_pay_message(&response),
+            "返利申请已提交：1 条等待结算，1 条记录处理失败"
+        );
+    }
+
+    #[test]
+    fn batch_message_reports_record_and_request_failures() {
+        let response = BatchApproveAndPayResponse {
+            total_requests: 3,
+            succeeded_requests: 2,
+            failed_requests: 1,
+            paid_count: 1,
+            already_paid_count: 0,
+            pending_count: 2,
+            failed_count: 1,
+            items: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        assert_eq!(
+            batch_approve_and_pay_message(&response),
+            "批量返利申请已提交：2 条等待结算，1 条已结算，1 条记录处理失败，1 个申请处理失败"
+        );
     }
 
     fn approve_and_pay_response_for_count_test(

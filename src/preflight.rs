@@ -751,17 +751,21 @@ fn inspect_postgres_versions(report: &mut PreflightReport) {
         ("invitations", report.postgres_version_num),
         ("newapi", report.external_postgres_version_num),
     ] {
-        if !(140_000..170_000).contains(&version) {
+        if !postgres_version_supported(version) {
             report.schema_compatible_before_migration = false;
             report.issues.push(PreflightIssue {
                 code: "unsupported_postgres_version",
                 severity: IssueSeverity::Blocking,
                 count: 1,
                 sample_ids: vec![format!("{scope}:{version}")],
-                message: "PostgreSQL 14 through 16 is required for this migration protocol.",
+                message: "PostgreSQL 14 through 18 is required for this migration protocol.",
             });
         }
     }
+}
+
+fn postgres_version_supported(version: i32) -> bool {
+    (140_000..190_000).contains(&version)
 }
 
 #[derive(Debug)]
@@ -2250,5 +2254,15 @@ mod tests {
             message: "blocked",
         });
         assert!(!report.finish().safe_to_migrate);
+    }
+
+    #[test]
+    fn postgres_migration_protocol_supports_versions_14_through_18() {
+        assert!(!postgres_version_supported(139_999));
+        assert!(postgres_version_supported(140_000));
+        assert!(postgres_version_supported(160_999));
+        assert!(postgres_version_supported(180_004));
+        assert!(postgres_version_supported(189_999));
+        assert!(!postgres_version_supported(190_000));
     }
 }
