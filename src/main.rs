@@ -4,6 +4,7 @@ mod error;
 mod invitation_signup;
 mod middleware;
 mod payout;
+mod preflight;
 mod rebate_lifecycle;
 mod rebate_types;
 mod response;
@@ -38,19 +39,65 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("--preflight") {
+        let database_url = match config::invitations_database_url_from_env() {
+            Ok(value) => value,
+            Err(_) => exit_preflight_error(
+                3,
+                "invalid_invitations_database_configuration",
+                "DATABASE_URL or INVITATIONS_DATABASE_URL must be set",
+            ),
+        };
+        let newapi_database_url = match config::newapi_database_url_from_env() {
+            Ok(value) => value,
+            Err(_) => exit_preflight_error(
+                3,
+                "invalid_newapi_database_configuration",
+                "NEWAPI_DATABASE_URL must be set",
+            ),
+        };
+        let report = match db::preflight_database(&database_url, &newapi_database_url).await {
+            Ok(report) => report,
+            Err(_) => exit_preflight_error(
+                4,
+                "preflight_database_unavailable",
+                "Preflight could not read both PostgreSQL databases",
+            ),
+        };
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(_) => exit_preflight_error(
+                5,
+                "preflight_serialization_failed",
+                "Preflight report serialization failed",
+            ),
+        }
+        if !report.safe_to_migrate {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     let config = Config::from_env()
         .unwrap_or_else(|error| panic!("invalid settlement configuration: {error}"));
-    let pool = db::init_pool(&config.database_url).await;
-    let newapi_pool = db::init_readonly_pool(&config.newapi_database_url).await;
-    let newapi_write_pool = if config.settlement_mode.is_enabled() {
-        db::init_external_pool(&config.newapi_database_url).await
-    } else {
-        newapi_pool.clone()
+    let newapi_pool = db::init_readonly_pool(&config.newapi_database_url)
+        .await
+        .expect("failed to connect to new-api readonly database");
+    let pool = match db::init_pool(&config.database_url, &newapi_pool).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            if let Some(report) = error.preflight_report() {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(report)
+                        .expect("serialize blocked preflight report")
+                );
+            }
+            panic!("invitations database is not ready: {error}");
+        }
     };
+    let newapi_write_pool = newapi_pool.clone();
     tracing::info!(settlement_mode = ?config.settlement_mode, "Settlement mode configured");
-    if config.settlement_mode.is_enabled() {
-        db::migrate_newapi_payout_tables(&newapi_write_pool).await;
-    }
     let listen_addr = config.listen_addr.clone();
     let base_path = config.base_path.clone();
 
@@ -253,4 +300,16 @@ async fn main() {
         base_path
     );
     axum::serve(listener, app).await.unwrap();
+}
+
+fn exit_preflight_error(exit_code: i32, code: &str, message: &str) -> ! {
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    println!("{payload}");
+    std::process::exit(exit_code);
 }

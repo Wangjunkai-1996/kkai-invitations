@@ -37,9 +37,8 @@ impl Config {
         Ok(Self {
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:6212".to_string()),
             base_path: env::var("BASE_PATH").unwrap_or_else(|_| "".to_string()),
-            database_url: database_url_env(),
-            newapi_database_url: env::var("NEWAPI_DATABASE_URL")
-                .expect("NEWAPI_DATABASE_URL must be set"),
+            database_url: invitations_database_url_from_env()?,
+            newapi_database_url: newapi_database_url_from_env()?,
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),
             sync_secret: env::var("SYNC_SECRET")
                 .ok()
@@ -59,11 +58,19 @@ impl Config {
     }
 }
 
-fn database_url_env() -> String {
+pub fn invitations_database_url_from_env() -> std::result::Result<String, String> {
     let database_url = env::var("DATABASE_URL").ok();
     let legacy_database_url = env::var("INVITATIONS_DATABASE_URL").ok();
     database_url_env_value(database_url.as_deref(), legacy_database_url.as_deref())
-        .expect("DATABASE_URL or INVITATIONS_DATABASE_URL must be set")
+        .ok_or_else(|| "DATABASE_URL or INVITATIONS_DATABASE_URL must be set".to_string())
+}
+
+pub fn newapi_database_url_from_env() -> std::result::Result<String, String> {
+    env::var("NEWAPI_DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "NEWAPI_DATABASE_URL must be set".to_string())
 }
 
 fn database_url_env_value(
@@ -104,7 +111,10 @@ fn settlement_mode_env_value(
         Some("") | None => Ok(SettlementMode::Disabled),
         Some("disabled") => Ok(SettlementMode::Disabled),
         Some("read_only") => Ok(SettlementMode::ReadOnly),
-        Some("enabled") => Ok(SettlementMode::Enabled),
+        Some("enabled") => Err(
+            "SETTLEMENT_MODE=enabled is unavailable until the NewAPI balance API write-ready gate is implemented"
+                .to_string(),
+        ),
         Some(value) => Err(format!(
             "SETTLEMENT_MODE must be one of disabled, read_only, or enabled; got {value:?}"
         )),
@@ -174,10 +184,7 @@ mod tests {
             settlement_mode_env_value(Some("read_only"), None).unwrap(),
             SettlementMode::ReadOnly
         );
-        assert_eq!(
-            settlement_mode_env_value(Some("enabled"), None).unwrap(),
-            SettlementMode::Enabled
-        );
+        assert!(settlement_mode_env_value(Some("enabled"), None).is_err());
         assert!(settlement_mode_env_value(Some("true"), None).is_err());
         assert!(settlement_mode_env_value(Some("write"), None).is_err());
     }

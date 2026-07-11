@@ -1,30 +1,1129 @@
-use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::Executor;
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
+use sqlx::{Acquire, Executor, Row};
+use sqlx_core::migrate::{MigrateError, Migration, MigrationType, Migrator};
+use thiserror::Error;
+
+use crate::preflight::{self, PreflightMode, PreflightReport};
 
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
+const EXPECTED_MIGRATIONS: [i64; 5] = [
+    202607110001,
+    202607110002,
+    202607110003,
+    202607110004,
+    202607110005,
+];
+#[derive(Clone, Copy)]
+struct IndexSpec {
+    name: &'static str,
+    table: &'static str,
+    columns: &'static [&'static str],
+    predicate: Option<&'static str>,
+    unique: bool,
+}
 
-use crate::system_config::{
-    INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
-    INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY,
-    INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
-    INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY, INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
-    INVITATION_SIGNUP_REWARD_ENABLED_KEY, INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY,
-    ORDER_REBATE_ENABLED_KEY, REBATE_TO_BALANCE_ENABLED_KEY, USER_INVITATION_REBATE_ENABLED_KEY,
-};
+const CRITICAL_INDEXES: &[IndexSpec] = &[
+    IndexSpec {
+        name: "uq_rebate_rules_group_type",
+        table: "rebate_rules",
+        columns: &["user_group", "rule_type"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_rebate_rules_group",
+        table: "rebate_rules",
+        columns: &["user_group"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "uq_rebate_records_order",
+        table: "rebate_records",
+        columns: &["order_type", "order_id"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_ulid",
+        table: "rebate_records",
+        columns: &["ulid"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_invitation_registrations_invitee",
+        table: "invitation_registrations",
+        columns: &["invitee_id"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_inviter",
+        table: "rebate_records",
+        columns: &["inviter_id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_status",
+        table: "rebate_records",
+        columns: &["status"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_initialization",
+        table: "rebate_records",
+        columns: &["status", "initialization_ends_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_effective",
+        table: "rebate_records",
+        columns: &["inviter_id", "status", "rebate_effective_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_inviter_status",
+        table: "rebate_records",
+        columns: &["inviter_id", "status"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_records_signup_unlock",
+        table: "rebate_records",
+        columns: &["order_type", "unlock_required", "unlocked_at", "invitee_id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_invitation_registrations_inviter",
+        table: "invitation_registrations",
+        columns: &["inviter_id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_invitation_registrations_invited_at",
+        table: "invitation_registrations",
+        columns: &["invited_at", "id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_requests_user",
+        table: "rebate_requests",
+        columns: &["user_id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_requests_status",
+        table: "rebate_requests",
+        columns: &["status"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "uq_invitation_rebate_payouts_record_pay",
+        table: "invitation_rebate_payouts",
+        columns: &["rebate_record_id"],
+        predicate: Some("kind='payout'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_invitation_rebate_payouts_original_reverse",
+        table: "invitation_rebate_payouts",
+        columns: &["original_payout_id"],
+        predicate: Some("kind='reversal'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_invitation_rebate_payouts_request_id",
+        table: "invitation_rebate_payouts",
+        columns: &["request_id"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_invitation_rebate_payouts_status",
+        table: "invitation_rebate_payouts",
+        columns: &["status", "updated_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_invitation_rebate_payout_attempts_record",
+        table: "invitation_rebate_payout_attempts",
+        columns: &["rebate_record_id", "created_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_sync_log_type_id",
+        table: "sync_log",
+        columns: &["sync_type", "last_sync_id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "uq_rebate_request_items_active_ordinal",
+        table: "rebate_request_items",
+        columns: &["request_id", "ordinal"],
+        predicate: Some("membership_state='active'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_rebate_record_request_ownership_active",
+        table: "rebate_record_request_ownership",
+        columns: &["rebate_record_id"],
+        predicate: Some("ownership_state='active'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_rebate_record_request_ownership_request",
+        table: "rebate_record_request_ownership",
+        columns: &["request_id", "ownership_state"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_record_settlements_state",
+        table: "rebate_record_settlements",
+        columns: &["settlement_state", "updated_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_calculation_snapshots_rule",
+        table: "rebate_calculation_snapshots",
+        columns: &["rule_id", "snapshotted_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "uq_balance_operations_operation_ulid",
+        table: "balance_operations",
+        columns: &["operation_ulid"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_balance_operations_idempotency_key",
+        table: "balance_operations",
+        columns: &["idempotency_key"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_balance_operations_business_identity",
+        table: "balance_operations",
+        columns: &["source", "business_operation_key"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_balance_operation_outbox_event",
+        table: "balance_operation_outbox",
+        columns: &["operation_id", "event_type"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_balance_operations_record_credit",
+        table: "balance_operations",
+        columns: &["rebate_record_id"],
+        predicate: Some("operation_kind='credit'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_balance_operations_original_reversal",
+        table: "balance_operations",
+        columns: &["original_operation_ulid"],
+        predicate: Some("operation_kind='reversal'"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_balance_operations_dispatch",
+        table: "balance_operations",
+        columns: &["operation_state", "next_attempt_at", "id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_balance_operations_record",
+        table: "balance_operations",
+        columns: &["rebate_record_id", "created_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_balance_operation_outbox_ready",
+        table: "balance_operation_outbox",
+        columns: &["available_at", "id"],
+        predicate: Some("dispatched_at IS NULL"),
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_balance_operation_events_operation",
+        table: "balance_operation_events",
+        columns: &["operation_id", "occurred_at", "id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_reconciliation_cases_open",
+        table: "rebate_reconciliation_cases",
+        columns: &["case_state", "issue_code", "created_at"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_background_jobs_runnable",
+        table: "rebate_background_jobs",
+        columns: &["job_state", "run_after", "id"],
+        predicate: Some("job_state=ANY(ARRAY['queued'::varchar,'retry_wait'::varchar])"),
+        unique: false,
+    },
+];
 
-pub async fn init_pool(database_url: &str) -> PgPool {
+#[derive(Clone, Copy)]
+struct KeyConstraintSpec {
+    name: &'static str,
+    table: &'static str,
+    constraint_type: char,
+    columns: &'static [&'static str],
+}
+
+const CRITICAL_KEY_CONSTRAINTS: &[KeyConstraintSpec] = &[
+    KeyConstraintSpec {
+        name: "rebate_rules_pkey",
+        table: "rebate_rules",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_records_pkey",
+        table: "rebate_records",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "invitation_registrations_pkey",
+        table: "invitation_registrations",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_requests_pkey",
+        table: "rebate_requests",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "invitation_rebate_payouts_pkey",
+        table: "invitation_rebate_payouts",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "invitation_rebate_payout_attempts_pkey",
+        table: "invitation_rebate_payout_attempts",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "sync_log_pkey",
+        table: "sync_log",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "system_config_pkey",
+        table: "system_config",
+        constraint_type: 'p',
+        columns: &["key"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_request_items_pkey",
+        table: "rebate_request_items",
+        constraint_type: 'p',
+        columns: &["request_id", "rebate_record_id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_record_request_ownership_pkey",
+        table: "rebate_record_request_ownership",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "uq_rebate_request_ownership_request_record",
+        table: "rebate_record_request_ownership",
+        constraint_type: 'u',
+        columns: &["request_id", "rebate_record_id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_record_settlements_pkey",
+        table: "rebate_record_settlements",
+        constraint_type: 'p',
+        columns: &["rebate_record_id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_calculation_snapshots_pkey",
+        table: "rebate_calculation_snapshots",
+        constraint_type: 'p',
+        columns: &["rebate_record_id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_request_money_snapshots_pkey",
+        table: "rebate_request_money_snapshots",
+        constraint_type: 'p',
+        columns: &["rebate_request_id"],
+    },
+    KeyConstraintSpec {
+        name: "balance_operations_pkey",
+        table: "balance_operations",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "uq_balance_operations_operation_ulid",
+        table: "balance_operations",
+        constraint_type: 'u',
+        columns: &["operation_ulid"],
+    },
+    KeyConstraintSpec {
+        name: "uq_balance_operations_idempotency_key",
+        table: "balance_operations",
+        constraint_type: 'u',
+        columns: &["idempotency_key"],
+    },
+    KeyConstraintSpec {
+        name: "uq_balance_operations_business_identity",
+        table: "balance_operations",
+        constraint_type: 'u',
+        columns: &["source", "business_operation_key"],
+    },
+    KeyConstraintSpec {
+        name: "balance_operation_outbox_pkey",
+        table: "balance_operation_outbox",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "uq_balance_operation_outbox_event",
+        table: "balance_operation_outbox",
+        constraint_type: 'u',
+        columns: &["operation_id", "event_type"],
+    },
+    KeyConstraintSpec {
+        name: "balance_operation_events_pkey",
+        table: "balance_operation_events",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_reconciliation_cases_pkey",
+        table: "rebate_reconciliation_cases",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_sync_checkpoints_pkey",
+        table: "rebate_sync_checkpoints",
+        constraint_type: 'p',
+        columns: &["sync_type", "source_namespace"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_background_jobs_pkey",
+        table: "rebate_background_jobs",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "uq_rebate_background_jobs_identity",
+        table: "rebate_background_jobs",
+        constraint_type: 'u',
+        columns: &["job_type", "partition_key"],
+    },
+    KeyConstraintSpec {
+        name: "_sqlx_migrations_pkey",
+        table: "_sqlx_migrations",
+        constraint_type: 'p',
+        columns: &["version"],
+    },
+];
+
+#[derive(Clone, Copy)]
+struct CheckSpec {
+    name: &'static str,
+    table: &'static str,
+    definition_md5: &'static str,
+}
+
+const CRITICAL_CHECKS: &[CheckSpec] = &[
+    CheckSpec {
+        name: "ck_invitation_rebate_payouts_amount_nonnegative",
+        table: "invitation_rebate_payouts",
+        definition_md5: "49f5752d3872fa83d7dfef372d0ce14f",
+    },
+    CheckSpec {
+        name: "ck_invitation_rebate_payouts_delta_nonzero",
+        table: "invitation_rebate_payouts",
+        definition_md5: "5b73d49bc22be26e7bb4163ae4a78a06",
+    },
+    CheckSpec {
+        name: "ck_invitation_rebate_payouts_kind",
+        table: "invitation_rebate_payouts",
+        definition_md5: "22cc0e52a6d8cfeef0bc543b79ef005c",
+    },
+    CheckSpec {
+        name: "ck_invitation_rebate_payouts_status",
+        table: "invitation_rebate_payouts",
+        definition_md5: "1073a6718da532e84be524a988d7c8c4",
+    },
+    CheckSpec {
+        name: "ck_invitation_rebate_payouts_kind_status_original",
+        table: "invitation_rebate_payouts",
+        definition_md5: "36332430c34be77d570ab7202f5f7d11",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_kind",
+        table: "balance_operations",
+        definition_md5: "5cb137469d1f3b09af93da532af5a393",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_state",
+        table: "balance_operations",
+        definition_md5: "8cb55a86cb4953c2c98902beaa34b9d9",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_delta_nonzero",
+        table: "balance_operations",
+        definition_md5: "78448298a2b7d80f32e76aeac18e1f21",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_attempt_count",
+        table: "balance_operations",
+        definition_md5: "1eccb251ce5d9eae5cc567adab24bd33",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_ulid_format",
+        table: "balance_operations",
+        definition_md5: "ae12b1cbf2ad6392a068198c8b75a680",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_payload_hash_format",
+        table: "balance_operations",
+        definition_md5: "8902c21ae3d765f256a8b9e162d3088e",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_direction",
+        table: "balance_operations",
+        definition_md5: "9988bf0b493ddea36b42b01f3cfbe92a",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_items_membership_state",
+        table: "rebate_request_items",
+        definition_md5: "0067984024457714135c3c710b2653c9",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_items_amount_nonnegative",
+        table: "rebate_request_items",
+        definition_md5: "8fece32e601ff5359fd178b21e3c5931",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_items_state_consistency",
+        table: "rebate_request_items",
+        definition_md5: "865e28ae4b3591d7db2881489b4b0c6d",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_ownership_state",
+        table: "rebate_record_request_ownership",
+        definition_md5: "be7eb51a5e5f7972313ec2a55e854f3b",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_ownership_state_consistency",
+        table: "rebate_record_request_ownership",
+        definition_md5: "83300393acf02040a9472b0c4e860262",
+    },
+    CheckSpec {
+        name: "ck_rebate_record_settlements_state",
+        table: "rebate_record_settlements",
+        definition_md5: "4238e100522ee179442d860cbcd82b95",
+    },
+    CheckSpec {
+        name: "ck_rebate_record_settlements_version",
+        table: "rebate_record_settlements",
+        definition_md5: "165e3705cd69898a22ebe56540b430b8",
+    },
+    CheckSpec {
+        name: "ck_rebate_calculation_snapshot_rate",
+        table: "rebate_calculation_snapshots",
+        definition_md5: "afa6c4daf51f71494145d7a4c9d6ca0a",
+    },
+    CheckSpec {
+        name: "ck_rebate_calculation_snapshot_quota_per_unit",
+        table: "rebate_calculation_snapshots",
+        definition_md5: "becd77852fa8f38e4e18751295350f82",
+    },
+    CheckSpec {
+        name: "ck_rebate_calculation_snapshot_order_amount",
+        table: "rebate_calculation_snapshots",
+        definition_md5: "2886d5d6db82e3b896dab02a55ee6c13",
+    },
+    CheckSpec {
+        name: "ck_rebate_calculation_snapshot_rebate_quota",
+        table: "rebate_calculation_snapshots",
+        definition_md5: "dbfae43a187c04b587665df0a9759461",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_money_snapshot_total",
+        table: "rebate_request_money_snapshots",
+        definition_md5: "a20c393354ef48deb7df03d34bf25cfd",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_money_snapshot_quota_per_unit",
+        table: "rebate_request_money_snapshots",
+        definition_md5: "becd77852fa8f38e4e18751295350f82",
+    },
+    CheckSpec {
+        name: "ck_rebate_request_money_snapshot_item_count",
+        table: "rebate_request_money_snapshots",
+        definition_md5: "3288868615be074cd1ed65354dcffa3f",
+    },
+    CheckSpec {
+        name: "ck_balance_operations_user_id_positive",
+        table: "balance_operations",
+        definition_md5: "b748a84ccc55d7a5fff8d98a421077a4",
+    },
+    CheckSpec {
+        name: "ck_balance_operation_outbox_attempt_count",
+        table: "balance_operation_outbox",
+        definition_md5: "1eccb251ce5d9eae5cc567adab24bd33",
+    },
+    CheckSpec {
+        name: "ck_rebate_reconciliation_case_state",
+        table: "rebate_reconciliation_cases",
+        definition_md5: "19e8df2ec6da3d22e8602127dd0d2e52",
+    },
+    CheckSpec {
+        name: "ck_rebate_sync_checkpoints_cursor_time",
+        table: "rebate_sync_checkpoints",
+        definition_md5: "0b23f6ead04280a8fb85419b3b51fa0d",
+    },
+    CheckSpec {
+        name: "ck_rebate_sync_checkpoints_cursor_id",
+        table: "rebate_sync_checkpoints",
+        definition_md5: "a4a3927b7f2d7f624e482d7389ed19c0",
+    },
+    CheckSpec {
+        name: "ck_rebate_sync_checkpoints_lookback",
+        table: "rebate_sync_checkpoints",
+        definition_md5: "5aaa4b5d4f864befacbd47826f47ded5",
+    },
+    CheckSpec {
+        name: "ck_rebate_background_jobs_state",
+        table: "rebate_background_jobs",
+        definition_md5: "ab468d08bc9cab14b20196f65c383832",
+    },
+    CheckSpec {
+        name: "ck_rebate_background_jobs_cursor_time",
+        table: "rebate_background_jobs",
+        definition_md5: "0b23f6ead04280a8fb85419b3b51fa0d",
+    },
+    CheckSpec {
+        name: "ck_rebate_background_jobs_cursor_id",
+        table: "rebate_background_jobs",
+        definition_md5: "a4a3927b7f2d7f624e482d7389ed19c0",
+    },
+    CheckSpec {
+        name: "ck_rebate_background_jobs_attempt_count",
+        table: "rebate_background_jobs",
+        definition_md5: "1eccb251ce5d9eae5cc567adab24bd33",
+    },
+];
+
+#[derive(Clone, Copy)]
+struct ForeignKeySpec {
+    name: &'static str,
+    table: &'static str,
+    columns: &'static [&'static str],
+    referenced_table: &'static str,
+    referenced_columns: &'static [&'static str],
+    delete_action: char,
+}
+
+const CRITICAL_FOREIGN_KEYS: &[ForeignKeySpec] = &[
+    ForeignKeySpec {
+        name: "fk_invitation_rebate_payouts_record",
+        table: "invitation_rebate_payouts",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_invitation_rebate_payouts_request",
+        table: "invitation_rebate_payouts",
+        columns: &["rebate_request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_invitation_rebate_payouts_original",
+        table: "invitation_rebate_payouts",
+        columns: &["original_payout_id"],
+        referenced_table: "invitation_rebate_payouts",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_invitation_rebate_payout_attempts_record",
+        table: "invitation_rebate_payout_attempts",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_request_items_request",
+        table: "rebate_request_items",
+        columns: &["request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_request_items_record",
+        table: "rebate_request_items",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_request_ownership_record",
+        table: "rebate_record_request_ownership",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_request_ownership_request",
+        table: "rebate_record_request_ownership",
+        columns: &["request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_record_settlements_record",
+        table: "rebate_record_settlements",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_record_settlements_request",
+        table: "rebate_record_settlements",
+        columns: &["rebate_request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_calculation_snapshot_record",
+        table: "rebate_calculation_snapshots",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_calculation_snapshot_rule",
+        table: "rebate_calculation_snapshots",
+        columns: &["rule_id"],
+        referenced_table: "rebate_rules",
+        referenced_columns: &["id"],
+        delete_action: 'n',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_request_money_snapshot_request",
+        table: "rebate_request_money_snapshots",
+        columns: &["rebate_request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_balance_operation_record",
+        table: "balance_operations",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_balance_operation_request",
+        table: "balance_operations",
+        columns: &["rebate_request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_balance_operation_original",
+        table: "balance_operations",
+        columns: &["original_operation_ulid"],
+        referenced_table: "balance_operations",
+        referenced_columns: &["operation_ulid"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_balance_operation_outbox_operation",
+        table: "balance_operation_outbox",
+        columns: &["operation_id"],
+        referenced_table: "balance_operations",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_balance_operation_event_operation",
+        table: "balance_operation_events",
+        columns: &["operation_id"],
+        referenced_table: "balance_operations",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_reconciliation_record",
+        table: "rebate_reconciliation_cases",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_reconciliation_request",
+        table: "rebate_reconciliation_cases",
+        columns: &["rebate_request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_reconciliation_operation",
+        table: "rebate_reconciliation_cases",
+        columns: &["operation_id"],
+        referenced_table: "balance_operations",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+];
+
+#[derive(Clone, Copy)]
+struct TriggerSpec {
+    name: &'static str,
+    table: &'static str,
+    trigger_type: i16,
+    update_columns: &'static [&'static str],
+    function: &'static str,
+    source_md5: &'static str,
+}
+
+const CRITICAL_TRIGGERS: &[TriggerSpec] = &[
+    TriggerSpec {
+        name: "trg_10_rebate_request_items",
+        table: "rebate_requests",
+        trigger_type: 21,
+        update_columns: &["rebate_record_ids"],
+        function: "sync_rebate_request_items",
+        source_md5: "089ea8416bd942fd30a6601fbaa19ae5",
+    },
+    TriggerSpec {
+        name: "trg_20_rebate_request_ownership",
+        table: "rebate_requests",
+        trigger_type: 21,
+        update_columns: &["rebate_record_ids", "rejected_at", "status"],
+        function: "sync_rebate_request_ownership",
+        source_md5: "bcd91b03acfec042be9d9c0359125730",
+    },
+    TriggerSpec {
+        name: "trg_rebate_request_item_snapshot_immutable",
+        table: "rebate_request_items",
+        trigger_type: 19,
+        update_columns: &["amount_quota_snapshot"],
+        function: "enforce_rebate_request_item_snapshot_immutable",
+        source_md5: "b61d225e11e9c37a3ef5c128d4ec9ba0",
+    },
+    TriggerSpec {
+        name: "trg_balance_operation_reversal_guard",
+        table: "balance_operations",
+        trigger_type: 23,
+        update_columns: &[
+            "delta_quota",
+            "operation_kind",
+            "original_operation_ulid",
+            "rebate_record_id",
+            "user_id",
+        ],
+        function: "validate_balance_operation_reversal",
+        source_md5: "199b2cb381b65e3e40434382804a1fb7",
+    },
+    TriggerSpec {
+        name: "trg_balance_operation_identity_immutable",
+        table: "balance_operations",
+        trigger_type: 19,
+        update_columns: &[
+            "business_operation_key",
+            "delta_quota",
+            "idempotency_key",
+            "operation_kind",
+            "operation_ulid",
+            "original_operation_ulid",
+            "payload_sha256",
+            "rebate_record_id",
+            "rebate_request_id",
+            "source",
+            "user_id",
+        ],
+        function: "enforce_balance_operation_financial_identity_immutable",
+        source_md5: "04cc209bd7a1f4ff4db6806e774eb556",
+    },
+    TriggerSpec {
+        name: "trg_rebate_record_settlement_insert",
+        table: "rebate_records",
+        trigger_type: 5,
+        update_columns: &[],
+        function: "ensure_rebate_record_settlement_coverage",
+        source_md5: "35876047af5dfc836ed7d8a2248f3ed2",
+    },
+    TriggerSpec {
+        name: "trg_rebate_record_settlement_delete_guard",
+        table: "rebate_record_settlements",
+        trigger_type: 11,
+        update_columns: &[],
+        function: "prevent_rebate_record_settlement_delete",
+        source_md5: "8792ac445cbce1e008f526e76adff255",
+    },
+    TriggerSpec {
+        name: "trg_rebate_record_settlement_identity_guard",
+        table: "rebate_record_settlements",
+        trigger_type: 19,
+        update_columns: &["rebate_record_id"],
+        function: "prevent_rebate_record_settlement_delete",
+        source_md5: "8792ac445cbce1e008f526e76adff255",
+    },
+    TriggerSpec {
+        name: "trg_rebate_record_settlement_truncate_guard",
+        table: "rebate_record_settlements",
+        trigger_type: 34,
+        update_columns: &[],
+        function: "prevent_rebate_record_settlement_delete",
+        source_md5: "8792ac445cbce1e008f526e76adff255",
+    },
+];
+
+const REQUIRED_NOT_NULL_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "invitation_rebate_payouts",
+        &[
+            "id",
+            "rebate_record_id",
+            "inviter_user_id",
+            "invitee_user_id",
+            "order_id",
+            "order_type",
+            "amount_cents",
+            "quota_delta",
+            "kind",
+            "status",
+            "request_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "rebate_request_items",
+        &[
+            "request_id",
+            "rebate_record_id",
+            "membership_state",
+            "amount_quota_snapshot",
+            "created_at",
+        ],
+    ),
+    (
+        "rebate_record_request_ownership",
+        &[
+            "id",
+            "rebate_record_id",
+            "request_id",
+            "ownership_state",
+            "acquired_at",
+        ],
+    ),
+    (
+        "rebate_record_settlements",
+        &[
+            "rebate_record_id",
+            "settlement_state",
+            "state_version",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "balance_operations",
+        &[
+            "id",
+            "operation_ulid",
+            "source",
+            "business_operation_key",
+            "operation_kind",
+            "rebate_record_id",
+            "user_id",
+            "delta_quota",
+            "idempotency_key",
+            "payload_sha256",
+            "operation_state",
+            "attempt_count",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "balance_operation_outbox",
+        &[
+            "id",
+            "operation_id",
+            "event_type",
+            "available_at",
+            "attempt_count",
+            "created_at",
+        ],
+    ),
+    (
+        "balance_operation_events",
+        &["id", "operation_id", "event_type", "occurred_at"],
+    ),
+    (
+        "rebate_reconciliation_cases",
+        &[
+            "id",
+            "issue_code",
+            "case_state",
+            "evidence_sha256",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+];
+
+static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
+    migrations: Cow::Owned(vec![
+        Migration::new(
+            202607110001,
+            Cow::Borrowed("legacy baseline"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110001_legacy_baseline.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202607110002,
+            Cow::Borrowed("request ownership and settlement state"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110002_request_ownership_and_settlement_state.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202607110003,
+            Cow::Borrowed("rule and money snapshots"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110003_rule_and_money_snapshots.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202607110004,
+            Cow::Borrowed("balance operation outbox"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110004_balance_operation_outbox.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202607110005,
+            Cow::Borrowed("sync checkpoints and jobs"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110005_sync_checkpoints_and_jobs.sql"
+            )),
+            false,
+        ),
+    ]),
+    ..Migrator::DEFAULT
+});
+
+#[derive(Debug, Error)]
+pub enum DatabaseStartupError {
+    #[error("failed to connect to invitations database: {0}")]
+    Connect(#[source] sqlx::Error),
+    #[error("invitations database preflight query failed: {0}")]
+    PreflightQuery(#[source] sqlx::Error),
+    #[error("invitations database preflight blocked migration with {blocking_issue_count} issue categories")]
+    PreflightBlocked {
+        blocking_issue_count: usize,
+        report: PreflightReport,
+    },
+    #[error("invitations database migration failed: {0}")]
+    Migration(#[source] MigrateError),
+    #[error("invitations database schema verification failed: {0}")]
+    Verification(String),
+}
+
+impl DatabaseStartupError {
+    pub fn preflight_report(&self) -> Option<&PreflightReport> {
+        match self {
+            Self::PreflightBlocked { report, .. } => Some(report),
+            _ => None,
+        }
+    }
+}
+
+pub async fn init_pool(
+    database_url: &str,
+    newapi_pool: &PgPool,
+) -> Result<PgPool, DatabaseStartupError> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(database_url)
         .await
-        .expect("failed to connect to database");
+        .map_err(DatabaseStartupError::Connect)?;
 
     tracing::info!("Invitations database pool connected");
-    migrate(&pool).await;
-    pool
+    prepare_database(&pool, newapi_pool).await?;
+    Ok(pool)
 }
 
-pub async fn init_readonly_pool(database_url: &str) -> PgPool {
+pub async fn init_readonly_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .after_connect(|conn, _meta| {
@@ -34,425 +1133,1750 @@ pub async fn init_readonly_pool(database_url: &str) -> PgPool {
             })
         })
         .connect(database_url)
-        .await
-        .expect("failed to connect to new-api database");
+        .await?;
 
     tracing::info!("new-api readonly database pool connected");
-    pool
+    Ok(pool)
 }
 
-pub async fn init_external_pool(database_url: &str) -> PgPool {
+pub async fn preflight_database(
+    database_url: &str,
+    newapi_database_url: &str,
+) -> Result<PreflightReport, sqlx::Error> {
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(2)
         .connect(database_url)
-        .await
-        .expect("failed to connect to external database");
-
-    tracing::info!("external writable database pool connected");
-    pool
+        .await?;
+    let newapi_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|connection, _meta| {
+            Box::pin(async move {
+                connection.execute(READONLY_CONNECTION_SETUP_SQL).await?;
+                Ok(())
+            })
+        })
+        .connect(newapi_database_url)
+        .await?;
+    let mut connection = pool.acquire().await?;
+    let mut external_connection = newapi_pool.acquire().await?;
+    let report = preflight::run(
+        &mut connection,
+        &mut external_connection,
+        PreflightMode::ReportOnly,
+    )
+    .await;
+    drop(connection);
+    drop(external_connection);
+    pool.close().await;
+    newapi_pool.close().await;
+    report
 }
 
-async fn migrate(pool: &PgPool) {
-    tracing::info!("Starting invitations database migration");
-
-    // 返利规则表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS rebate_rules (
-            id BIGSERIAL PRIMARY KEY,
-            user_group VARCHAR(64) NOT NULL,
-            rule_type VARCHAR(20) NOT NULL,
-            rebate_rate DECIMAL(5,4) NOT NULL,
-            effective_time BIGINT NOT NULL,
-            created_at BIGINT NOT NULL,
-            updated_at BIGINT NOT NULL,
-            UNIQUE(user_group, rule_type)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create rebate_rules table");
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_rules_group ON rebate_rules(user_group)")
-        .execute(pool)
+async fn prepare_database(pool: &PgPool, newapi_pool: &PgPool) -> Result<(), DatabaseStartupError> {
+    tracing::info!("Running invitations database preflight");
+    let mut connection = pool
+        .acquire()
         .await
-        .ok();
-
-    // 返利记录表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS rebate_records (
-            id BIGSERIAL PRIMARY KEY,
-            ulid VARCHAR(26),
-            inviter_id BIGINT NOT NULL,
-            invitee_id BIGINT NOT NULL,
-            user_group VARCHAR(64) NOT NULL,
-            order_type VARCHAR(20) NOT NULL,
-            order_id BIGINT NOT NULL,
-            order_amount DECIMAL(10,2) NOT NULL,
-            order_time BIGINT NOT NULL,
-            rebate_effective_at BIGINT NOT NULL,
-            rebate_amount BIGINT NOT NULL DEFAULT 0,
-            rebate_rate DECIMAL(5,4),
-            status VARCHAR(20) NOT NULL,
-            scan_started_at BIGINT NOT NULL,
-            initialization_ends_at BIGINT NOT NULL,
-            finalized_at BIGINT,
-            admin_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
-            closed_at BIGINT,
-            unlock_required BOOLEAN NOT NULL DEFAULT FALSE,
-            unlocked_at BIGINT,
-            created_at BIGINT NOT NULL,
-            updated_at BIGINT NOT NULL,
-            UNIQUE(order_type, order_id)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create rebate_records table");
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_ulid ON rebate_records(ulid)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_rebate_records_inviter ON rebate_records(inviter_id)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_records_status ON rebate_records(status)")
-        .execute(pool)
+        .map_err(DatabaseStartupError::Connect)?;
+    let mut external_connection = newapi_pool
+        .acquire()
         .await
-        .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_rebate_records_initialization ON rebate_records(status, initialization_ends_at)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_rebate_records_effective ON rebate_records(inviter_id, status, rebate_effective_at)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    // 添加复合索引以优化常见查询
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_records_inviter_status ON rebate_records(inviter_id, status)")
-        .execute(pool)
+        .map_err(DatabaseStartupError::Connect)?;
+    let mut transaction = connection
+        .begin()
         .await
-        .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_rebate_records_signup_unlock ON rebate_records(order_type, unlock_required, unlocked_at, invitee_id)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    // 邀请注册关系表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS invitation_registrations (
-            id BIGSERIAL PRIMARY KEY,
-            inviter_id BIGINT NOT NULL,
-            invitee_id BIGINT NOT NULL UNIQUE,
-            user_group VARCHAR(64) NOT NULL,
-            invited_at BIGINT NOT NULL,
-            created_at BIGINT NOT NULL,
-            updated_at BIGINT NOT NULL
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create invitation_registrations table");
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_invitation_registrations_inviter ON invitation_registrations(inviter_id)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_invitation_registrations_invited_at ON invitation_registrations(invited_at DESC, id DESC)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    // 返利申请表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS rebate_requests (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            rebate_record_ids BIGINT[] NOT NULL,
-            total_amount BIGINT NOT NULL,
-            status VARCHAR(20) NOT NULL,
-            admin_id BIGINT,
-            admin_note TEXT,
-            created_at BIGINT NOT NULL,
-            updated_at BIGINT NOT NULL,
-            approved_at BIGINT,
-            rejected_at BIGINT,
-            completed_at BIGINT
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create rebate_requests table");
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_requests_user ON rebate_requests(user_id)")
-        .execute(pool)
+        .map_err(DatabaseStartupError::Connect)?;
+    let mut external_transaction = external_connection
+        .begin()
         .await
-        .ok();
+        .map_err(DatabaseStartupError::Connect)?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rebate_requests_status ON rebate_requests(status)")
-        .execute(pool)
+    // Maintenance locks make every later READ COMMITTED statement observe all writers
+    // that completed before the lock was granted, without pinning a stale snapshot.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *transaction)
         .await
-        .ok();
-
-    // 返利余额发放流水表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS invitation_rebate_payouts (
-            id BIGSERIAL PRIMARY KEY,
-            rebate_record_id BIGINT NOT NULL,
-            rebate_request_id BIGINT,
-            inviter_user_id BIGINT NOT NULL,
-            invitee_user_id BIGINT NOT NULL,
-            order_id BIGINT NOT NULL,
-            order_type VARCHAR(64) NOT NULL,
-            amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
-            quota_delta BIGINT NOT NULL CHECK (quota_delta <> 0),
-            kind VARCHAR(32) NOT NULL CHECK (kind IN ('payout', 'reversal')),
-            status VARCHAR(32) NOT NULL CHECK (status IN ('pending', 'newapi_applied', 'completed', 'reversed', 'failed', 'reversal_pending')),
-            request_id VARCHAR(128) NOT NULL,
-            admin_user_id BIGINT,
-            admin_username TEXT,
-            newapi_mark_id BIGINT,
-            newapi_log_id BIGINT,
-            original_payout_id BIGINT REFERENCES invitation_rebate_payouts(id),
-            error_message TEXT,
-            created_at BIGINT NOT NULL,
-            updated_at BIGINT NOT NULL,
-            completed_at BIGINT,
-            reversed_at BIGINT
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create invitation_rebate_payouts table");
-
-    sqlx::query(
-        r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_invitation_rebate_payouts_record_pay
-        ON invitation_rebate_payouts(rebate_record_id)
-        WHERE kind = 'payout'
-        "#,
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_invitation_rebate_payouts_original_reverse
-        ON invitation_rebate_payouts(original_payout_id)
-        WHERE kind = 'reversal'
-        "#,
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_invitation_rebate_payouts_status ON invitation_rebate_payouts(status, updated_at)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS invitation_rebate_payout_attempts (
-            id BIGSERIAL PRIMARY KEY,
-            rebate_record_id BIGINT,
-            action VARCHAR(32) NOT NULL,
-            request_id VARCHAR(128) NOT NULL,
-            admin_user_id BIGINT,
-            admin_username TEXT,
-            status VARCHAR(64) NOT NULL,
-            http_status INTEGER NOT NULL,
-            error_message TEXT,
-            created_at BIGINT NOT NULL,
-            completed_at BIGINT
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create invitation_rebate_payout_attempts table");
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_invitation_rebate_payout_attempts_record ON invitation_rebate_payout_attempts(rebate_record_id, created_at DESC)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    // 同步日志表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sync_log (
-            id BIGSERIAL PRIMARY KEY,
-            sync_type VARCHAR(64) NOT NULL,
-            last_sync_id BIGINT NOT NULL,
-            last_sync_time BIGINT NOT NULL,
-            created_at BIGINT NOT NULL
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create sync_log table");
-
-    sqlx::query("ALTER TABLE sync_log ALTER COLUMN sync_type TYPE VARCHAR(64)")
-        .execute(pool)
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *external_transaction)
         .await
-        .ok();
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    sqlx::query("SET LOCAL lock_timeout = '15s'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *external_transaction)
+        .await
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(1263358281, 20260711)")
+        .execute(&mut *transaction)
+        .await
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+    lock_maintenance_tables(&mut transaction).await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_sync_log_type_id ON sync_log(sync_type, last_sync_id)",
+    let report = preflight::run(
+        &mut transaction,
+        &mut external_transaction,
+        PreflightMode::MaintenanceLocked,
     )
-    .execute(pool)
     .await
-    .ok();
+    .map_err(DatabaseStartupError::PreflightQuery)?;
 
-    // 系统配置表
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS system_config (
-            key VARCHAR(64) PRIMARY KEY,
-            value TEXT NOT NULL,
-            description TEXT,
-            updated_at BIGINT NOT NULL
-        )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create system_config table");
+    for issue in &report.issues {
+        tracing::warn!(
+            issue_code = issue.code,
+            severity = ?issue.severity,
+            count = issue.count,
+            "Invitations database preflight finding"
+        );
+    }
 
-    // 插入默认配置
-    sqlx::query(
-        r#"
-        INSERT INTO system_config (key, value, description, updated_at)
-        VALUES
-            ('min_rebate_request_amount', '1000000', '最低返利申请金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ('rebate_request_frequency_days', '7', '返利申请频率限制（天数）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($1, 'true', '用户侧邀请返利界面开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($2, 'true', '订单返利开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($3, 'false', '邀请注册奖励开关', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($4, '1000000', '邀请注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($5, '1000000', '邀请人注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($6, '1000000', '被邀请人注册奖励金额（new-api 额度单位）', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($7, 'true', '邀请注册奖励是否需要审核', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($8, 'false', '邀请人注册奖励是否等待被邀请人首次充值/订阅', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($9, 'false', '被邀请人注册奖励是否等待首次充值/订阅', EXTRACT(EPOCH FROM NOW())::BIGINT),
-            ($10, 'true', '返利到余额开关', EXTRACT(EPOCH FROM NOW())::BIGINT)
-        ON CONFLICT (key) DO NOTHING
-        "#,
-    )
-    .bind(USER_INVITATION_REBATE_ENABLED_KEY)
-    .bind(ORDER_REBATE_ENABLED_KEY)
-    .bind(INVITATION_SIGNUP_REWARD_ENABLED_KEY)
-    .bind(INVITATION_SIGNUP_REWARD_AMOUNT_KEY)
-    .bind(INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY)
-    .bind(INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY)
-    .bind(INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY)
-    .bind(INVITATION_SIGNUP_INVITER_REWARD_REQUIRES_PAID_ORDER_KEY)
-    .bind(INVITATION_SIGNUP_INVITEE_REWARD_REQUIRES_PAID_ORDER_KEY)
-    .bind(REBATE_TO_BALANCE_ENABLED_KEY)
-    .execute(pool)
-    .await
-    .ok();
+    if !report.safe_to_migrate {
+        return Err(DatabaseStartupError::PreflightBlocked {
+            blocking_issue_count: report.blocking_issue_count(),
+            report,
+        });
+    }
 
-    tracing::info!("Invitations database migration completed");
+    tracing::info!("Applying versioned invitations database migrations");
+    MIGRATOR
+        .run(&mut *transaction)
+        .await
+        .map_err(DatabaseStartupError::Migration)?;
+    verify_schema(&mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(DatabaseStartupError::Connect)?;
+    external_transaction
+        .commit()
+        .await
+        .map_err(DatabaseStartupError::Connect)?;
+    tracing::info!(
+        schema_version = EXPECTED_MIGRATIONS[4],
+        "Invitations database is ready"
+    );
+    Ok(())
 }
 
-pub async fn migrate_newapi_payout_tables(pool: &PgPool) {
-    tracing::info!("Starting new-api payout database migration");
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS kkai_invitation_rebate_balance_marks (
-            id BIGSERIAL PRIMARY KEY,
-            kind VARCHAR(32) NOT NULL CHECK (kind IN ('payout', 'reversal')),
-            rebate_record_id BIGINT NOT NULL,
-            payout_id BIGINT NOT NULL,
-            original_payout_id BIGINT,
-            user_id BIGINT NOT NULL,
-            quota_delta BIGINT NOT NULL CHECK (quota_delta <> 0),
-            amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
-            log_id BIGINT,
-            request_id VARCHAR(128) NOT NULL,
-            created_at BIGINT NOT NULL
+async fn lock_maintenance_tables(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), DatabaseStartupError> {
+    const TABLES: &[&str] = &[
+        "balance_operation_events",
+        "_sqlx_migrations",
+        "balance_operation_outbox",
+        "balance_operations",
+        "invitation_rebate_payout_attempts",
+        "invitation_rebate_payouts",
+        "invitation_registrations",
+        "rebate_background_jobs",
+        "rebate_calculation_snapshots",
+        "rebate_record_request_ownership",
+        "rebate_record_settlements",
+        "rebate_records",
+        "rebate_reconciliation_cases",
+        "rebate_request_items",
+        "rebate_request_money_snapshots",
+        "rebate_requests",
+        "rebate_rules",
+        "rebate_sync_checkpoints",
+        "sync_log",
+        "system_config",
+        "withdrawal_requests",
+    ];
+    for table in TABLES {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass(format('%I.%I', current_schema(), $1)) IS NOT NULL",
         )
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("failed to create kkai_invitation_rebate_balance_marks table");
+        .bind(table)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DatabaseStartupError::PreflightQuery)?;
+        if exists {
+            let statement = format!("LOCK TABLE \"{table}\" IN SHARE ROW EXCLUSIVE MODE");
+            sqlx::query(&statement)
+                .execute(&mut **transaction)
+                .await
+                .map_err(DatabaseStartupError::PreflightQuery)?;
+        }
+    }
+    Ok(())
+}
 
-    sqlx::query(
+async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStartupError> {
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+    let missing_migrations: Vec<i64> = EXPECTED_MIGRATIONS
+        .into_iter()
+        .filter(|version| !applied.contains(version))
+        .collect();
+    if !missing_migrations.is_empty() {
+        return Err(DatabaseStartupError::Verification(format!(
+            "missing migration versions: {missing_migrations:?}"
+        )));
+    }
+
+    let required_tables = [
+        "rebate_request_items",
+        "rebate_record_request_ownership",
+        "rebate_record_settlements",
+        "rebate_calculation_snapshots",
+        "rebate_request_money_snapshots",
+        "balance_operations",
+        "balance_operation_outbox",
+        "balance_operation_events",
+        "rebate_reconciliation_cases",
+        "rebate_sync_checkpoints",
+        "rebate_background_jobs",
+    ];
+    for table in required_tables {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass(format('%I.%I', current_schema(), $1)) IS NOT NULL",
+        )
+        .bind(table)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        if !exists {
+            return Err(DatabaseStartupError::Verification(format!(
+                "required table is missing: {table}"
+            )));
+        }
+    }
+
+    for expected in CRITICAL_INDEXES {
+        let row = sqlx::query(
+            r#"
+            SELECT table_class.relname AS table_name,
+                   pg_index.indisvalid AS is_valid,
+                   pg_index.indisunique AS is_unique,
+                   pg_get_expr(pg_index.indpred, pg_index.indrelid) AS predicate,
+                   ARRAY(
+                       SELECT attribute.attname::TEXT
+                       FROM unnest(pg_index.indkey::SMALLINT[])
+                            WITH ORDINALITY AS key(attnum, position)
+                       JOIN pg_attribute attribute
+                         ON attribute.attrelid = pg_index.indrelid
+                        AND attribute.attnum = key.attnum
+                       WHERE key.position <= pg_index.indnkeyatts
+                       ORDER BY key.position
+                   )::TEXT[] AS columns
+            FROM pg_class index_class
+            JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+            JOIN pg_index ON pg_index.indexrelid = index_class.oid
+            JOIN pg_class table_class ON table_class.oid = pg_index.indrelid
+            WHERE namespace.nspname = current_schema() AND index_class.relname = $1
+            "#,
+        )
+        .bind(expected.name)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?
+        .ok_or_else(|| {
+            DatabaseStartupError::Verification(format!(
+                "critical index is missing: {}",
+                expected.name
+            ))
+        })?;
+        let table_name: String = row
+            .try_get("table_name")
+            .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        let is_valid: bool = row
+            .try_get("is_valid")
+            .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        let is_unique: bool = row
+            .try_get("is_unique")
+            .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        let columns: Vec<String> = row
+            .try_get("columns")
+            .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        let predicate: Option<String> = row
+            .try_get("predicate")
+            .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?;
+        let expected_columns: Vec<String> = expected
+            .columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect();
+        if !is_valid
+            || is_unique != expected.unique
+            || table_name != expected.table
+            || columns != expected_columns
+            || predicate.as_deref().map(normalize_catalog_expression)
+                != expected.predicate.map(normalize_catalog_expression)
+        {
+            return Err(DatabaseStartupError::Verification(format!(
+                "critical index definition drifted: {}",
+                expected.name
+            )));
+        }
+    }
+
+    for expected in CRITICAL_KEY_CONSTRAINTS {
+        verify_key_constraint(connection, *expected).await?;
+    }
+
+    for expected in CRITICAL_CHECKS {
+        let row = sqlx::query(
+            r#"
+            SELECT table_class.relname AS table_name,
+                   pg_constraint.contype::TEXT AS constraint_type,
+                   pg_constraint.convalidated AS is_valid,
+                   md5(pg_get_constraintdef(pg_constraint.oid, TRUE)) AS definition_md5
+            FROM pg_constraint
+            JOIN pg_namespace namespace ON namespace.oid = pg_constraint.connamespace
+            JOIN pg_class table_class ON table_class.oid = pg_constraint.conrelid
+            WHERE namespace.nspname = current_schema() AND pg_constraint.conname = $1
+            "#,
+        )
+        .bind(expected.name)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| DatabaseStartupError::Verification(error.to_string()))?
+        .ok_or_else(|| {
+            DatabaseStartupError::Verification(format!(
+                "critical check is missing: {}",
+                expected.name
+            ))
+        })?;
+        let table_name: String = row.try_get("table_name").map_err(verification_error)?;
+        let constraint_type: String = row.try_get("constraint_type").map_err(verification_error)?;
+        let is_valid: bool = row.try_get("is_valid").map_err(verification_error)?;
+        let definition_md5: String = row.try_get("definition_md5").map_err(verification_error)?;
+        if table_name != expected.table
+            || constraint_type != "c"
+            || !is_valid
+            || definition_md5 != expected.definition_md5
+        {
+            return Err(DatabaseStartupError::Verification(format!(
+                "critical check definition drifted: {} (actual md5 {definition_md5})",
+                expected.name
+            )));
+        }
+    }
+
+    for expected in CRITICAL_FOREIGN_KEYS {
+        verify_foreign_key(connection, *expected).await?;
+    }
+    for (table, columns) in REQUIRED_NOT_NULL_COLUMNS {
+        for column in *columns {
+            let is_not_null: Option<bool> = sqlx::query_scalar(
+                r#"
+                SELECT attribute.attnotnull
+                FROM pg_attribute attribute
+                JOIN pg_class table_class ON table_class.oid = attribute.attrelid
+                JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_class.relname = $1 AND attribute.attname = $2
+                  AND NOT attribute.attisdropped
+                "#,
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(verification_error)?;
+            if is_not_null != Some(true) {
+                return Err(DatabaseStartupError::Verification(format!(
+                    "required NOT NULL column drifted: {table}.{column}"
+                )));
+            }
+        }
+    }
+    for expected in CRITICAL_TRIGGERS {
+        verify_trigger(connection, *expected).await?;
+    }
+
+    let missing_settlement_coverage: Option<i64> = sqlx::query_scalar(
         r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_record_pay
-        ON kkai_invitation_rebate_balance_marks(rebate_record_id)
-        WHERE kind = 'payout'
+        SELECT record.id
+        FROM rebate_records record
+        LEFT JOIN rebate_record_settlements settlement
+          ON settlement.rebate_record_id = record.id
+        WHERE settlement.rebate_record_id IS NULL
+        ORDER BY record.id
+        LIMIT 1
         "#,
     )
-    .execute(pool)
+    .fetch_optional(&mut *connection)
     .await
-    .ok();
+    .map_err(verification_error)?;
+    if let Some(record_id) = missing_settlement_coverage {
+        return Err(DatabaseStartupError::Verification(format!(
+            "normalized settlement coverage is missing for rebate record {record_id}"
+        )));
+    }
 
-    sqlx::query(
+    Ok(())
+}
+
+async fn verify_key_constraint(
+    connection: &mut PgConnection,
+    expected: KeyConstraintSpec,
+) -> Result<(), DatabaseStartupError> {
+    let row = sqlx::query(
         r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_original_reverse
-        ON kkai_invitation_rebate_balance_marks(original_payout_id)
-        WHERE kind = 'reversal'
+        SELECT table_class.relname AS table_name,
+               constraint_meta.contype::TEXT AS constraint_type,
+               constraint_meta.convalidated AS is_valid,
+               ARRAY(
+                   SELECT attribute.attname::TEXT
+                   FROM unnest(constraint_meta.conkey) WITH ORDINALITY AS key(attnum, position)
+                   JOIN pg_attribute attribute
+                     ON attribute.attrelid = constraint_meta.conrelid
+                    AND attribute.attnum = key.attnum
+                   ORDER BY key.position
+               )::TEXT[] AS columns
+        FROM pg_constraint constraint_meta
+        JOIN pg_class table_class ON table_class.oid = constraint_meta.conrelid
+        JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+        WHERE namespace.nspname = current_schema() AND constraint_meta.conname = $1
         "#,
     )
-    .execute(pool)
+    .bind(expected.name)
+    .fetch_optional(&mut *connection)
     .await
-    .ok();
+    .map_err(verification_error)?
+    .ok_or_else(|| {
+        DatabaseStartupError::Verification(format!(
+            "critical constraint is missing: {}",
+            expected.name
+        ))
+    })?;
+    let table_name: String = row.try_get("table_name").map_err(verification_error)?;
+    let constraint_type: String = row.try_get("constraint_type").map_err(verification_error)?;
+    let is_valid: bool = row.try_get("is_valid").map_err(verification_error)?;
+    let columns: Vec<String> = row.try_get("columns").map_err(verification_error)?;
+    let expected_columns: Vec<String> = expected
+        .columns
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect();
+    if table_name != expected.table
+        || constraint_type != expected.constraint_type.to_string()
+        || !is_valid
+        || columns != expected_columns
+    {
+        return Err(DatabaseStartupError::Verification(format!(
+            "critical constraint definition drifted: {}",
+            expected.name
+        )));
+    }
+    Ok(())
+}
 
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_kkai_invitation_rebate_balance_marks_request ON kkai_invitation_rebate_balance_marks(request_id)",
+async fn verify_foreign_key(
+    connection: &mut PgConnection,
+    expected: ForeignKeySpec,
+) -> Result<(), DatabaseStartupError> {
+    let row = sqlx::query(
+        r#"
+        SELECT source_table.relname AS table_name,
+               referenced_table.relname AS referenced_table_name,
+               constraint_meta.convalidated AS is_valid,
+               constraint_meta.confdeltype::TEXT AS delete_action,
+               ARRAY(
+                   SELECT attribute.attname::TEXT
+                   FROM unnest(constraint_meta.conkey) WITH ORDINALITY AS key(attnum, position)
+                   JOIN pg_attribute attribute
+                     ON attribute.attrelid = constraint_meta.conrelid
+                    AND attribute.attnum = key.attnum
+                   ORDER BY key.position
+               )::TEXT[] AS columns,
+               ARRAY(
+                   SELECT attribute.attname::TEXT
+                   FROM unnest(constraint_meta.confkey) WITH ORDINALITY AS key(attnum, position)
+                   JOIN pg_attribute attribute
+                     ON attribute.attrelid = constraint_meta.confrelid
+                    AND attribute.attnum = key.attnum
+                   ORDER BY key.position
+               )::TEXT[] AS referenced_columns
+        FROM pg_constraint constraint_meta
+        JOIN pg_namespace namespace ON namespace.oid = constraint_meta.connamespace
+        JOIN pg_class source_table ON source_table.oid = constraint_meta.conrelid
+        JOIN pg_class referenced_table ON referenced_table.oid = constraint_meta.confrelid
+        WHERE namespace.nspname = current_schema()
+          AND constraint_meta.conname = $1 AND constraint_meta.contype = 'f'
+        "#,
     )
-    .execute(pool)
+    .bind(expected.name)
+    .fetch_optional(&mut *connection)
     .await
-    .ok();
+    .map_err(verification_error)?
+    .ok_or_else(|| {
+        DatabaseStartupError::Verification(format!(
+            "critical foreign key is missing: {}",
+            expected.name
+        ))
+    })?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_kkai_invitation_rebate_balance_marks_user ON kkai_invitation_rebate_balance_marks(user_id, created_at DESC)",
+    let table_name: String = row.try_get("table_name").map_err(verification_error)?;
+    let referenced_table: String = row
+        .try_get("referenced_table_name")
+        .map_err(verification_error)?;
+    let is_valid: bool = row.try_get("is_valid").map_err(verification_error)?;
+    let delete_action: String = row.try_get("delete_action").map_err(verification_error)?;
+    let columns: Vec<String> = row.try_get("columns").map_err(verification_error)?;
+    let referenced_columns: Vec<String> = row
+        .try_get("referenced_columns")
+        .map_err(verification_error)?;
+    let expected_columns: Vec<String> = expected
+        .columns
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    let expected_referenced_columns: Vec<String> = expected
+        .referenced_columns
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if table_name != expected.table
+        || referenced_table != expected.referenced_table
+        || !is_valid
+        || delete_action != expected.delete_action.to_string()
+        || columns != expected_columns
+        || referenced_columns != expected_referenced_columns
+    {
+        return Err(DatabaseStartupError::Verification(format!(
+            "critical foreign key definition drifted: {}",
+            expected.name
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_trigger(
+    connection: &mut PgConnection,
+    expected: TriggerSpec,
+) -> Result<(), DatabaseStartupError> {
+    let row = sqlx::query(
+        r#"
+        SELECT table_class.relname AS table_name,
+               trigger_meta.tgenabled::TEXT AS enabled,
+               trigger_meta.tgtype::SMALLINT AS trigger_type,
+               function_meta.proname AS function_name,
+               md5(function_meta.prosrc) AS source_md5,
+               ARRAY(
+                   SELECT attribute.attname::TEXT
+                   FROM unnest(trigger_meta.tgattr::SMALLINT[]) AS key(attnum)
+                   JOIN pg_attribute attribute
+                     ON attribute.attrelid = trigger_meta.tgrelid
+                    AND attribute.attnum = key.attnum
+                   ORDER BY attribute.attname
+               )::TEXT[] AS update_columns
+        FROM pg_trigger trigger_meta
+        JOIN pg_class table_class ON table_class.oid = trigger_meta.tgrelid
+        JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+        JOIN pg_proc function_meta ON function_meta.oid = trigger_meta.tgfoid
+        WHERE namespace.nspname = current_schema()
+          AND trigger_meta.tgname = $1 AND NOT trigger_meta.tgisinternal
+        "#,
     )
-    .execute(pool)
+    .bind(expected.name)
+    .fetch_optional(&mut *connection)
     .await
-    .ok();
+    .map_err(verification_error)?
+    .ok_or_else(|| {
+        DatabaseStartupError::Verification(format!(
+            "critical trigger is missing: {}",
+            expected.name
+        ))
+    })?;
+    let table_name: String = row.try_get("table_name").map_err(verification_error)?;
+    let enabled: String = row.try_get("enabled").map_err(verification_error)?;
+    let trigger_type: i16 = row.try_get("trigger_type").map_err(verification_error)?;
+    let function_name: String = row.try_get("function_name").map_err(verification_error)?;
+    let source_md5: String = row.try_get("source_md5").map_err(verification_error)?;
+    let update_columns: Vec<String> = row.try_get("update_columns").map_err(verification_error)?;
+    let expected_columns: Vec<String> = expected
+        .update_columns
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if table_name != expected.table
+        || enabled != "O"
+        || trigger_type != expected.trigger_type
+        || function_name != expected.function
+        || update_columns != expected_columns
+        || source_md5 != expected.source_md5
+    {
+        return Err(DatabaseStartupError::Verification(format!(
+            "critical trigger definition drifted: {} (actual source md5 {source_md5})",
+            expected.name
+        )));
+    }
+    Ok(())
+}
 
-    tracing::info!("new-api payout database migration completed");
+fn normalize_catalog_expression(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .replace("::character varying", "")
+        .replace("::varchar", "")
+        .replace("::text[]", "")
+        .replace("::text", "")
+        .replace("array[", "[")
+        .replace([' ', '\n', '\t', '(', ')', '"'], "")
+}
+
+fn verification_error(error: sqlx::Error) -> DatabaseStartupError {
+    DatabaseStartupError::Verification(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::env;
+    use std::time::Duration;
+
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::Executor;
+
+    use super::*;
+
+    const LATEST_LEGACY_FIXTURE: &str = include_str!("../tests/fixtures/latest_legacy.sql");
+    const NEWAPI_MARK_FIXTURE: &str = include_str!("../tests/fixtures/newapi_balance_marks.sql");
+
+    struct TestDatabase {
+        admin_pool: PgPool,
+        pool: PgPool,
+        external_pool: PgPool,
+        schema: String,
+        external_schema: String,
+    }
+
+    impl TestDatabase {
+        async fn create() -> Self {
+            let database_url = env::var("TEST_DATABASE_URL")
+                .expect("ignored migration tests require TEST_DATABASE_URL");
+            let admin_pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .expect("connect TEST_DATABASE_URL");
+            let schema = format!(
+                "invitations_test_{}",
+                ulid::Ulid::new().to_string().to_lowercase()
+            );
+            let external_schema = format!(
+                "newapi_test_{}",
+                ulid::Ulid::new().to_string().to_lowercase()
+            );
+            admin_pool
+                .execute(format!("CREATE SCHEMA {schema}").as_str())
+                .await
+                .expect("create test schema");
+            admin_pool
+                .execute(format!("CREATE SCHEMA {external_schema}").as_str())
+                .await
+                .expect("create external test schema");
+
+            let search_path = schema.clone();
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .after_connect(move |connection, _| {
+                    let statement = format!("SET search_path TO {search_path}");
+                    Box::pin(async move {
+                        connection.execute(statement.as_str()).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url)
+                .await
+                .expect("connect isolated test schema");
+            let external_search_path = external_schema.clone();
+            let external_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .after_connect(move |connection, _| {
+                    let statement = format!("SET search_path TO {external_search_path}");
+                    Box::pin(async move {
+                        connection.execute(statement.as_str()).await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url)
+                .await
+                .expect("connect isolated external test schema");
+            Self {
+                admin_pool,
+                pool,
+                external_pool,
+                schema,
+                external_schema,
+            }
+        }
+
+        async fn preflight(&self) -> Result<PreflightReport, sqlx::Error> {
+            let mut connection = self.pool.acquire().await?;
+            let mut external_connection = self.external_pool.acquire().await?;
+            preflight::run(
+                &mut connection,
+                &mut external_connection,
+                PreflightMode::ReportOnly,
+            )
+            .await
+        }
+
+        async fn prepare(&self) -> Result<(), DatabaseStartupError> {
+            prepare_database(&self.pool, &self.external_pool).await
+        }
+
+        async fn verify(&self) -> Result<(), DatabaseStartupError> {
+            let mut connection = self.pool.acquire().await.unwrap();
+            verify_schema(&mut connection).await
+        }
+
+        async fn create_external_mark_table(&self) {
+            sqlx::raw_sql(NEWAPI_MARK_FIXTURE)
+                .execute(&self.external_pool)
+                .await
+                .unwrap();
+        }
+
+        async fn cleanup(self) {
+            self.pool.close().await;
+            self.external_pool.close().await;
+            self.admin_pool
+                .execute(format!("DROP SCHEMA {} CASCADE", self.schema).as_str())
+                .await
+                .expect("drop test schema");
+            self.admin_pool
+                .execute(format!("DROP SCHEMA {} CASCADE", self.external_schema).as_str())
+                .await
+                .expect("drop external test schema");
+            self.admin_pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn empty_database_migrates_and_reruns_idempotently() {
+        let database = TestDatabase::create().await;
+        let report = database.preflight().await.unwrap();
+        assert!(report.safe_to_migrate);
+
+        database.prepare().await.unwrap();
+        database.prepare().await.unwrap();
+        database.verify().await.unwrap();
+
+        let migration_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = TRUE")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(migration_count, 5);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn latest_legacy_fixture_is_adopted_without_data_loss() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(database.preflight().await.unwrap().safe_to_migrate);
+
+        database.prepare().await.unwrap();
+
+        let item: (i64, i64) = sqlx::query_as(
+            "SELECT request_id, rebate_record_id FROM rebate_request_items WHERE request_id = 201",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(item, (201, 101));
+        let settlement_state: String = sqlx::query_scalar(
+            "SELECT settlement_state FROM rebate_record_settlements WHERE rebate_record_id = 101",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(settlement_state, "unsettled");
+        let checkpoint: (i64, i64) = sqlx::query_as(
+            "SELECT cursor_time, cursor_id FROM rebate_sync_checkpoints WHERE sync_type = 'topup'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(checkpoint, (1_700_000_001, 501));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn status_changes_preserve_snapshots_and_audit_rows_restrict_deletion() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+
+        let missing = sqlx::query(
+            "UPDATE rebate_requests SET rebate_record_ids = ARRAY[999]::BIGINT[] WHERE id = 201",
+        )
+        .execute(&database.pool)
+        .await;
+        assert!(missing.is_err());
+
+        sqlx::query("UPDATE rebate_requests SET status = 'rejected', rejected_at = 1700000002 WHERE id = 201")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE rebate_records SET rebate_amount = 6000000 WHERE id = 101")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE rebate_requests SET status = 'pending', rejected_at = NULL WHERE id = 201",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let snapshot: i64 = sqlx::query_scalar(
+            "SELECT amount_quota_snapshot FROM rebate_request_items WHERE request_id = 201 AND rebate_record_id = 101",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot, 5_000_000);
+        assert!(sqlx::query(
+            "UPDATE rebate_request_items SET amount_quota_snapshot = 6000000 WHERE request_id = 201 AND rebate_record_id = 101",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err());
+        let ownership_state: String = sqlx::query_scalar(
+            "SELECT ownership_state FROM rebate_record_request_ownership WHERE request_id = 201 AND rebate_record_id = 101",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(ownership_state, "active");
+        assert!(sqlx::query("DELETE FROM rebate_records WHERE id = 101")
+            .execute(&database.pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("DELETE FROM rebate_requests WHERE id = 201")
+            .execute(&database.pool)
+            .await
+            .is_err());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn duplicate_active_ownership_blocks_before_migration() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_requests (
+                id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at
+            ) VALUES (202, 11, ARRAY[101]::BIGINT[], 5000000, 'pending', 1700000001, 1700000001)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.safe_to_migrate);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "duplicate_active_record_ownership"));
+        assert!(matches!(
+            database.prepare().await,
+            Err(DatabaseStartupError::PreflightBlocked { .. })
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn missing_request_record_blocks_before_migration() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE rebate_requests SET rebate_record_ids = ARRAY[999]::BIGINT[] WHERE id = 201",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.safe_to_migrate);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "request_references_missing_record"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn payout_and_completion_ambiguities_are_reported_without_correction() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE rebate_records SET status = 'completed' WHERE id = 101")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                id, ulid, inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                102, '01J00000000000000000000001', 11, 13, 'legacy-group', 'topup', 502,
+                50.00, 1700000000, 1700000000, 2500000, 0.0500,
+                'completed', 1700000000, 1700000000, 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO invitation_rebate_payouts (
+                id, rebate_record_id, inviter_user_id, invitee_user_id, order_id, order_type,
+                amount_cents, quota_delta, kind, status, request_id, created_at, updated_at
+            ) VALUES
+                (301, 101, 11, 12, 501, 'topup', 1000, 5000000, 'payout', 'completed', 'pay-301', 1700000000, 1700000000),
+                (302, 101, 11, 12, 501, 'topup', 0, 0, 'payout', 'pending', 'pay-302', 1700000001, 1700000001),
+                (303, 101, 11, 12, 501, 'topup', 1000, -5000000, 'reversal', 'pending', 'reverse-303', 1700000002, 1700000002),
+                (304, 101, 11, 12, 501, 'topup', 1000, -5000000, 'reversal', 'reversed', 'reverse-304', 1700000003, 1700000003)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE invitation_rebate_payouts SET original_payout_id = 301 WHERE id IN (303, 304)",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.safe_to_migrate);
+        for expected in [
+            "duplicate_payout_for_record",
+            "duplicate_reversal_for_payout",
+            "illegal_payout_state",
+            "invalid_payout_amount",
+            "inflight_payout_requires_reconciliation",
+            "external_mark_state_mismatch",
+            "completed_record_without_ledger_evidence",
+        ] {
+            assert!(
+                report.issues.iter().any(|issue| issue.code == expected),
+                "missing preflight issue {expected}"
+            );
+        }
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn external_marks_are_verified_bidirectionally_by_exact_identity() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.create_external_mark_table().await;
+        sqlx::query("UPDATE rebate_records SET status = 'completed' WHERE id = 101")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO invitation_rebate_payouts (
+                id, rebate_record_id, rebate_request_id, inviter_user_id, invitee_user_id,
+                order_id, order_type, amount_cents, quota_delta, kind, status,
+                request_id, newapi_mark_id, created_at, updated_at, completed_at
+            ) VALUES (
+                301, 101, 201, 11, 12, 501, 'topup', 1000, 5000000,
+                'payout', 'completed', 'pay-301', 401, 1700000000, 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO kkai_invitation_rebate_balance_marks (
+                id, kind, rebate_record_id, payout_id, user_id, quota_delta,
+                amount_cents, request_id, created_at
+            ) VALUES (401, 'payout', 101, 301, 11, 5000000, 1000, 'pay-301', 1700000000)
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+
+        let exact = database.preflight().await.unwrap();
+        assert!(
+            exact.safe_to_migrate,
+            "unexpected issues: {:?}",
+            exact.issues
+        );
+        assert!(exact.external_evidence_checked);
+
+        sqlx::query("UPDATE kkai_invitation_rebate_balance_marks SET user_id = 99 WHERE id = 401")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        let mismatched = database.preflight().await.unwrap();
+        assert!(!mismatched.safe_to_migrate);
+        assert!(mismatched
+            .issues
+            .iter()
+            .any(|issue| issue.code == "external_mark_identity_mismatch"));
+
+        sqlx::query("UPDATE kkai_invitation_rebate_balance_marks SET user_id = 11 WHERE id = 401")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO kkai_invitation_rebate_balance_marks (
+                id, kind, rebate_record_id, payout_id, user_id, quota_delta,
+                amount_cents, request_id, created_at
+            ) VALUES (402, 'payout', 999, 999, 99, 1, 1, 'orphan-402', 1700000001)
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        let orphaned = database.preflight().await.unwrap();
+        assert!(!orphaned.safe_to_migrate);
+        assert!(orphaned
+            .issues
+            .iter()
+            .any(|issue| issue.code == "external_orphan_balance_mark"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn external_evidence_requires_primary_and_business_unique_keys() {
+        let database = TestDatabase::create().await;
+        database.create_external_mark_table().await;
+        sqlx::query(
+            "ALTER TABLE kkai_invitation_rebate_balance_marks DROP CONSTRAINT kkai_invitation_rebate_balance_marks_pkey",
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+
+        let missing_primary_key = database.preflight().await.unwrap();
+        assert!(!missing_primary_key.schema_compatible_before_migration);
+        assert!(missing_primary_key.issues.iter().any(|issue| {
+            issue.code == "external_evidence_schema_incompatible"
+                && issue
+                    .sample_ids
+                    .iter()
+                    .any(|detail| detail.contains("primary_key"))
+        }));
+
+        sqlx::query("ALTER TABLE kkai_invitation_rebate_balance_marks ADD PRIMARY KEY (id)")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX uq_kkai_invitation_rebate_balance_marks_request")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        let missing_business_identity = database.preflight().await.unwrap();
+        assert!(!missing_business_identity.schema_compatible_before_migration);
+        assert!(missing_business_identity.issues.iter().any(|issue| {
+            issue.code == "external_evidence_schema_incompatible"
+                && issue
+                    .sample_ids
+                    .iter()
+                    .any(|detail| detail.contains("unique_key:request_id"))
+        }));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn unsupported_empty_table_shape_is_a_blocker() {
+        let database = TestDatabase::create().await;
+        sqlx::query("CREATE TABLE rebate_records (id TEXT PRIMARY KEY)")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.schema_compatible_before_migration);
+        assert!(!report.safe_to_migrate);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unsupported_table_shape"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn balance_operation_constraints_enforce_single_exact_reversal() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000010', 'credit:101', 'credit',
+                101, 201, 11, 5000000, 'ki1-credit-101', repeat('a', 64),
+                'queued', 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000011', 'credit:101:duplicate', 'credit',
+                101, 201, 11, 5000000, 'ki1-credit-101-duplicate', repeat('b', 64),
+                'queued', 1700000001, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, original_operation_ulid,
+                user_id, delta_quota, idempotency_key, payload_sha256,
+                operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000012', 'reversal:101:wrong', 'reversal',
+                101, 201, '01J00000000000000000000010', 99, -5000000,
+                'ki1-reversal-101-wrong', repeat('c', 64), 'queued', 1700000002, 1700000002
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .is_err());
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, original_operation_ulid,
+                user_id, delta_quota, idempotency_key, payload_sha256,
+                operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000013', 'reversal:101', 'reversal',
+                101, 201, '01J00000000000000000000010', 11, -5000000,
+                'ki1-reversal-101', repeat('d', 64), 'queued', 1700000003, 1700000003
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, original_operation_ulid,
+                user_id, delta_quota, idempotency_key, payload_sha256,
+                operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000014', 'reversal:101:duplicate', 'reversal',
+                101, 201, '01J00000000000000000000010', 11, -5000000,
+                'ki1-reversal-101-duplicate', repeat('e', 64), 'queued', 1700000004, 1700000004
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .is_err());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn preflight_blocks_historical_balance_operation_conflicts() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000020', 'credit:history:1', 'credit',
+                101, 201, 11, 5000000, 'ki1-history-credit-1', repeat('1', 64),
+                'queued', 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP INDEX uq_balance_operations_record_credit")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX uq_balance_operations_original_reversal")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE balance_operations DISABLE TRIGGER trg_balance_operation_reversal_guard",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000021', 'credit:history:2', 'credit',
+                101, 201, 11, 5000000, 'ki1-history-credit-2', repeat('2', 64),
+                'queued', 1700000001, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        for (ulid, key, user_id) in [
+            ("01J00000000000000000000022", "reversal:history:1", 99_i64),
+            ("01J00000000000000000000023", "reversal:history:2", 11_i64),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO balance_operations (
+                    operation_ulid, business_operation_key, operation_kind,
+                    rebate_record_id, rebate_request_id, original_operation_ulid,
+                    user_id, delta_quota, idempotency_key, payload_sha256,
+                    operation_state, created_at, updated_at
+                ) VALUES ($1, $2, 'reversal', 101, 201,
+                    '01J00000000000000000000020', $3, -5000000,
+                    $2 || ':idempotency', repeat('3', 64), 'queued', 1700000002, 1700000002)
+                "#,
+            )
+            .bind(ulid)
+            .bind(key)
+            .bind(user_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        }
+
+        let report = database.preflight().await.unwrap();
+        for expected in [
+            "duplicate_balance_credit_for_record",
+            "duplicate_balance_reversal_for_credit",
+            "balance_reversal_identity_mismatch",
+        ] {
+            assert!(
+                report.issues.iter().any(|issue| issue.code == expected),
+                "missing preflight issue {expected}"
+            );
+        }
+        assert!(!report.safe_to_migrate);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn readiness_rejects_same_name_wrong_index_and_disabled_trigger() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query("DROP INDEX uq_invitation_rebate_payouts_record_pay")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_invitation_rebate_payouts_record_pay ON rebate_records(inviter_id)",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("index definition drifted"));
+
+        sqlx::query("DROP INDEX uq_invitation_rebate_payouts_record_pay")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX uq_invitation_rebate_payouts_record_pay ON invitation_rebate_payouts(rebate_record_id) WHERE kind = 'payout'",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE rebate_requests DISABLE TRIGGER trg_20_rebate_request_ownership")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("trigger definition drifted"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn maintenance_lock_blocks_concurrent_business_writes() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let mut connection = database.pool.acquire().await.unwrap();
+        let mut transaction = connection.begin().await.unwrap();
+        lock_maintenance_tables(&mut transaction).await.unwrap();
+
+        let mut writer = database.pool.acquire().await.unwrap();
+        sqlx::query("SET lock_timeout = '200ms'")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let write =
+            sqlx::query("UPDATE rebate_records SET updated_at = updated_at + 1 WHERE id = 101")
+                .execute(&mut *writer)
+                .await;
+        assert!(write.is_err());
+        transaction.rollback().await.unwrap();
+        drop(writer);
+        drop(connection);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn missing_critical_index_refuses_schema_readiness() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query("DROP INDEX uq_invitation_rebate_payouts_record_pay")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let error = database.verify().await.unwrap_err();
+        assert!(error.to_string().contains("critical index is missing"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn full_prepare_observes_a_write_committed_while_waiting_for_maintenance_lock() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let mut writer = database.pool.acquire().await.unwrap();
+        let mut writer_transaction = writer.begin().await.unwrap();
+        sqlx::query("UPDATE rebate_records SET status = 'illegal_state' WHERE id = 101")
+            .execute(&mut *writer_transaction)
+            .await
+            .unwrap();
+
+        let prepare = prepare_database(&database.pool, &database.external_pool);
+        let release_writer = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_locks lock
+                            JOIN pg_class relation ON relation.oid = lock.relation
+                            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                            WHERE namespace.nspname = $1
+                              AND relation.relname = 'rebate_records'
+                              AND NOT lock.granted
+                        )
+                        "#,
+                    )
+                    .bind(&database.schema)
+                    .fetch_one(&database.admin_pool)
+                    .await
+                    .unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("prepare_database did not wait for the legacy writer lock");
+            writer_transaction.commit().await.unwrap();
+        };
+        let (prepare_result, ()) = tokio::join!(prepare, release_writer);
+        drop(writer);
+        let error = prepare_result.expect_err(
+            "the post-lock snapshot must observe and block the committed invalid state",
+        );
+        let report = error.preflight_report().expect("preflight blocked report");
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "illegal_rebate_record_state"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn settlement_coverage_is_created_guarded_and_verified() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+
+        let covered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_record_settlements WHERE rebate_record_id = 101",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(covered, 1);
+        assert!(
+            sqlx::query("DELETE FROM rebate_record_settlements WHERE rebate_record_id = 101",)
+                .execute(&database.pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query("UPDATE rebate_record_settlements SET rebate_record_id = 999 WHERE rebate_record_id = 101")
+            .execute(&database.pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("TRUNCATE rebate_record_settlements")
+            .execute(&database.pool)
+            .await
+            .is_err());
+
+        sqlx::query(
+            "ALTER TABLE rebate_record_settlements DISABLE TRIGGER trg_rebate_record_settlement_delete_guard",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM rebate_record_settlements WHERE rebate_record_id = 101")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE rebate_record_settlements ENABLE TRIGGER trg_rebate_record_settlement_delete_guard",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.safe_to_migrate);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "normalized_settlement_coverage_missing"));
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("settlement coverage"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn readiness_manifest_covers_every_migration_catalog_object() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+
+        let constraint_names: BTreeSet<String> = sqlx::query_scalar(
+            r#"
+            SELECT constraint_meta.conname::TEXT
+            FROM pg_constraint constraint_meta
+            JOIN pg_class table_class ON table_class.oid = constraint_meta.conrelid
+            JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND constraint_meta.contype IN ('p', 'u', 'c', 'f')
+            ORDER BY constraint_meta.conname
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        let expected_constraints: BTreeSet<String> = CRITICAL_KEY_CONSTRAINTS
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .chain(CRITICAL_CHECKS.iter().map(|spec| spec.name.to_string()))
+            .chain(
+                CRITICAL_FOREIGN_KEYS
+                    .iter()
+                    .map(|spec| spec.name.to_string()),
+            )
+            .collect();
+        assert_eq!(constraint_names, expected_constraints);
+
+        let standalone_index_names: BTreeSet<String> = sqlx::query_scalar(
+            r#"
+            SELECT index_class.relname::TEXT
+            FROM pg_index index_meta
+            JOIN pg_class index_class ON index_class.oid = index_meta.indexrelid
+            JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_constraint constraint_meta
+                  WHERE constraint_meta.conindid = index_meta.indexrelid
+              )
+            ORDER BY index_class.relname
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        let expected_indexes: BTreeSet<String> = CRITICAL_INDEXES
+            .iter()
+            .filter(|spec| {
+                !CRITICAL_KEY_CONSTRAINTS
+                    .iter()
+                    .any(|constraint| constraint.name == spec.name)
+            })
+            .map(|spec| spec.name.to_string())
+            .collect();
+        assert_eq!(standalone_index_names, expected_indexes);
+
+        let trigger_names: BTreeSet<String> = sqlx::query_scalar(
+            r#"
+            SELECT trigger_meta.tgname::TEXT
+            FROM pg_trigger trigger_meta
+            JOIN pg_class table_class ON table_class.oid = trigger_meta.tgrelid
+            JOIN pg_namespace namespace ON namespace.oid = table_class.relnamespace
+            WHERE namespace.nspname = current_schema() AND NOT trigger_meta.tgisinternal
+            ORDER BY trigger_meta.tgname
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        let expected_triggers: BTreeSet<String> = CRITICAL_TRIGGERS
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        assert_eq!(trigger_names, expected_triggers);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn balance_operation_financial_identity_is_immutable_after_insert() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000030', 'credit:immutable:101', 'credit',
+                101, 201, 11, 5000000, 'ki1-immutable-credit-101', repeat('a', 64),
+                'queued', 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, original_operation_ulid,
+                user_id, delta_quota, idempotency_key, payload_sha256,
+                operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000031', 'reversal:immutable:101', 'reversal',
+                101, 201, '01J00000000000000000000030', 11, -5000000,
+                'ki1-immutable-reversal-101', repeat('b', 64), 'queued', 1700000001, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        for update in [
+            "UPDATE balance_operations SET operation_ulid = '01J00000000000000000000039' WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET source = 'changed-source' WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET business_operation_key = 'changed-key' WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET operation_kind = 'reversal' WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET rebate_record_id = 999 WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET rebate_request_id = NULL WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET user_id = 99 WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET delta_quota = 6000000 WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET idempotency_key = 'changed-idempotency' WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET payload_sha256 = repeat('c', 64) WHERE operation_kind = 'credit'",
+            "UPDATE balance_operations SET original_operation_ulid = NULL WHERE operation_kind = 'reversal'",
+        ] {
+            let mut transaction = database.pool.begin().await.unwrap();
+            let error = sqlx::query(update)
+                .execute(&mut *transaction)
+                .await
+                .expect_err(update);
+            assert!(
+                error.to_string().contains("financial identity is immutable"),
+                "unexpected update error for {update}: {error}"
+            );
+            transaction.rollback().await.unwrap();
+        }
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn readiness_rejects_checkpoint_primary_key_drift() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            "ALTER TABLE rebate_sync_checkpoints DROP CONSTRAINT rebate_sync_checkpoints_pkey",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("critical constraint is missing"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn supported_legacy_columns_without_primary_key_are_rejected() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE rebate_records DROP CONSTRAINT rebate_records_pkey")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.schema_compatible_before_migration);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "unsupported_table_shape"
+                && issue
+                    .sample_ids
+                    .iter()
+                    .any(|item| item.contains("primary_key"))
+        }));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn legacy_relation_kind_is_part_of_supported_shape() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE rebate_records RENAME TO rebate_records_backing")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW rebate_records AS SELECT * FROM rebate_records_backing")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let report = database.preflight().await.unwrap();
+        assert!(!report.schema_compatible_before_migration);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "unsupported_table_shape"
+                && issue
+                    .sample_ids
+                    .iter()
+                    .any(|item| item == "rebate_records.relkind:v")
+        }));
+        database.cleanup().await;
+    }
 }
