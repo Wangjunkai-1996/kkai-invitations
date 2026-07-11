@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::config::BalanceApiConfig;
+use crate::config::{BalanceApiConfig, BALANCE_LEASE_MILLISECONDS};
 use crate::AppState;
 
 const DISPATCH_BATCH_SIZE: usize = 25;
-const LEASE_SECONDS: i64 = 30;
+const LEASE_SECONDS: i64 = (BALANCE_LEASE_MILLISECONDS / 1_000) as i64;
+const MAX_NEWAPI_DELTA: i64 = i32::MAX as i64;
 const MAX_RETRY_DELAY_SECONDS: i64 = 15 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,8 +153,19 @@ pub async fn enqueue_operation(
     transaction: &mut Transaction<'_, Postgres>,
     input: EnqueueOperation,
 ) -> Result<EnqueuedOperation, sqlx::Error> {
+    if input.delta_quota == 0 || input.delta_quota.unsigned_abs() > MAX_NEWAPI_DELTA as u64 {
+        return Err(sqlx::Error::Protocol(
+            "balance adjustment delta exceeds the NewAPI contract".to_string(),
+        ));
+    }
     if let Some(existing) = read_operation(transaction, input.kind, input.rebate_record_id).await? {
-        return Ok(existing);
+        if !matches!(
+            existing.operation_state.as_str(),
+            "needs_review" | "blocked"
+        ) {
+            return Ok(existing);
+        }
+        return requeue_terminal_operation(transaction, &input, existing).await;
     }
 
     let operation_ulid = ulid::Ulid::new().to_string();
@@ -266,6 +278,82 @@ pub async fn enqueue_operation(
         operation_ulid,
         operation_state,
     })
+}
+
+async fn requeue_terminal_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    input: &EnqueueOperation,
+    mut operation: EnqueuedOperation,
+) -> Result<EnqueuedOperation, sqlx::Error> {
+    let terminal_state = operation.operation_state.clone();
+    let operation_id: i64 = sqlx::query_scalar(
+        r#"
+        UPDATE balance_operations
+        SET operation_state = 'queued', next_attempt_at = $2,
+            lease_token = NULL, lease_expires_at = NULL,
+            last_http_status = NULL, last_error_code = NULL, updated_at = $2
+        WHERE operation_ulid = $1 AND operation_state IN ('needs_review', 'blocked')
+        RETURNING id
+        "#,
+    )
+    .bind(&operation.operation_ulid)
+    .bind(input.now)
+    .fetch_one(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE balance_operation_outbox
+        SET available_at = $2, dispatched_at = NULL,
+            lease_token = NULL, lease_expires_at = NULL, last_error_code = NULL
+        WHERE operation_id = $1 AND event_type = 'dispatch_balance_adjustment'
+        "#,
+    )
+    .bind(operation_id)
+    .bind(input.now)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE invitation_rebate_payouts
+        SET status = 'pending', error_message = NULL, updated_at = $2
+        WHERE id = $1 AND status IN ('failed', 'needs_review', 'reversal_pending')
+        "#,
+    )
+    .bind(input.payout_id)
+    .bind(input.now)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE rebate_record_settlements
+        SET settlement_state = $2, state_version = state_version + 1,
+            last_operation_ulid = $3, updated_at = $4
+        WHERE rebate_record_id = $1
+        "#,
+    )
+    .bind(input.rebate_record_id)
+    .bind(match input.kind {
+        OperationKind::Credit => "payout_pending",
+        OperationKind::Reversal => "reversal_pending",
+    })
+    .bind(&operation.operation_ulid)
+    .bind(input.now)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO balance_operation_events(
+            operation_id, event_type, state_from, state_to, occurred_at
+        ) VALUES ($1, 'manual_retry', $2, 'queued', $3)
+        "#,
+    )
+    .bind(operation_id)
+    .bind(terminal_state)
+    .bind(input.now)
+    .execute(&mut **transaction)
+    .await?;
+    operation.operation_state = "queued".to_string();
+    Ok(operation)
 }
 
 pub async fn original_credit_operation_ulid(
@@ -430,6 +518,43 @@ pub async fn persist_applied_for_test(
     persist_applied(pool, &claimed, response, 201, now).await
 }
 
+#[cfg(test)]
+pub async fn mark_needs_review_for_test(
+    pool: &PgPool,
+    operation_ulid: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let operation_id: i64 =
+        sqlx::query_scalar("SELECT id FROM balance_operations WHERE operation_ulid = $1")
+            .bind(operation_ulid)
+            .fetch_one(pool)
+            .await?;
+    sqlx::query(
+        r#"
+        UPDATE balance_operations
+        SET operation_state = 'needs_review', last_error_code = 'insufficient_balance',
+            lease_token = NULL, lease_expires_at = NULL, updated_at = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(operation_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE balance_operation_outbox
+        SET dispatched_at = $2, lease_token = NULL, lease_expires_at = NULL
+        WHERE operation_id = $1
+        "#,
+    )
+    .bind(operation_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn claim_next_operation(
     pool: &PgPool,
     now: i64,
@@ -577,13 +702,19 @@ async fn dispatch_claim(
     };
 
     let status = response.status();
-    if status == StatusCode::TOO_MANY_REQUESTS
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_EARLY
+        || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::SERVICE_UNAVAILABLE
         || status.is_server_error()
     {
         return DispatchOutcome::Retry {
             status: Some(status.as_u16()),
-            code: if status == StatusCode::TOO_MANY_REQUESTS {
+            code: if status == StatusCode::REQUEST_TIMEOUT {
+                "upstream_request_timeout"
+            } else if status == StatusCode::TOO_EARLY {
+                "upstream_too_early"
+            } else if status == StatusCode::TOO_MANY_REQUESTS {
                 "rate_limited"
             } else if status == StatusCode::SERVICE_UNAVAILABLE {
                 "balance_api_unavailable"
@@ -601,16 +732,24 @@ async fn dispatch_claim(
         };
     }
     if status.is_client_error() {
+        let code = response_error_code(response).await;
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            || (status == StatusCode::NOT_FOUND && code.as_deref() != Some("user_not_found"))
+        {
+            return DispatchOutcome::Retry {
+                status: Some(status.as_u16()),
+                code: match status {
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "balance_api_auth_failed",
+                    _ => "balance_api_route_not_found",
+                },
+            };
+        }
         return DispatchOutcome::Terminal {
-            state: if status == StatusCode::BAD_REQUEST {
-                "needs_review"
-            } else {
-                "blocked"
-            },
+            state: "needs_review",
             status: Some(status.as_u16()),
-            code: match status {
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "balance_api_auth_failed",
-                StatusCode::NOT_FOUND => "balance_user_not_found",
+            code: match code.as_deref() {
+                Some("user_not_found") => "balance_user_not_found",
+                Some("invalid_request") => "invalid_request",
                 _ => "balance_api_rejected",
             },
         };
@@ -626,16 +765,14 @@ async fn dispatch_claim(
         Ok(response) => response.into_inner(),
         Err(error) => {
             tracing::error!(operation_id = %claimed.operation_ulid, %error, "Invalid Balance API success response");
-            return DispatchOutcome::Terminal {
-                state: "needs_review",
+            return DispatchOutcome::Retry {
                 status: Some(status.as_u16()),
                 code: "invalid_success_response",
             };
         }
     };
     if !response_matches_request(&response, &request) {
-        return DispatchOutcome::Terminal {
-            state: "needs_review",
+        return DispatchOutcome::Retry {
             status: Some(status.as_u16()),
             code: "success_response_mismatch",
         };
@@ -1135,6 +1272,13 @@ mod tests {
         assert_eq!(retry_delay_seconds(2), 10);
         assert_eq!(retry_delay_seconds(9), 900);
         assert_eq!(retry_delay_seconds(100), 900);
+    }
+
+    #[test]
+    fn newapi_delta_contract_rejects_out_of_range_values_before_enqueue() {
+        assert_eq!(MAX_NEWAPI_DELTA, i64::from(i32::MAX));
+        assert!(i64::from(i32::MAX) <= MAX_NEWAPI_DELTA);
+        assert!(i64::from(i32::MAX) + 1 > MAX_NEWAPI_DELTA);
     }
 
     #[test]

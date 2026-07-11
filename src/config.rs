@@ -7,6 +7,7 @@ pub const DEFAULT_AUTO_SYNC_INITIAL_DELAY_SECONDS: u64 = 10;
 pub const DEFAULT_BALANCE_DISPATCH_INTERVAL_MILLISECONDS: u64 = 1_000;
 pub const DEFAULT_BALANCE_API_CONNECT_TIMEOUT_MILLISECONDS: u64 = 2_000;
 pub const DEFAULT_BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS: u64 = 10_000;
+pub const BALANCE_LEASE_MILLISECONDS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettlementMode {
@@ -141,7 +142,9 @@ fn balance_api_config_from_env(
     settlement_mode: SettlementMode,
 ) -> std::result::Result<Option<BalanceApiConfig>, String> {
     let base_url = optional_trimmed_env("NEWAPI_BASE_URL");
-    let secret = optional_trimmed_env("INVITATIONS_INTERNAL_SECRET");
+    let secret = env::var("INVITATIONS_INTERNAL_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty());
     let values =
         balance_api_config_from_values(settlement_mode, base_url.as_deref(), secret.as_deref())?;
     Ok(values.map(|(base_url, secret)| BalanceApiConfig {
@@ -164,7 +167,8 @@ fn balance_api_config_from_values(
     secret: Option<&str>,
 ) -> std::result::Result<Option<(String, String)>, String> {
     let base_url = base_url.map(str::trim).filter(|value| !value.is_empty());
-    let secret = secret.map(str::trim).filter(|value| !value.is_empty());
+    let raw_secret = secret.filter(|value| !value.is_empty());
+    let secret = raw_secret.map(str::trim).filter(|value| !value.is_empty());
     if settlement_mode.is_enabled() {
         let base_url = base_url.ok_or_else(|| {
             "NEWAPI_BASE_URL must be set when SETTLEMENT_MODE=enabled".to_string()
@@ -172,11 +176,44 @@ fn balance_api_config_from_values(
         let secret = secret.ok_or_else(|| {
             "INVITATIONS_INTERNAL_SECRET must be set when SETTLEMENT_MODE=enabled".to_string()
         })?;
+        validate_balance_api_values(base_url, raw_secret.unwrap_or(secret))?;
         return Ok(Some((base_url.to_string(), secret.to_string())));
     }
     Ok(base_url
         .zip(secret)
         .map(|(base_url, secret)| (base_url.to_string(), secret.to_string())))
+}
+
+fn validate_balance_api_values(base_url: &str, secret: &str) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| "NEWAPI_BASE_URL must be a valid http or https URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("NEWAPI_BASE_URL must be a valid http or https URL".to_string());
+    }
+    if secret.len() < 32 || secret.chars().any(char::is_whitespace) {
+        return Err(
+            "INVITATIONS_INTERNAL_SECRET must be at least 32 characters with no whitespace"
+                .to_string(),
+        );
+    }
+    let request_timeout = optional_u64_env_value(
+        "BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS",
+        env::var("BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS")
+            .ok()
+            .as_deref(),
+        DEFAULT_BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS,
+    );
+    if request_timeout == 0 {
+        return Err(
+            "BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS must be a positive integer".to_string(),
+        );
+    }
+    if request_timeout >= BALANCE_LEASE_MILLISECONDS {
+        return Err(format!(
+            "BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS must be less than {BALANCE_LEASE_MILLISECONDS}"
+        ));
+    }
+    Ok(())
 }
 
 fn optional_trimmed_env(name: &str) -> Option<String> {
@@ -295,11 +332,36 @@ mod tests {
             balance_api_config_from_values(
                 SettlementMode::Enabled,
                 Some(" https://newapi.example "),
-                Some(" secret "),
+                Some("0123456789abcdef0123456789abcdef"),
             )
             .unwrap(),
-            Some(("https://newapi.example".to_string(), "secret".to_string()))
+            Some((
+                "https://newapi.example".to_string(),
+                "0123456789abcdef0123456789abcdef".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn enabled_rejects_invalid_balance_api_url_and_secret() {
+        assert!(balance_api_config_from_values(
+            SettlementMode::Enabled,
+            Some("file:///tmp/socket"),
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .is_err());
+        assert!(balance_api_config_from_values(
+            SettlementMode::Enabled,
+            Some("https://newapi.example"),
+            Some(" 0123456789abcdef0123456789abcdef "),
+        )
+        .is_err());
+        assert!(balance_api_config_from_values(
+            SettlementMode::Enabled,
+            Some("https://newapi.example"),
+            Some("short-secret"),
+        )
+        .is_err());
     }
 
     #[test]

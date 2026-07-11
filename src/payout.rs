@@ -430,8 +430,37 @@ async fn read_payout_status(state: &AppState, record_id: i64) -> Result<PayoutSt
             result.newapi_log_id = payout.newapi_log_id;
             result.newapi_mark_id = payout.newapi_mark_id;
             result.can_pay = false;
-            result.can_reverse = matches!(payout.status.as_str(), "completed" | "reversal_pending");
-            result.needs_review = matches!(payout.status.as_str(), "failed" | "reversal_pending");
+            let credit_operation_exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM balance_operations
+                    WHERE rebate_record_id = $1 AND operation_kind = 'credit'
+                )
+                "#,
+            )
+            .bind(record_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            result.can_reverse = credit_operation_exists
+                && matches!(payout.status.as_str(), "completed" | "reversal_pending");
+            let operation_state: Option<String> = sqlx::query_scalar(
+                r#"
+                SELECT operation_state
+                FROM balance_operations
+                WHERE rebate_record_id = $1
+                ORDER BY id DESC LIMIT 1
+                "#,
+            )
+            .bind(record_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            result.needs_review = matches!(payout.status.as_str(), "failed" | "reversal_pending")
+                || matches!(operation_state.as_deref(), Some("blocked" | "needs_review"));
+            if payout.status == "completed" && !credit_operation_exists {
+                result.needs_review = true;
+                result.message =
+                    Some("历史发放缺少新余额操作账本，只能人工复核，不能自动冲正".to_string());
+            }
             if payout.status == "reversal_pending" {
                 result.message = Some("冲正待复核：用户余额不足或上次冲正未完成".to_string());
             }
@@ -464,7 +493,7 @@ async fn reserve_payout(
             tx.commit().await?;
             return Ok(ReservePayoutResult::AlreadyPaid(existing));
         }
-        Ok(existing) if matches!(existing.status.as_str(), "reversed" | "reversal_pending") => {
+        Ok(existing) if existing.status == "reversed" => {
             return Err(PayoutError::PayoutNotCompleted);
         }
         Ok(existing) => {
@@ -880,9 +909,9 @@ fn pay_error_response(err: PayoutError) -> (&'static str, i32, AppError) {
             AppError::Conflict("返利记录未审核通过，不能发放".to_string()),
         ),
         PayoutError::HistoricalComplete => (
-            "historical_completed_without_payout",
+            "historical_settlement_requires_review",
             409,
-            AppError::Conflict("该历史已完成记录缺少余额发放流水，需要人工复核".to_string()),
+            AppError::Conflict("该历史结算缺少新余额操作账本，只能人工复核".to_string()),
         ),
         PayoutError::InvalidQuota(message) => (
             "invalid_quota",
@@ -909,6 +938,11 @@ fn reverse_error_response(err: PayoutError) -> (&'static str, i32, AppError) {
             "not_completed",
             409,
             AppError::Conflict("只有已完成的余额发放流水可以冲正".to_string()),
+        ),
+        PayoutError::HistoricalComplete => (
+            "historical_settlement_requires_review",
+            409,
+            AppError::Conflict("该历史结算缺少新余额操作账本，只能人工复核".to_string()),
         ),
         PayoutError::InvalidQuota(message) => (
             "invalid_quota",

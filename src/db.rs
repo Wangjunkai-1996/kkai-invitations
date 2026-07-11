@@ -1819,8 +1819,8 @@ mod tests {
 
     use super::*;
     use crate::balance_dispatcher::{
-        claim_operation_ids_for_test, enqueue_operation, persist_applied_for_test,
-        EnqueueOperation, OperationKind,
+        claim_operation_ids_for_test, enqueue_operation, mark_needs_review_for_test,
+        persist_applied_for_test, EnqueueOperation, OperationKind,
     };
 
     const LATEST_LEGACY_FIXTURE: &str = include_str!("../tests/fixtures/latest_legacy.sql");
@@ -2264,6 +2264,87 @@ mod tests {
                 Some(1_700_000_003),
             )
         );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn manual_retry_requeues_same_operation_ulid_after_review() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        let payout_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO invitation_rebate_payouts(
+                rebate_record_id, rebate_request_id, inviter_user_id, invitee_user_id,
+                order_id, order_type, amount_cents, quota_delta, kind, status,
+                request_id, created_at, updated_at
+            ) VALUES (101, 201, 11, 12, 501, 'topup', 1000, 5000000, 'payout',
+                      'pending', 'manual-retry-test', 1700000000, 1700000000)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let input = |now| EnqueueOperation {
+            kind: OperationKind::Credit,
+            rebate_record_id: 101,
+            rebate_request_id: Some(201),
+            original_operation_ulid: None,
+            user_id: 11,
+            payout_id,
+            delta_quota: 5_000_000,
+            now,
+        };
+        let mut transaction = database.pool.begin().await.unwrap();
+        let operation = enqueue_operation(&mut transaction, input(1_700_000_001))
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        mark_needs_review_for_test(&database.pool, &operation.operation_ulid, 1_700_000_002)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE invitation_rebate_payouts SET status = 'failed' WHERE id = $1")
+            .bind(payout_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let mut transaction = database.pool.begin().await.unwrap();
+        let retried = enqueue_operation(&mut transaction, input(1_700_000_003))
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(retried.operation_ulid, operation.operation_ulid);
+        assert_eq!(retried.operation_state, "queued");
+        let state: (String, Option<i64>, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT operation.operation_state, outbox.dispatched_at,
+                   payout.status, operation.last_error_code
+            FROM balance_operations operation
+            JOIN balance_operation_outbox outbox ON outbox.operation_id = operation.id
+            JOIN invitation_rebate_payouts payout ON payout.id = $2
+            WHERE operation.operation_ulid = $1
+            "#,
+        )
+        .bind(&operation.operation_ulid)
+        .bind(payout_id)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            ("queued".to_string(), None, "pending".to_string(), None)
+        );
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM balance_operations")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(operation_count, 1);
         database.cleanup().await;
     }
 

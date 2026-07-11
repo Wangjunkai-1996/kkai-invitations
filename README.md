@@ -68,7 +68,7 @@ NEWAPI_DATABASE_URL=postgresql://user:password@localhost/newapi
 
 # 仅在 SETTLEMENT_MODE=enabled 时必填；用于调用 new-api 内部幂等余额接口
 NEWAPI_BASE_URL=http://127.0.0.1:3000
-INVITATIONS_INTERNAL_SECRET=replace-with-a-long-random-secret
+INVITATIONS_INTERNAL_SECRET=replace-with-at-least-32-random-characters
 
 # 结算模式默认为 disabled；enabled 会启动 outbox dispatcher
 SETTLEMENT_MODE=disabled
