@@ -137,6 +137,7 @@ pub struct ApproveAndPayResponse {
     pub total_amount: i64,
     pub paid_count: usize,
     pub already_paid_count: usize,
+    pub pending_count: usize,
     pub failed_count: usize,
     pub items: Vec<ApproveAndPayRecordResult>,
 }
@@ -156,6 +157,7 @@ pub struct BatchApproveAndPayResponse {
     pub failed_requests: usize,
     pub paid_count: usize,
     pub already_paid_count: usize,
+    pub pending_count: usize,
     pub failed_count: usize,
     pub items: Vec<ApproveAndPayResponse>,
     pub errors: Vec<BatchApproveAndPayError>,
@@ -979,7 +981,7 @@ pub async fn approve_and_pay_rebate_request(
     let result =
         approve_and_pay_request(&state, &admin, id, req.note.as_deref(), &base_request_id).await?;
 
-    Ok(message(result, "返利申请已审批并发放"))
+    Ok(message(result, "返利申请已提交，等待结算"))
 }
 
 // POST /api/admin/rebate-requests/approve-and-pay-batch
@@ -1029,12 +1031,13 @@ pub async fn batch_approve_and_pay_rebate_requests(
         failed_requests: errors.len(),
         paid_count,
         already_paid_count,
+        pending_count: aggregate_pending_count(&items),
         failed_count,
         items,
         errors,
     };
 
-    Ok(message(result, "批量审批并发放已完成"))
+    Ok(message(result, "批量返利申请已提交，等待结算"))
 }
 
 // POST /api/admin/rebate-requests/:id/reject
@@ -2821,6 +2824,7 @@ async fn approve_and_pay_request(
             total_amount: quota_to_cents(total_amount),
             paid_count: 0,
             already_paid_count: rebate_record_ids.len(),
+            pending_count: 0,
             failed_count: 0,
             items: rebate_record_ids
                 .into_iter()
@@ -2834,6 +2838,7 @@ async fn approve_and_pay_request(
             let mut items = Vec::with_capacity(rebate_record_ids.len());
             let mut paid_count = 0;
             let mut already_paid_count = 0;
+            let mut pending_count = 0;
             let mut failed_count = 0;
 
             for record_id in rebate_record_ids {
@@ -2855,6 +2860,8 @@ async fn approve_and_pay_request(
                             already_paid_count += 1;
                         } else if result.outcome == "paid" {
                             paid_count += 1;
+                        } else if result.outcome == "pending" {
+                            pending_count += 1;
                         }
                         items.push(record_result_from_pay_result(result));
                     }
@@ -2865,18 +2872,28 @@ async fn approve_and_pay_request(
                 }
             }
 
-            let status = finalize_approve_and_pay_request(state, request_id).await?;
+            let finalized_status = finalize_approve_and_pay_request(state, request_id).await?;
+            let status = if pending_count > 0 {
+                "pending".to_string()
+            } else {
+                finalized_status
+            };
             Ok(ApproveAndPayResponse {
                 request_id,
                 status,
                 total_amount: quota_to_cents(total_amount),
                 paid_count,
                 already_paid_count,
+                pending_count,
                 failed_count,
                 items,
             })
         }
     }
+}
+
+fn aggregate_pending_count(items: &[ApproveAndPayResponse]) -> usize {
+    items.iter().map(|item| item.pending_count).sum()
 }
 
 async fn prepare_approve_and_pay_request(
@@ -3585,6 +3602,65 @@ mod tests {
 
         let too_many = vec![1; MAX_APPROVE_AND_PAY_BATCH_SIZE + 1];
         assert!(validate_approve_and_pay_batch_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn approve_and_pay_response_serializes_pending_count_in_camel_case() {
+        let response = ApproveAndPayResponse {
+            request_id: 10,
+            status: "pending".to_string(),
+            total_amount: 100,
+            paid_count: 0,
+            already_paid_count: 0,
+            pending_count: 2,
+            failed_count: 0,
+            items: Vec::new(),
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["pendingCount"], 2);
+        assert!(json.get("pending_count").is_none());
+    }
+
+    #[test]
+    fn batch_pending_count_sums_nested_pending_records() {
+        let items = vec![
+            approve_and_pay_response_for_count_test("pending", 2),
+            approve_and_pay_response_for_count_test("pending", 1),
+            approve_and_pay_response_for_count_test("completed", 0),
+        ];
+
+        assert_eq!(aggregate_pending_count(&items), 3);
+        let response = BatchApproveAndPayResponse {
+            total_requests: 3,
+            succeeded_requests: 3,
+            failed_requests: 0,
+            paid_count: 0,
+            already_paid_count: 0,
+            pending_count: aggregate_pending_count(&items),
+            failed_count: 0,
+            items,
+            errors: Vec::new(),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["pendingCount"], 3);
+        assert!(json.get("pending_count").is_none());
+    }
+
+    fn approve_and_pay_response_for_count_test(
+        status: &str,
+        pending_count: usize,
+    ) -> ApproveAndPayResponse {
+        ApproveAndPayResponse {
+            request_id: 1,
+            status: status.to_string(),
+            total_amount: 0,
+            paid_count: 0,
+            already_paid_count: 0,
+            pending_count,
+            failed_count: 0,
+            items: Vec::new(),
+        }
     }
 
     #[test]
