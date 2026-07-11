@@ -9,12 +9,13 @@ use thiserror::Error;
 use crate::preflight::{self, PreflightMode, PreflightReport};
 
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
-const EXPECTED_MIGRATIONS: [i64; 5] = [
+const EXPECTED_MIGRATIONS: [i64; 6] = [
     202607110001,
     202607110002,
     202607110003,
     202607110004,
     202607110005,
+    202607110006,
 ];
 #[derive(Clone, Copy)]
 struct IndexSpec {
@@ -268,7 +269,14 @@ const CRITICAL_INDEXES: &[IndexSpec] = &[
         name: "idx_balance_operation_outbox_ready",
         table: "balance_operation_outbox",
         columns: &["available_at", "id"],
-        predicate: Some("dispatched_at IS NULL"),
+        predicate: Some("dispatched_at IS NULL AND lease_expires_at IS NULL"),
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_balance_operation_outbox_expired_lease",
+        table: "balance_operation_outbox",
+        columns: &["lease_expires_at", "available_at", "id"],
+        predicate: Some("dispatched_at IS NULL AND lease_expires_at IS NOT NULL"),
         unique: false,
     },
     IndexSpec {
@@ -487,12 +495,12 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_invitation_rebate_payouts_status",
         table: "invitation_rebate_payouts",
-        definition_md5: "1073a6718da532e84be524a988d7c8c4",
+        definition_md5: "24892e3a20ec7d78cad00d2b36e9d537",
     },
     CheckSpec {
         name: "ck_invitation_rebate_payouts_kind_status_original",
         table: "invitation_rebate_payouts",
-        definition_md5: "36332430c34be77d570ab7202f5f7d11",
+        definition_md5: "16f7edeb150cd90d95802c69c9e215e6",
     },
     CheckSpec {
         name: "ck_balance_operations_kind",
@@ -608,6 +616,11 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
         name: "ck_balance_operation_outbox_attempt_count",
         table: "balance_operation_outbox",
         definition_md5: "1eccb251ce5d9eae5cc567adab24bd33",
+    },
+    CheckSpec {
+        name: "ck_balance_operation_outbox_lease_consistency",
+        table: "balance_operation_outbox",
+        definition_md5: "b540d7e3f032cb3c12de012b2242ef9c",
     },
     CheckSpec {
         name: "ck_rebate_reconciliation_case_state",
@@ -1078,6 +1091,15 @@ static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
             )),
             false,
         ),
+        Migration::new(
+            202607110006,
+            Cow::Borrowed("dispatcher leases and responses"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607110006_dispatcher_leases_and_responses.sql"
+            )),
+            false,
+        ),
     ]),
     ..Migrator::DEFAULT
 });
@@ -1258,7 +1280,7 @@ async fn prepare_database(pool: &PgPool, newapi_pool: &PgPool) -> Result<(), Dat
         .await
         .map_err(DatabaseStartupError::Connect)?;
     tracing::info!(
-        schema_version = EXPECTED_MIGRATIONS[4],
+        schema_version = EXPECTED_MIGRATIONS[EXPECTED_MIGRATIONS.len() - 1],
         "Invitations database is ready"
     );
     Ok(())
@@ -1493,6 +1515,25 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
             }
         }
     }
+    verify_column_shapes(
+        connection,
+        "balance_operations",
+        &[
+            ("balance_before", "int8", true),
+            ("balance_after", "int8", true),
+            ("external_created_at", "int8", true),
+        ],
+    )
+    .await?;
+    verify_column_shapes(
+        connection,
+        "balance_operation_outbox",
+        &[
+            ("last_error_code", "varchar", true),
+            ("last_http_status", "int4", true),
+        ],
+    )
+    .await?;
     for expected in CRITICAL_TRIGGERS {
         verify_trigger(connection, *expected).await?;
     }
@@ -1517,6 +1558,40 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
         )));
     }
 
+    Ok(())
+}
+
+async fn verify_column_shapes(
+    connection: &mut PgConnection,
+    table: &str,
+    columns: &[(&str, &str, bool)],
+) -> Result<(), DatabaseStartupError> {
+    for (column, expected_type, expected_nullable) in columns {
+        let row = sqlx::query(
+            r#"
+            SELECT udt_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+            "#,
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(verification_error)?;
+        let Some(row) = row else {
+            return Err(DatabaseStartupError::Verification(format!(
+                "required dispatcher column is missing: {table}.{column}"
+            )));
+        };
+        let actual_type: String = row.try_get("udt_name").map_err(verification_error)?;
+        let actual_nullable: String = row.try_get("is_nullable").map_err(verification_error)?;
+        if actual_type != *expected_type || (actual_nullable == "YES") != *expected_nullable {
+            return Err(DatabaseStartupError::Verification(format!(
+                "required dispatcher column drifted: {table}.{column}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1874,7 +1949,211 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 6);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn dispatcher_schema_supports_leased_claims_and_response_evidence() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at,
+                balance_before, balance_after, external_created_at
+            ) VALUES (
+                '01J00000000000000000000006', 'credit:dispatcher:101', 'credit',
+                101, 201, 11, 5000000, 'ki1-dispatcher-credit-101', repeat('a', 64),
+                'queued', 1700000000, 1700000000, 10, 5000010, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let operation_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM balance_operations WHERE business_operation_key = 'credit:dispatcher:101'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operation_outbox (
+                operation_id, event_type, available_at, lease_token, lease_expires_at,
+                last_error_code, last_http_status, created_at
+            ) VALUES ($1, 'balance_adjustment_requested', 1700000000, 'lease-1', 1700000060,
+                      'request_timeout', 503, 1700000000)
+            "#,
+        )
+        .bind(operation_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        assert!(sqlx::query(
+            r#"
+            INSERT INTO balance_operation_outbox (
+                operation_id, event_type, available_at, lease_token, created_at
+            ) VALUES ($1, 'invalid_partial_lease', 1700000000, 'lease-2', 1700000000)
+            "#,
+        )
+        .bind(operation_id)
+        .execute(&database.pool)
+        .await
+        .is_err());
+
+        database.verify().await.unwrap();
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn dispatcher_migration_releases_ambiguous_existing_leases() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let migrator_v5 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 202607110005)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        migrator_v5.run(&database.pool).await.unwrap();
+        let operation_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state, created_at, updated_at
+            ) VALUES (
+                '01J00000000000000000000007', 'credit:stale-lease:101', 'credit',
+                101, 201, 11, 5000000, 'ki1-stale-lease-credit-101', repeat('b', 64),
+                'queued', 1700000000, 1700000000
+            ) RETURNING id
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operation_outbox (
+                operation_id, event_type, available_at, lease_token, created_at
+            ) VALUES ($1, 'balance_adjustment_requested', 1700000000, 'ambiguous-lease', 1700000000)
+            "#,
+        )
+        .bind(operation_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        database.prepare().await.unwrap();
+        let lease: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT lease_token, lease_expires_at FROM balance_operation_outbox WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(lease, (None, None));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn dispatcher_schema_readiness_rejects_index_and_column_drift() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+
+        sqlx::query("DROP INDEX idx_balance_operation_outbox_expired_lease")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("critical index is missing"));
+        sqlx::query(
+            r#"
+            CREATE INDEX idx_balance_operation_outbox_expired_lease
+            ON balance_operation_outbox(lease_expires_at, available_at, id)
+            WHERE dispatched_at IS NULL AND lease_expires_at IS NOT NULL
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        sqlx::query("ALTER TABLE balance_operations ALTER COLUMN balance_before SET NOT NULL")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(database
+            .verify()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("required dispatcher column drifted"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn preflight_accepts_version_five_and_requires_version_six_shape_after_upgrade() {
+        let database = TestDatabase::create().await;
+        let migrator_v5 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 202607110005)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        migrator_v5
+            .run(&database.pool)
+            .await
+            .expect("apply migrations through version five");
+        let before_upgrade = database.preflight().await.unwrap();
+        assert!(
+            before_upgrade.schema_compatible_before_migration,
+            "unexpected issues: {:?}",
+            before_upgrade.issues
+        );
+
+        database.prepare().await.unwrap();
+        sqlx::query("ALTER TABLE balance_operations ALTER COLUMN balance_after SET NOT NULL")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let after_upgrade = database.preflight().await.unwrap();
+        assert!(!after_upgrade.schema_compatible_before_migration);
+        assert!(after_upgrade.issues.iter().any(|issue| {
+            issue.code == "unsupported_table_shape"
+                && issue
+                    .sample_ids
+                    .iter()
+                    .any(|detail| detail.contains("balance_operations.balance_after"))
+        }));
         database.cleanup().await;
     }
 

@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::{PgConnection, Row};
 
 const SAMPLE_LIMIT: i64 = 50;
+const DISPATCHER_SCHEMA_MIGRATION: i64 = 202607110006;
 pub const ROLLBACK_BOUNDARY: &str = "Schema changes are expand-only. Application rollback is allowed only while settlement remains disabled and no balance_operations rows exist; never down-migrate or roll back to a binary that writes NewAPI quota directly.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -336,6 +337,15 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("idempotency_key", "varchar", false),
             column("payload_sha256", "bpchar", false),
             column("operation_state", "varchar", false),
+            column("attempt_count", "int4", false),
+            column("next_attempt_at", "int8", true),
+            column("lease_token", "varchar", true),
+            column("lease_expires_at", "int8", true),
+            column("last_http_status", "int4", true),
+            column("last_error_code", "varchar", true),
+            column("balance_before", "int8", true),
+            column("balance_after", "int8", true),
+            column("external_created_at", "int8", true),
         ],
     },
     TableShape {
@@ -345,6 +355,12 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("operation_id", "int8", false),
             column("event_type", "varchar", false),
             column("available_at", "int8", false),
+            column("attempt_count", "int4", false),
+            column("lease_token", "varchar", true),
+            column("lease_expires_at", "int8", true),
+            column("last_error_code", "varchar", true),
+            column("last_http_status", "int4", true),
+            column("dispatched_at", "int8", true),
         ],
     },
     TableShape {
@@ -407,6 +423,17 @@ const EXTERNAL_MARK_SHAPE: TableShape = TableShape {
     ],
 };
 
+const PRE_DISPATCHER_OUTBOX_COLUMNS: &[ColumnSpec] = &[
+    column("id", "int8", false),
+    column("operation_id", "int8", false),
+    column("event_type", "varchar", false),
+    column("available_at", "int8", false),
+    column("attempt_count", "int4", false),
+    column("lease_token", "varchar", true),
+    column("lease_expires_at", "int8", true),
+    column("dispatched_at", "int8", true),
+];
+
 async fn inspect_schema_shapes(
     connection: &mut PgConnection,
     report: &mut PreflightReport,
@@ -419,11 +446,14 @@ async fn inspect_schema_shapes(
         );
     }
 
+    let dispatcher_schema_applied =
+        migration_applied(connection, DISPATCHER_SCHEMA_MIGRATION).await?;
     for shape in LOCAL_TABLE_SHAPES {
         if !table_exists(connection, shape.name).await? {
             continue;
         }
-        let mismatches = table_shape_mismatches(connection, *shape).await?;
+        let shape = dispatcher_compatible_shape(*shape, dispatcher_schema_applied);
+        let mismatches = table_shape_mismatches(connection, shape).await?;
         if !mismatches.is_empty() {
             block_unsupported_shape(report, shape.name, &mismatches);
         }
@@ -456,6 +486,39 @@ async fn inspect_schema_shapes(
         }
     }
     Ok(())
+}
+
+fn dispatcher_compatible_shape(shape: TableShape, dispatcher_schema_applied: bool) -> TableShape {
+    if dispatcher_schema_applied {
+        return shape;
+    }
+
+    match shape.name {
+        "balance_operations" => TableShape {
+            name: shape.name,
+            columns: &shape.columns[..shape.columns.len() - 3],
+        },
+        "balance_operation_outbox" => TableShape {
+            name: shape.name,
+            columns: PRE_DISPATCHER_OUTBOX_COLUMNS,
+        },
+        _ => shape,
+    }
+}
+
+async fn migration_applied(
+    connection: &mut PgConnection,
+    version: i64,
+) -> Result<bool, sqlx::Error> {
+    if !has_columns(connection, "_sqlx_migrations", &["version", "success"]).await? {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1 AND success = TRUE)",
+    )
+    .bind(version)
+    .fetch_one(&mut *connection)
+    .await
 }
 
 async fn inspect_external_schema_shape(
@@ -1465,7 +1528,7 @@ async fn inspect_payouts(
         r#"
         SELECT id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
         FROM invitation_rebate_payouts
-        WHERE status IN ('pending', 'newapi_applied', 'failed', 'reversal_pending')
+        WHERE status IN ('pending', 'newapi_applied', 'failed', 'reversal_pending', 'needs_review')
         ORDER BY id LIMIT $1
         "#,
     )
