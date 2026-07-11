@@ -2853,7 +2853,7 @@ async fn approve_and_pay_request(
                     Ok(result) => {
                         if result.outcome == "already_paid" {
                             already_paid_count += 1;
-                        } else {
+                        } else if result.outcome == "paid" {
                             paid_count += 1;
                         }
                         items.push(record_result_from_pay_result(result));

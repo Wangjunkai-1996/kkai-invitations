@@ -9,6 +9,9 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
+use crate::balance_dispatcher::{
+    enqueue_operation, original_credit_operation_ulid, EnqueueOperation, OperationKind,
+};
 use crate::config::SettlementMode;
 use crate::error::{
     AppError, Result, FUNDS_MAINTENANCE_MESSAGE, LEGACY_COMPLETION_DISABLED_MESSAGE,
@@ -29,8 +32,6 @@ enum PayoutError {
     HistoricalComplete,
     #[error("quota conversion failed: {0}")]
     InvalidQuota(String),
-    #[error("user quota is insufficient for reversal")]
-    InsufficientQuota,
     #[error("payout is not completed")]
     PayoutNotCompleted,
     #[error("database error: {0}")]
@@ -137,12 +138,6 @@ struct Payout {
     newapi_log_id: Option<i64>,
 }
 
-struct NewApiBalanceMark {
-    id: i64,
-    log_id: Option<i64>,
-    balance: i64,
-}
-
 enum ReservePayoutResult {
     Reserved(Payout),
     AlreadyPaid(Payout),
@@ -243,7 +238,7 @@ pub async fn reverse_rebate_payout(
     let request_id = request_id_from_headers(&headers)?;
     let now = Utc::now().timestamp();
 
-    let (payout, reversal) =
+    let (_payout, reversal) =
         match reserve_reversal(&state, record_id, &request_id, &admin, now).await {
             Ok(ReserveReversalResult::Reserved { payout, reversal }) => (payout, reversal),
             Ok(ReserveReversalResult::AlreadyReversed(reversal)) => {
@@ -264,7 +259,6 @@ pub async fn reverse_rebate_payout(
                 return Ok(ok(pay_result_from_payout(
                     "already_reversed",
                     &reversal,
-                    None,
                     state.config.settlement_mode,
                 )));
             }
@@ -273,84 +267,6 @@ pub async fn reverse_rebate_payout(
             }
         };
 
-    let mark = match apply_newapi_reversal(&state.newapi_write_pool, &reversal, &payout, now).await
-    {
-        Ok(mark) => mark,
-        Err(PayoutError::InsufficientQuota) => {
-            mark_reversal_pending(
-                &state.pool,
-                payout.id,
-                reversal.id,
-                "user quota is insufficient for reversal",
-                now,
-            )
-            .await;
-            record_attempt(
-                &state.pool,
-                PayoutAttempt {
-                    record_id,
-                    action: "reverse",
-                    request_id: &request_id,
-                    admin: &admin,
-                    status: "reversal_pending",
-                    http_status: 409,
-                    message: "user quota is insufficient for reversal",
-                    occurred_at: now,
-                },
-            )
-            .await;
-            return Err(AppError::Conflict(
-                "用户余额不足，冲正已标记为待复核".to_string(),
-            ));
-        }
-        Err(err) => {
-            record_attempt(
-                &state.pool,
-                PayoutAttempt {
-                    record_id,
-                    action: "reverse",
-                    request_id: &request_id,
-                    admin: &admin,
-                    status: "failed",
-                    http_status: 500,
-                    message: &err.to_string(),
-                    occurred_at: now,
-                },
-            )
-            .await;
-            tracing::error!(record_id, error = %err, "Payout reversal failed");
-            return Err(AppError::Internal("返利冲正失败，请稍后重试".to_string()));
-        }
-    };
-
-    if let Err(err) = complete_reversal(&state.pool, &payout, &reversal, &mark, now).await {
-        record_attempt(
-            &state.pool,
-            PayoutAttempt {
-                record_id,
-                action: "reverse",
-                request_id: &request_id,
-                admin: &admin,
-                status: "newapi_applied_completion_failed",
-                http_status: 500,
-                message: &err.to_string(),
-                occurred_at: now,
-            },
-        )
-        .await;
-        tracing::error!(
-            record_id,
-            payout_id = payout.id,
-            reversal_id = reversal.id,
-            mark_id = mark.id,
-            error = %err,
-            "Payout reversal completion failed after New API balance apply"
-        );
-        return Err(AppError::Internal(
-            "余额已冲正，但返利状态回写失败；请重试冲正以补齐状态".to_string(),
-        ));
-    }
-
     record_attempt(
         &state.pool,
         PayoutAttempt {
@@ -358,8 +274,8 @@ pub async fn reverse_rebate_payout(
             action: "reverse",
             request_id: &request_id,
             admin: &admin,
-            status: "reversed",
-            http_status: 200,
+            status: "pending",
+            http_status: 202,
             message: "",
             occurred_at: now,
         },
@@ -367,9 +283,8 @@ pub async fn reverse_rebate_payout(
     .await;
 
     Ok(ok(pay_result_from_payout(
-        "reversed",
+        "pending",
         &reversal,
-        Some(&mark),
         state.config.settlement_mode,
     )))
 }
@@ -445,7 +360,6 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
             return Ok(pay_result_from_payout(
                 "already_paid",
                 &payout,
-                None,
                 state.config.settlement_mode,
             ));
         }
@@ -462,61 +376,6 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
         }
     };
 
-    let mark = match apply_newapi_payout(&state.newapi_write_pool, &payout, input.now).await {
-        Ok(mark) => mark,
-        Err(err) => {
-            mark_payout_failed(&state.pool, payout.id, &err.to_string(), input.now).await;
-            record_attempt(
-                &state.pool,
-                PayoutAttempt {
-                    record_id: input.record_id,
-                    action: "pay",
-                    request_id: &input.request_id,
-                    admin: input.admin,
-                    status: "failed",
-                    http_status: 500,
-                    message: &err.to_string(),
-                    occurred_at: input.now,
-                },
-            )
-            .await;
-            tracing::error!(
-                record_id = input.record_id,
-                payout_id = payout.id,
-                error = %err,
-                "New API payout apply failed"
-            );
-            return Err(AppError::Internal("余额发放失败，请稍后重试".to_string()));
-        }
-    };
-
-    if let Err(err) = complete_payout(&state.pool, &payout, &mark, input.now).await {
-        record_attempt(
-            &state.pool,
-            PayoutAttempt {
-                record_id: input.record_id,
-                action: "pay",
-                request_id: &input.request_id,
-                admin: input.admin,
-                status: "newapi_applied_completion_failed",
-                http_status: 500,
-                message: &err.to_string(),
-                occurred_at: input.now,
-            },
-        )
-        .await;
-        tracing::error!(
-            record_id = input.record_id,
-            payout_id = payout.id,
-            mark_id = mark.id,
-            error = %err,
-            "Payout completion failed after New API balance apply"
-        );
-        return Err(AppError::Internal(
-            "余额已发放，但返利状态回写失败；请重试发放以补齐状态".to_string(),
-        ));
-    }
-
     record_attempt(
         &state.pool,
         PayoutAttempt {
@@ -524,8 +383,8 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
             action: "pay",
             request_id: &input.request_id,
             admin: input.admin,
-            status: "paid",
-            http_status: 200,
+            status: "pending",
+            http_status: 202,
             message: "",
             occurred_at: input.now,
         },
@@ -533,9 +392,8 @@ pub async fn pay_rebate_record(state: &AppState, input: PayRecordInput<'_>) -> R
     .await;
 
     Ok(pay_result_from_payout(
-        "paid",
+        "pending",
         &payout,
-        Some(&mark),
         state.config.settlement_mode,
     ))
 }
@@ -602,11 +460,15 @@ async fn reserve_payout(
     let record = read_rebate_record(&mut tx, record_id, true, state.config.quota_per_unit).await?;
 
     match read_payout_by_record(&mut tx, record_id, false).await {
-        Ok(existing) if matches!(existing.status.as_str(), "completed" | "reversed") => {
+        Ok(existing) if existing.status == "completed" => {
             tx.commit().await?;
             return Ok(ReservePayoutResult::AlreadyPaid(existing));
         }
+        Ok(existing) if matches!(existing.status.as_str(), "reversed" | "reversal_pending") => {
+            return Err(PayoutError::PayoutNotCompleted);
+        }
         Ok(existing) => {
+            enqueue_credit_for_payout(&mut tx, &existing, now).await?;
             tx.commit().await?;
             return Ok(ReservePayoutResult::Reserved(existing));
         }
@@ -622,6 +484,7 @@ async fn reserve_payout(
     }
 
     let payout = insert_payout(&mut tx, &record, request_id, admin, now).await?;
+    enqueue_credit_for_payout(&mut tx, &payout, now).await?;
     tx.commit().await?;
     Ok(ReservePayoutResult::Reserved(payout))
 }
@@ -652,6 +515,7 @@ async fn reserve_reversal(
             return Ok(ReserveReversalResult::AlreadyReversed(reversal));
         }
         Ok(reversal) => {
+            enqueue_reversal_for_payout(&mut tx, &payout, &reversal, now).await?;
             tx.commit().await?;
             return Ok(ReserveReversalResult::Reserved { payout, reversal });
         }
@@ -660,8 +524,68 @@ async fn reserve_reversal(
     }
 
     let reversal = insert_reversal(&mut tx, &payout, request_id, admin, now).await?;
+    enqueue_reversal_for_payout(&mut tx, &payout, &reversal, now).await?;
     tx.commit().await?;
     Ok(ReserveReversalResult::Reserved { payout, reversal })
+}
+
+async fn enqueue_credit_for_payout(
+    transaction: &mut Transaction<'_, Postgres>,
+    payout: &Payout,
+    now: i64,
+) -> PayoutResult<()> {
+    let operation = enqueue_operation(
+        transaction,
+        EnqueueOperation {
+            kind: OperationKind::Credit,
+            rebate_record_id: payout.rebate_record_id,
+            rebate_request_id: payout.rebate_request_id,
+            original_operation_ulid: None,
+            user_id: payout.inviter_user_id,
+            payout_id: payout.id,
+            delta_quota: payout.quota_delta,
+            now,
+        },
+    )
+    .await?;
+    tracing::debug!(
+        operation_id = %operation.operation_ulid,
+        operation_state = %operation.operation_state,
+        "Payout balance operation queued"
+    );
+    Ok(())
+}
+
+async fn enqueue_reversal_for_payout(
+    transaction: &mut Transaction<'_, Postgres>,
+    payout: &Payout,
+    reversal: &Payout,
+    now: i64,
+) -> PayoutResult<()> {
+    let original_operation_ulid =
+        original_credit_operation_ulid(transaction, payout.rebate_record_id)
+            .await?
+            .ok_or(PayoutError::HistoricalComplete)?;
+    let operation = enqueue_operation(
+        transaction,
+        EnqueueOperation {
+            kind: OperationKind::Reversal,
+            rebate_record_id: payout.rebate_record_id,
+            rebate_request_id: payout.rebate_request_id,
+            original_operation_ulid: Some(original_operation_ulid),
+            user_id: payout.inviter_user_id,
+            payout_id: reversal.id,
+            delta_quota: reversal.quota_delta,
+            now,
+        },
+    )
+    .await?;
+    tracing::debug!(
+        operation_id = %operation.operation_ulid,
+        operation_state = %operation.operation_state,
+        "Reversal balance operation queued"
+    );
+    Ok(())
 }
 
 async fn read_rebate_record(
@@ -868,395 +792,6 @@ fn payout_from_row(row: &PgRow) -> PayoutResult<Payout> {
     })
 }
 
-async fn apply_newapi_payout(
-    newapi_pool: &PgPool,
-    payout: &Payout,
-    now: i64,
-) -> PayoutResult<NewApiBalanceMark> {
-    let mut tx = newapi_pool.begin().await?;
-    let inserted_mark_id: Option<i64> = sqlx::query_scalar(
-        r#"
-        INSERT INTO kkai_invitation_rebate_balance_marks
-            (kind, rebate_record_id, payout_id, user_id, quota_delta, amount_cents, request_id, created_at)
-        VALUES ('payout', $1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT DO NOTHING
-        RETURNING id
-        "#,
-    )
-    .bind(payout.rebate_record_id)
-    .bind(payout.id)
-    .bind(payout.inviter_user_id)
-    .bind(payout.quota_delta)
-    .bind(payout.amount_cents)
-    .bind(&payout.request_id)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(mark_id) = inserted_mark_id else {
-        let mark = read_newapi_mark(&mut tx, "payout", Some(payout.rebate_record_id), None).await?;
-        tx.commit().await?;
-        return Ok(mark);
-    };
-
-    let user = sqlx::query(
-        r#"
-        UPDATE users
-        SET quota = COALESCE(quota, 0) + $1
-        WHERE id = $2
-          AND deleted_at IS NULL
-        RETURNING quota, COALESCE(NULLIF(display_name, ''), NULLIF(username, ''), NULLIF(email, ''), '')
-        "#,
-    )
-    .bind(payout.quota_delta)
-    .bind(payout.inviter_user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let balance: i64 = user.try_get("quota")?;
-    let username: String = user.try_get(1)?;
-
-    let content = format!(
-        "邀请返利发放 ¥{:.2}，返利记录ID {}",
-        payout.amount_cents as f64 / 100.0,
-        payout.rebate_record_id
-    );
-    let log_id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO logs(user_id, created_at, type, content, username, quota, request_id, other)
-        VALUES ($1, $2, 1, $3, $4, 0, LEFT($5::TEXT, 64), $6)
-        RETURNING id
-        "#,
-    )
-    .bind(payout.inviter_user_id)
-    .bind(now)
-    .bind(content)
-    .bind(username)
-    .bind(&payout.request_id)
-    .bind(payout_log_other("payout", payout))
-    .fetch_one(&mut *tx)
-    .await?;
-
-    sqlx::query("UPDATE kkai_invitation_rebate_balance_marks SET log_id = $2 WHERE id = $1")
-        .bind(mark_id)
-        .bind(log_id)
-        .execute(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
-    Ok(NewApiBalanceMark {
-        id: mark_id,
-        log_id: Some(log_id),
-        balance,
-    })
-}
-
-async fn apply_newapi_reversal(
-    newapi_pool: &PgPool,
-    reversal: &Payout,
-    payout: &Payout,
-    now: i64,
-) -> PayoutResult<NewApiBalanceMark> {
-    let mut tx = newapi_pool.begin().await?;
-    let inserted_mark_id: Option<i64> = sqlx::query_scalar(
-        r#"
-        INSERT INTO kkai_invitation_rebate_balance_marks
-            (kind, rebate_record_id, payout_id, original_payout_id, user_id, quota_delta, amount_cents, request_id, created_at)
-        VALUES ('reversal', $1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT DO NOTHING
-        RETURNING id
-        "#,
-    )
-    .bind(reversal.rebate_record_id)
-    .bind(reversal.id)
-    .bind(payout.id)
-    .bind(reversal.inviter_user_id)
-    .bind(reversal.quota_delta)
-    .bind(reversal.amount_cents)
-    .bind(&reversal.request_id)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(mark_id) = inserted_mark_id else {
-        let mark = read_newapi_mark(&mut tx, "reversal", None, Some(payout.id)).await?;
-        tx.commit().await?;
-        return Ok(mark);
-    };
-
-    let deduct_quota = -reversal.quota_delta;
-    let user = sqlx::query(
-        r#"
-        UPDATE users
-        SET quota = COALESCE(quota, 0) - $1
-        WHERE id = $2
-          AND deleted_at IS NULL
-          AND COALESCE(quota, 0) >= $1
-        RETURNING quota, COALESCE(NULLIF(display_name, ''), NULLIF(username, ''), NULLIF(email, ''), '')
-        "#,
-    )
-    .bind(deduct_quota)
-    .bind(reversal.inviter_user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(user) = user else {
-        return Err(PayoutError::InsufficientQuota);
-    };
-    let balance: i64 = user.try_get("quota")?;
-    let username: String = user.try_get(1)?;
-
-    let content = format!(
-        "邀请返利冲正 -¥{:.2}，返利记录ID {}",
-        reversal.amount_cents as f64 / 100.0,
-        reversal.rebate_record_id
-    );
-    let log_id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO logs(user_id, created_at, type, content, username, quota, request_id, other)
-        VALUES ($1, $2, 1, $3, $4, 0, LEFT($5::TEXT, 64), $6)
-        RETURNING id
-        "#,
-    )
-    .bind(reversal.inviter_user_id)
-    .bind(now)
-    .bind(content)
-    .bind(username)
-    .bind(&reversal.request_id)
-    .bind(payout_log_other("reversal", reversal))
-    .fetch_one(&mut *tx)
-    .await?;
-
-    sqlx::query("UPDATE kkai_invitation_rebate_balance_marks SET log_id = $2 WHERE id = $1")
-        .bind(mark_id)
-        .bind(log_id)
-        .execute(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
-    Ok(NewApiBalanceMark {
-        id: mark_id,
-        log_id: Some(log_id),
-        balance,
-    })
-}
-
-async fn read_newapi_mark(
-    tx: &mut Transaction<'_, Postgres>,
-    kind: &str,
-    record_id: Option<i64>,
-    original_payout_id: Option<i64>,
-) -> PayoutResult<NewApiBalanceMark> {
-    let row = sqlx::query(
-        r#"
-        SELECT mark.id,
-               mark.log_id,
-               COALESCE(users.quota, 0) AS balance
-        FROM kkai_invitation_rebate_balance_marks mark
-        LEFT JOIN users ON users.id = mark.user_id
-        WHERE mark.kind = $1
-          AND (($2::BIGINT IS NOT NULL AND mark.rebate_record_id = $2)
-               OR ($3::BIGINT IS NOT NULL AND mark.original_payout_id = $3))
-        ORDER BY mark.id DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(kind)
-    .bind(record_id)
-    .bind(original_payout_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(PayoutError::NotFound)?;
-
-    Ok(NewApiBalanceMark {
-        id: row.try_get("id")?,
-        log_id: row.try_get("log_id")?,
-        balance: row.try_get("balance")?,
-    })
-}
-
-async fn complete_payout(
-    pool: &PgPool,
-    payout: &Payout,
-    mark: &NewApiBalanceMark,
-    now: i64,
-) -> PayoutResult<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = 'completed',
-            newapi_mark_id = $2,
-            newapi_log_id = $3,
-            updated_at = $4,
-            completed_at = COALESCE(completed_at, $4),
-            error_message = NULL
-        WHERE id = $1
-          AND kind = 'payout'
-        "#,
-    )
-    .bind(payout.id)
-    .bind(mark.id)
-    .bind(mark.log_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        UPDATE rebate_records
-        SET status = 'completed',
-            finalized_at = COALESCE(finalized_at, $2),
-            updated_at = $2
-        WHERE id = $1
-        "#,
-    )
-    .bind(payout.rebate_record_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    if let Some(request_id) = payout.rebate_request_id {
-        sqlx::query(
-            r#"
-            UPDATE rebate_requests request
-            SET status = 'completed',
-                completed_at = COALESCE(completed_at, $2),
-                updated_at = $2
-            WHERE request.id = $1
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM rebate_records record
-                  WHERE record.id = ANY(request.rebate_record_ids)
-                    AND record.status <> 'completed'
-              )
-            "#,
-        )
-        .bind(request_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn complete_reversal(
-    pool: &PgPool,
-    payout: &Payout,
-    reversal: &Payout,
-    mark: &NewApiBalanceMark,
-    now: i64,
-) -> PayoutResult<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = 'reversed',
-            reversed_at = COALESCE(reversed_at, $2),
-            updated_at = $2,
-            error_message = NULL
-        WHERE id = $1
-        "#,
-    )
-    .bind(payout.id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = 'completed',
-            newapi_mark_id = $2,
-            newapi_log_id = $3,
-            completed_at = COALESCE(completed_at, $4),
-            updated_at = $4,
-            error_message = NULL
-        WHERE id = $1
-        "#,
-    )
-    .bind(reversal.id)
-    .bind(mark.id)
-    .bind(mark.log_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        r#"
-        UPDATE rebate_records
-        SET status = 'approved',
-            finalized_at = NULL,
-            updated_at = $2
-        WHERE id = $1
-        "#,
-    )
-    .bind(payout.rebate_record_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn mark_payout_failed(pool: &PgPool, payout_id: i64, message: &str, now: i64) {
-    let _ = sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = CASE WHEN status = 'pending' THEN 'failed' ELSE status END,
-            error_message = LEFT($2::TEXT, 1000),
-            updated_at = $3
-        WHERE id = $1
-          AND status IN ('pending', 'failed')
-        "#,
-    )
-    .bind(payout_id)
-    .bind(message)
-    .bind(now)
-    .execute(pool)
-    .await;
-}
-
-async fn mark_reversal_pending(
-    pool: &PgPool,
-    payout_id: i64,
-    reversal_id: i64,
-    message: &str,
-    now: i64,
-) {
-    let _ = sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = 'reversal_pending',
-            error_message = LEFT($2::TEXT, 1000),
-            updated_at = $3
-        WHERE id = $1
-        "#,
-    )
-    .bind(payout_id)
-    .bind(message)
-    .bind(now)
-    .execute(pool)
-    .await;
-
-    let _ = sqlx::query(
-        r#"
-        UPDATE invitation_rebate_payouts
-        SET status = 'failed',
-            error_message = LEFT($2::TEXT, 1000),
-            updated_at = $3
-        WHERE id = $1
-        "#,
-    )
-    .bind(reversal_id)
-    .bind(message)
-    .bind(now)
-    .execute(pool)
-    .await;
-}
-
 async fn record_attempt(pool: &PgPool, attempt: PayoutAttempt<'_>) {
     let _ = sqlx::query(
         r#"
@@ -1354,12 +889,12 @@ fn pay_error_response(err: PayoutError) -> (&'static str, i32, AppError) {
             400,
             AppError::BadRequest(format!("返利金额无法按整分发放：{message}")),
         ),
-        PayoutError::Database(err) => ("pay_failed", 500, AppError::Database(err)),
-        other => (
-            "pay_failed",
-            500,
-            AppError::Internal(format!("返利发放失败：{other}")),
+        PayoutError::PayoutNotCompleted => (
+            "payout_not_payable",
+            409,
+            AppError::Conflict("该返利已进入冲正流程，不能再次发放".to_string()),
         ),
+        PayoutError::Database(err) => ("pay_failed", 500, AppError::Database(err)),
     }
 }
 
@@ -1418,7 +953,6 @@ fn app_error_message(error: &AppError) -> &str {
 fn pay_result_from_payout(
     outcome: &str,
     payout: &Payout,
-    mark: Option<&NewApiBalanceMark>,
     settlement_mode: SettlementMode,
 ) -> PayResult {
     PayResult {
@@ -1428,9 +962,9 @@ fn pay_result_from_payout(
         request_id: payout.request_id.clone(),
         amount_cents: payout.amount_cents,
         quota_delta: payout.quota_delta,
-        balance_after: mark.map(|mark| mark.balance),
-        newapi_log_id: mark.and_then(|mark| mark.log_id).or(payout.newapi_log_id),
-        newapi_mark_id: mark.map(|mark| mark.id).or(payout.newapi_mark_id),
+        balance_after: None,
+        newapi_log_id: payout.newapi_log_id,
+        newapi_mark_id: payout.newapi_mark_id,
         message: None,
         payout_enabled: settlement_mode.is_enabled(),
     }
@@ -1522,18 +1056,6 @@ pub fn request_id_from_headers(headers: &HeaderMap) -> Result<String> {
     Ok(format!("kkai-{}", ulid::Ulid::new()))
 }
 
-fn payout_log_other(kind: &str, payout: &Payout) -> String {
-    serde_json::json!({
-        "kind": kind,
-        "rebateRecordId": payout.rebate_record_id,
-        "rebateRequestId": payout.rebate_request_id.unwrap_or_default(),
-        "orderId": payout.order_id,
-        "orderType": payout.order_type,
-        "payoutId": payout.id,
-    })
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1608,10 +1130,12 @@ mod tests {
                 auto_sync_initial_delay_seconds: 0,
                 settlement_mode: mode,
                 quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
             },
             pool: pool.clone(),
             newapi_pool: pool.clone(),
-            newapi_write_pool: pool,
+            balance_client: None,
         };
         let probe = Arc::new(RouteExecutionProbe::default());
         let guard = axum::middleware::from_fn_with_state(state.clone(), enforce_settlement_mode);

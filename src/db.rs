@@ -1818,6 +1818,10 @@ mod tests {
     use sqlx::Executor;
 
     use super::*;
+    use crate::balance_dispatcher::{
+        claim_operation_ids_for_test, enqueue_operation, persist_applied_for_test,
+        EnqueueOperation, OperationKind,
+    };
 
     const LATEST_LEGACY_FIXTURE: &str = include_str!("../tests/fixtures/latest_legacy.sql");
     const NEWAPI_MARK_FIXTURE: &str = include_str!("../tests/fixtures/newapi_balance_marks.sql");
@@ -2013,6 +2017,253 @@ mod tests {
         .is_err());
 
         database.verify().await.unwrap();
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn concurrent_dispatchers_claim_each_outbox_row_once() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        for id in 1..=2_i64 {
+            sqlx::query(
+                r#"
+                INSERT INTO rebate_records(
+                    id, ulid, inviter_id, invitee_id, user_group, order_type, order_id,
+                    order_amount, order_time, rebate_effective_at, rebate_amount, status,
+                    scan_started_at, initialization_ends_at, created_at, updated_at
+                ) VALUES ($1, $2, 11, 12, 'test', 'topup', $3, 1, 1, 1, 5000,
+                          'approved', 1, 1, 1, 1)
+                "#,
+            )
+            .bind(id)
+            .bind(format!("01J000000000000000000000{:02}", id + 10))
+            .bind(1000 + id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            let payout_id: i64 = sqlx::query_scalar(
+                r#"
+                INSERT INTO invitation_rebate_payouts(
+                    rebate_record_id, inviter_user_id, invitee_user_id, order_id, order_type,
+                    amount_cents, quota_delta, kind, status, request_id, created_at, updated_at
+                ) VALUES ($1, 11, 12, $2, 'topup', 1, 5000, 'payout', 'pending', $3, 1, 1)
+                RETURNING id
+                "#,
+            )
+            .bind(id)
+            .bind(1000 + id)
+            .bind(format!("test-{id}"))
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            let operation_id: i64 = sqlx::query_scalar(
+                r#"
+                INSERT INTO balance_operations(
+                    operation_ulid, business_operation_key, operation_kind, rebate_record_id,
+                    user_id, delta_quota, idempotency_key, payload_sha256, operation_state,
+                    next_attempt_at, created_at, updated_at
+                ) VALUES ($1, $2, 'credit', $3, 11, 5000, $1, repeat('a', 64),
+                          'queued', 1, 1, 1)
+                RETURNING id
+                "#,
+            )
+            .bind(format!("01J000000000000000000001{:02}", id))
+            .bind(format!("test-credit-{payout_id}"))
+            .bind(id)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO balance_operation_outbox(operation_id, event_type, available_at, created_at) VALUES ($1, 'dispatch_balance_adjustment', 1, 1)",
+            )
+            .bind(operation_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        }
+
+        let (first, second) = tokio::join!(
+            claim_operation_ids_for_test(&database.pool, 2, 1),
+            claim_operation_ids_for_test(&database.pool, 2, 1),
+        );
+        let mut claimed = [first.unwrap(), second.unwrap()].concat();
+        claimed.sort();
+        claimed.dedup();
+        assert_eq!(claimed.len(), 2);
+        let attempts: Vec<i32> =
+            sqlx::query_scalar("SELECT attempt_count FROM balance_operation_outbox ORDER BY id")
+                .fetch_all(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, vec![1, 1]);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn enqueue_is_transactional_and_reuses_stable_operation_ulid() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        let payout_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO invitation_rebate_payouts(
+                rebate_record_id, rebate_request_id, inviter_user_id, invitee_user_id,
+                order_id, order_type, amount_cents, quota_delta, kind, status,
+                request_id, created_at, updated_at
+            ) VALUES (101, 201, 11, 12, 501, 'topup', 1000, 5000000, 'payout',
+                      'pending', 'enqueue-test', 1700000000, 1700000000)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let input = || EnqueueOperation {
+            kind: OperationKind::Credit,
+            rebate_record_id: 101,
+            rebate_request_id: Some(201),
+            original_operation_ulid: None,
+            user_id: 11,
+            payout_id,
+            delta_quota: 5_000_000,
+            now: 1_700_000_001,
+        };
+
+        let mut transaction = database.pool.begin().await.unwrap();
+        let rolled_back = enqueue_operation(&mut transaction, input()).await.unwrap();
+        transaction.rollback().await.unwrap();
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM balance_operations")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(operation_count, 0);
+
+        let mut transaction = database.pool.begin().await.unwrap();
+        let first = enqueue_operation(&mut transaction, input()).await.unwrap();
+        transaction.commit().await.unwrap();
+        assert_ne!(first.operation_ulid, rolled_back.operation_ulid);
+        let mut transaction = database.pool.begin().await.unwrap();
+        let replay = enqueue_operation(&mut transaction, input()).await.unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(replay.operation_ulid, first.operation_ulid);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM balance_operations), (SELECT COUNT(*) FROM balance_operation_outbox)",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1));
+        let settlement: (String, String) = sqlx::query_as(
+            "SELECT settlement_state, last_operation_ulid::TEXT FROM rebate_record_settlements WHERE rebate_record_id = 101",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            settlement,
+            ("payout_pending".to_string(), first.operation_ulid)
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn successful_dispatch_atomically_completes_local_settlement_state() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        let payout_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO invitation_rebate_payouts(
+                rebate_record_id, rebate_request_id, inviter_user_id, invitee_user_id,
+                order_id, order_type, amount_cents, quota_delta, kind, status,
+                request_id, created_at, updated_at
+            ) VALUES (101, 201, 11, 12, 501, 'topup', 1000, 5000000, 'payout',
+                      'pending', 'dispatch-success-test', 1700000000, 1700000000)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let mut transaction = database.pool.begin().await.unwrap();
+        let operation = enqueue_operation(
+            &mut transaction,
+            EnqueueOperation {
+                kind: OperationKind::Credit,
+                rebate_record_id: 101,
+                rebate_request_id: Some(201),
+                original_operation_ulid: None,
+                user_id: 11,
+                payout_id,
+                delta_quota: 5_000_000,
+                now: 1_700_000_001,
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            claim_operation_ids_for_test(&database.pool, 1_700_000_002, 1)
+                .await
+                .unwrap(),
+            vec![operation.operation_ulid.clone()]
+        );
+        persist_applied_for_test(&database.pool, &operation.operation_ulid, 1_700_000_003)
+            .await
+            .unwrap();
+
+        let operation_state: (String, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT operation_state, balance_before, balance_after, completed_at FROM balance_operations WHERE operation_ulid = $1",
+        )
+        .bind(&operation.operation_ulid)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            operation_state,
+            (
+                "completed".to_string(),
+                Some(10_000_000),
+                Some(15_000_000),
+                Some(1_700_000_003)
+            )
+        );
+        let states: (String, String, String, String, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT payout.status, record.status, settlement.settlement_state,
+                   request.status, outbox.dispatched_at
+            FROM invitation_rebate_payouts payout
+            JOIN rebate_records record ON record.id = payout.rebate_record_id
+            JOIN rebate_record_settlements settlement ON settlement.rebate_record_id = record.id
+            JOIN rebate_requests request ON request.id = payout.rebate_request_id
+            JOIN balance_operations operation ON operation.rebate_record_id = record.id
+            JOIN balance_operation_outbox outbox ON outbox.operation_id = operation.id
+            WHERE payout.id = $1
+            "#,
+        )
+        .bind(payout_id)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            (
+                "completed".to_string(),
+                "completed".to_string(),
+                "paid".to_string(),
+                "completed".to_string(),
+                Some(1_700_000_003),
+            )
+        );
         database.cleanup().await;
     }
 

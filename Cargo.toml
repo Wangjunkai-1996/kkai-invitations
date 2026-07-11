@@ -23,3 +23,4 @@ hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
 ulid = "1.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

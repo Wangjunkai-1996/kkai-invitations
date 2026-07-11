@@ -66,6 +66,16 @@ DATABASE_URL=postgresql://user:password@localhost/invitations
 # new-api 数据库（只读，用于同步订单）
 NEWAPI_DATABASE_URL=postgresql://user:password@localhost/newapi
 
+# 仅在 SETTLEMENT_MODE=enabled 时必填；用于调用 new-api 内部幂等余额接口
+NEWAPI_BASE_URL=http://127.0.0.1:3000
+INVITATIONS_INTERNAL_SECRET=replace-with-a-long-random-secret
+
+# 结算模式默认为 disabled；enabled 会启动 outbox dispatcher
+SETTLEMENT_MODE=disabled
+BALANCE_API_CONNECT_TIMEOUT_MILLISECONDS=2000
+BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS=10000
+BALANCE_DISPATCH_INTERVAL_MILLISECONDS=1000
+
 # 监听地址
 LISTEN_ADDR=0.0.0.0:6212
 

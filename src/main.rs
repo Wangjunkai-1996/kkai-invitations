@@ -1,3 +1,4 @@
+mod balance_dispatcher;
 mod config;
 mod db;
 mod error;
@@ -28,7 +29,7 @@ pub struct AppState {
     pub config: Config,
     pub pool: PgPool,
     pub newapi_pool: PgPool,
-    pub newapi_write_pool: PgPool,
+    pub balance_client: Option<reqwest::Client>,
 }
 
 #[tokio::main]
@@ -96,7 +97,12 @@ async fn main() {
             panic!("invitations database is not ready: {error}");
         }
     };
-    let newapi_write_pool = newapi_pool.clone();
+    let balance_client = config
+        .balance_api
+        .as_ref()
+        .map(balance_dispatcher::build_http_client)
+        .transpose()
+        .expect("failed to build NewAPI balance HTTP client");
     tracing::info!(settlement_mode = ?config.settlement_mode, "Settlement mode configured");
     let listen_addr = config.listen_addr.clone();
     let base_path = config.base_path.clone();
@@ -105,9 +111,10 @@ async fn main() {
         config,
         pool,
         newapi_pool,
-        newapi_write_pool,
+        balance_client,
     };
     sync_scheduler::spawn_rebate_sync_scheduler(state.clone());
+    balance_dispatcher::spawn_balance_dispatcher(state.clone());
 
     let b = &base_path;
     let mut app = Router::new()
