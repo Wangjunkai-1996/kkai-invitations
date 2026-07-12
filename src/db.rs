@@ -490,27 +490,27 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_invitation_rebate_payouts_kind",
         table: "invitation_rebate_payouts",
-        definition_md5: "22cc0e52a6d8cfeef0bc543b79ef005c",
+        definition_md5: "018552a8cff4d559b5968de2634686e1",
     },
     CheckSpec {
         name: "ck_invitation_rebate_payouts_status",
         table: "invitation_rebate_payouts",
-        definition_md5: "24892e3a20ec7d78cad00d2b36e9d537",
+        definition_md5: "e309b67674db46ef902a1b43691f7317",
     },
     CheckSpec {
         name: "ck_invitation_rebate_payouts_kind_status_original",
         table: "invitation_rebate_payouts",
-        definition_md5: "16f7edeb150cd90d95802c69c9e215e6",
+        definition_md5: "63aa74dbc1dda7eb384b279e6cf6f145",
     },
     CheckSpec {
         name: "ck_balance_operations_kind",
         table: "balance_operations",
-        definition_md5: "5cb137469d1f3b09af93da532af5a393",
+        definition_md5: "9839599a1d1c520684bf9333405b27f7",
     },
     CheckSpec {
         name: "ck_balance_operations_state",
         table: "balance_operations",
-        definition_md5: "8cb55a86cb4953c2c98902beaa34b9d9",
+        definition_md5: "0e9e3630efad4bc7dbccaaa61dfd027e",
     },
     CheckSpec {
         name: "ck_balance_operations_delta_nonzero",
@@ -540,7 +540,7 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_rebate_request_items_membership_state",
         table: "rebate_request_items",
-        definition_md5: "0067984024457714135c3c710b2653c9",
+        definition_md5: "419396e994ae87e5fbc0f938697025a7",
     },
     CheckSpec {
         name: "ck_rebate_request_items_amount_nonnegative",
@@ -555,7 +555,7 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_rebate_request_ownership_state",
         table: "rebate_record_request_ownership",
-        definition_md5: "be7eb51a5e5f7972313ec2a55e854f3b",
+        definition_md5: "2aa48dd95b5f047aa482cf984252a8eb",
     },
     CheckSpec {
         name: "ck_rebate_request_ownership_state_consistency",
@@ -565,7 +565,7 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_rebate_record_settlements_state",
         table: "rebate_record_settlements",
-        definition_md5: "4238e100522ee179442d860cbcd82b95",
+        definition_md5: "c713d471b64337da6a5219415c0aacc7",
     },
     CheckSpec {
         name: "ck_rebate_record_settlements_version",
@@ -625,7 +625,7 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_rebate_reconciliation_case_state",
         table: "rebate_reconciliation_cases",
-        definition_md5: "19e8df2ec6da3d22e8602127dd0d2e52",
+        definition_md5: "03eb71123f220122096f58298c9f3b66",
     },
     CheckSpec {
         name: "ck_rebate_sync_checkpoints_cursor_time",
@@ -645,7 +645,7 @@ const CRITICAL_CHECKS: &[CheckSpec] = &[
     CheckSpec {
         name: "ck_rebate_background_jobs_state",
         table: "rebate_background_jobs",
-        definition_md5: "ab468d08bc9cab14b20196f65c383832",
+        definition_md5: "3246b4460d802abd827d81a67c7120b7",
     },
     CheckSpec {
         name: "ck_rebate_background_jobs_cursor_time",
