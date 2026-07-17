@@ -7,7 +7,9 @@ mod middleware;
 mod payout;
 mod preflight;
 mod rebate_lifecycle;
+mod rebate_source_events;
 mod rebate_types;
+mod reconciliation_cli;
 mod response;
 mod routes;
 mod session;
@@ -36,11 +38,36 @@ pub struct AppState {
 async fn main() {
     dotenvy::dotenv().ok();
 
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("reconcile") {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+        match reconciliation_cli::run(&args[2..]).await {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": error.code(),
+                            "message": error.to_string(),
+                        }
+                    })
+                );
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    if std::env::args().nth(1).as_deref() == Some("--preflight") {
+    if args.get(1).map(String::as_str) == Some("--preflight") {
         let database_url = match config::invitations_database_url_from_env() {
             Ok(value) => value,
             Err(_) => exit_preflight_error(
@@ -114,6 +141,7 @@ async fn main() {
         balance_client,
     };
     sync_scheduler::spawn_rebate_sync_scheduler(state.clone());
+    sync_scheduler::spawn_topup_reconciliation_scheduler(state.clone());
     balance_dispatcher::spawn_balance_dispatcher(state.clone());
 
     let b = &base_path;
@@ -281,6 +309,10 @@ async fn main() {
             get(routes::admin::get_user_rebates),
         )
         // 系统 API
+        .route(
+            &format!("{b}/api/internal/rebate-source-events"),
+            post(rebate_source_events::receive_rebate_source_event),
+        )
         .route(
             &format!("{b}/api/system/sync-rebates"),
             post(routes::system::sync_rebates),

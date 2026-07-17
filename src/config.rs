@@ -4,6 +4,8 @@ use crate::rebate_types::DEFAULT_QUOTA_UNITS_PER_YUAN;
 
 pub const DEFAULT_AUTO_SYNC_INTERVAL_SECONDS: u64 = 60 * 60;
 pub const DEFAULT_AUTO_SYNC_INITIAL_DELAY_SECONDS: u64 = 10;
+pub const DEFAULT_TOPUP_RECONCILIATION_INTERVAL_SECONDS: u64 = 5 * 60;
+pub const DEFAULT_TOPUP_RECONCILIATION_INITIAL_DELAY_SECONDS: u64 = 30;
 pub const DEFAULT_BALANCE_DISPATCH_INTERVAL_MILLISECONDS: u64 = 1_000;
 pub const DEFAULT_BALANCE_API_CONNECT_TIMEOUT_MILLISECONDS: u64 = 2_000;
 pub const DEFAULT_BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS: u64 = 10_000;
@@ -29,9 +31,12 @@ pub struct Config {
     pub database_url: String,
     pub newapi_database_url: String,
     pub session_secret: String,
+    pub rebate_event_ingest_secret: String,
     pub sync_secret: Option<String>,
     pub auto_sync_interval_seconds: u64,
     pub auto_sync_initial_delay_seconds: u64,
+    pub topup_reconciliation_interval_seconds: u64,
+    pub topup_reconciliation_initial_delay_seconds: u64,
     pub settlement_mode: SettlementMode,
     pub quota_per_unit: i64,
     pub balance_api: Option<BalanceApiConfig>,
@@ -48,13 +53,14 @@ pub struct BalanceApiConfig {
 
 impl Config {
     pub fn from_env() -> std::result::Result<Self, String> {
-        let settlement_mode = settlement_mode_env()?;
+        let settlement_mode = settlement_mode_from_env()?;
         Ok(Self {
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:6212".to_string()),
             base_path: env::var("BASE_PATH").unwrap_or_else(|_| "".to_string()),
             database_url: invitations_database_url_from_env()?,
             newapi_database_url: newapi_database_url_from_env()?,
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),
+            rebate_event_ingest_secret: required_secret_env("REBATE_EVENT_INGEST_SECRET")?,
             sync_secret: env::var("SYNC_SECRET")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -66,6 +72,14 @@ impl Config {
             auto_sync_initial_delay_seconds: optional_u64_env(
                 "AUTO_SYNC_INITIAL_DELAY_SECONDS",
                 DEFAULT_AUTO_SYNC_INITIAL_DELAY_SECONDS,
+            ),
+            topup_reconciliation_interval_seconds: optional_u64_env(
+                "TOPUP_RECONCILIATION_INTERVAL_SECONDS",
+                DEFAULT_TOPUP_RECONCILIATION_INTERVAL_SECONDS,
+            ),
+            topup_reconciliation_initial_delay_seconds: optional_u64_env(
+                "TOPUP_RECONCILIATION_INITIAL_DELAY_SECONDS",
+                DEFAULT_TOPUP_RECONCILIATION_INITIAL_DELAY_SECONDS,
             ),
             settlement_mode,
             quota_per_unit: quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN),
@@ -93,6 +107,10 @@ pub fn newapi_database_url_from_env() -> std::result::Result<String, String> {
         .ok_or_else(|| "NEWAPI_DATABASE_URL must be set".to_string())
 }
 
+pub fn quota_per_unit_from_env() -> i64 {
+    quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN)
+}
+
 fn database_url_env_value(
     database_url: Option<&str>,
     legacy_database_url: Option<&str>,
@@ -108,10 +126,16 @@ fn database_url_env_value(
         .map(ToOwned::to_owned)
 }
 
-fn settlement_mode_env() -> std::result::Result<SettlementMode, String> {
+pub(crate) fn settlement_mode_from_env() -> std::result::Result<SettlementMode, String> {
     let settlement_mode = env::var("SETTLEMENT_MODE").ok();
     let legacy_payout_enabled = env::var("PAYOUT_ENABLED").ok();
     settlement_mode_env_value(settlement_mode.as_deref(), legacy_payout_enabled.as_deref())
+}
+
+pub(crate) fn settlement_mode_from_value(
+    settlement_mode: Option<&str>,
+) -> std::result::Result<SettlementMode, String> {
+    settlement_mode_env_value(settlement_mode, None)
 }
 
 fn settlement_mode_env_value(
@@ -221,6 +245,20 @@ fn optional_trimmed_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_secret_env(name: &str) -> std::result::Result<String, String> {
+    let raw = env::var(name).map_err(|_| format!("{name} must be set"))?;
+    validate_secret_value(name, &raw)
+}
+
+fn validate_secret_value(name: &str, raw: &str) -> std::result::Result<String, String> {
+    if raw.len() < 32 || raw.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{name} must be at least 32 characters with no whitespace"
+        ));
+    }
+    Ok(raw.to_string())
 }
 
 fn quota_per_unit_env(name: &str, default_value: i64) -> i64 {
@@ -362,6 +400,24 @@ mod tests {
             Some("short-secret"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn rebate_event_ingest_secret_requires_dedicated_production_strength_value() {
+        assert!(validate_secret_value("REBATE_EVENT_INGEST_SECRET", "short").is_err());
+        assert!(validate_secret_value(
+            "REBATE_EVENT_INGEST_SECRET",
+            " 0123456789abcdef0123456789abcdef "
+        )
+        .is_err());
+        assert_eq!(
+            validate_secret_value(
+                "REBATE_EVENT_INGEST_SECRET",
+                "0123456789abcdef0123456789abcdef"
+            )
+            .unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]

@@ -9,13 +9,14 @@ use thiserror::Error;
 use crate::preflight::{self, PreflightMode, PreflightReport};
 
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
-const EXPECTED_MIGRATIONS: [i64; 6] = [
+const EXPECTED_MIGRATIONS: [i64; 7] = [
     202607110001,
     202607110002,
     202607110003,
     202607110004,
     202607110005,
     202607110006,
+    202607170001,
 ];
 #[derive(Clone, Copy)]
 struct IndexSpec {
@@ -47,6 +48,27 @@ const CRITICAL_INDEXES: &[IndexSpec] = &[
         columns: &["order_type", "order_id"],
         predicate: None,
         unique: true,
+    },
+    IndexSpec {
+        name: "uq_rebate_records_canonical_event_key",
+        table: "rebate_records",
+        columns: &["canonical_event_key"],
+        predicate: Some("canonical_event_key IS NOT NULL"),
+        unique: true,
+    },
+    IndexSpec {
+        name: "uq_rebate_source_event_receipts_event_key",
+        table: "rebate_source_event_receipts",
+        columns: &["event_key"],
+        predicate: None,
+        unique: true,
+    },
+    IndexSpec {
+        name: "idx_rebate_source_event_receipts_received",
+        table: "rebate_source_event_receipts",
+        columns: &["received_at", "id"],
+        predicate: None,
+        unique: false,
     },
     IndexSpec {
         name: "idx_rebate_records_ulid",
@@ -294,6 +316,13 @@ const CRITICAL_INDEXES: &[IndexSpec] = &[
         unique: false,
     },
     IndexSpec {
+        name: "idx_rebate_reconciliation_cases_source_order",
+        table: "rebate_reconciliation_cases",
+        columns: &["case_state", "source_order_id"],
+        predicate: Some("source_event_key IS NOT NULL"),
+        unique: false,
+    },
+    IndexSpec {
         name: "idx_rebate_background_jobs_runnable",
         table: "rebate_background_jobs",
         columns: &["job_state", "run_after", "id"],
@@ -320,6 +349,12 @@ const CRITICAL_KEY_CONSTRAINTS: &[KeyConstraintSpec] = &[
     KeyConstraintSpec {
         name: "rebate_records_pkey",
         table: "rebate_records",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "rebate_source_event_receipts_pkey",
+        table: "rebate_source_event_receipts",
         constraint_type: 'p',
         columns: &["id"],
     },
@@ -477,6 +512,11 @@ struct CheckSpec {
 }
 
 const CRITICAL_CHECKS: &[CheckSpec] = &[
+    CheckSpec {
+        name: "ck_rebate_source_event_receipts_outcome",
+        table: "rebate_source_event_receipts",
+        definition_md5: "0a8fea3694b03a83540fe2437e0e219c",
+    },
     CheckSpec {
         name: "ck_invitation_rebate_payouts_amount_nonnegative",
         table: "invitation_rebate_payouts",
@@ -684,6 +724,22 @@ const CRITICAL_FOREIGN_KEYS: &[ForeignKeySpec] = &[
         delete_action: 'r',
     },
     ForeignKeySpec {
+        name: "fk_rebate_records_superseded_by",
+        table: "rebate_records",
+        columns: &["superseded_by_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_rebate_source_event_receipts_record",
+        table: "rebate_source_event_receipts",
+        columns: &["rebate_record_id"],
+        referenced_table: "rebate_records",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
         name: "fk_invitation_rebate_payouts_request",
         table: "invitation_rebate_payouts",
         columns: &["rebate_request_id"],
@@ -856,6 +912,14 @@ struct TriggerSpec {
 }
 
 const CRITICAL_TRIGGERS: &[TriggerSpec] = &[
+    TriggerSpec {
+        name: "trg_rebate_record_supersession_guard",
+        table: "rebate_records",
+        trigger_type: 23,
+        update_columns: &["status", "superseded_by_record_id"],
+        function: "enforce_rebate_record_supersession",
+        source_md5: "34c6359091448d33fdee333bb23172bf",
+    },
     TriggerSpec {
         name: "trg_10_rebate_request_items",
         table: "rebate_requests",
@@ -1097,6 +1161,15 @@ static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
             MigrationType::Simple,
             Cow::Borrowed(include_str!(
                 "../migrations/202607110006_dispatcher_leases_and_responses.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202607170001,
+            Cow::Borrowed("canonical rebate source events"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202607170001_canonical_rebate_source_events.sql"
             )),
             false,
         ),
@@ -1478,7 +1551,7 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
         if table_name != expected.table
             || constraint_type != "c"
             || !is_valid
-            || definition_md5 != expected.definition_md5
+            || !is_supported_check_definition(expected, &definition_md5)
         {
             return Err(DatabaseStartupError::Verification(format!(
                 "critical check definition drifted: {} (actual md5 {definition_md5})",
@@ -1515,6 +1588,34 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
             }
         }
     }
+    verify_column_shapes(
+        connection,
+        "rebate_records",
+        &[
+            ("canonical_event_key", "varchar", true),
+            ("source_payload_sha256", "bpchar", true),
+            ("source_schema_version", "int4", true),
+            ("order_amount_cents", "int8", true),
+            ("credited_quota", "int8", true),
+            ("superseded_by_record_id", "int8", true),
+        ],
+    )
+    .await?;
+    verify_column_shapes(
+        connection,
+        "rebate_calculation_snapshots",
+        &[("credited_quota", "int8", true)],
+    )
+    .await?;
+    verify_column_shapes(
+        connection,
+        "rebate_reconciliation_cases",
+        &[
+            ("source_event_key", "varchar", true),
+            ("source_order_id", "int8", true),
+        ],
+    )
+    .await?;
     verify_column_shapes(
         connection,
         "balance_operations",
@@ -1559,6 +1660,46 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
     }
 
     Ok(())
+}
+
+fn is_supported_check_definition(expected: &CheckSpec, actual_md5: &str) -> bool {
+    if actual_md5 == expected.definition_md5 {
+        return true;
+    }
+    matches!(
+        (expected.name, actual_md5),
+        (
+            "ck_invitation_rebate_payouts_kind",
+            "22cc0e52a6d8cfeef0bc543b79ef005c"
+        ) | (
+            "ck_invitation_rebate_payouts_status",
+            "24892e3a20ec7d78cad00d2b36e9d537"
+        ) | (
+            "ck_invitation_rebate_payouts_kind_status_original",
+            "16f7edeb150cd90d95802c69c9e215e6"
+        ) | (
+            "ck_balance_operations_kind",
+            "5cb137469d1f3b09af93da532af5a393"
+        ) | (
+            "ck_balance_operations_state",
+            "8cb55a86cb4953c2c98902beaa34b9d9"
+        ) | (
+            "ck_rebate_request_items_membership_state",
+            "0067984024457714135c3c710b2653c9"
+        ) | (
+            "ck_rebate_request_ownership_state",
+            "be7eb51a5e5f7972313ec2a55e854f3b"
+        ) | (
+            "ck_rebate_record_settlements_state",
+            "4238e100522ee179442d860cbcd82b95"
+        ) | (
+            "ck_rebate_reconciliation_case_state",
+            "19e8df2ec6da3d22e8602127dd0d2e52"
+        ) | (
+            "ck_rebate_background_jobs_state",
+            "ab468d08bc9cab14b20196f65c383832"
+        )
+    )
 }
 
 async fn verify_column_shapes(
@@ -1816,15 +1957,51 @@ mod tests {
 
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Executor;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::balance_dispatcher::{
         claim_operation_ids_for_test, enqueue_operation, mark_needs_review_for_test,
         persist_applied_for_test, EnqueueOperation, OperationKind,
     };
+    use crate::config::{Config, SettlementMode};
+    use crate::middleware::AdminUser;
+    use crate::rebate_lifecycle::{finalize_ready_topup_event_records, INITIALIZATION_SECONDS};
+    use crate::rebate_source_events::{
+        ingest_rebate_source_event, receive_rebate_source_event, IngestError, IngestOutcome,
+        RebateSourceEvent,
+    };
+    use crate::reconciliation_cli::{apply_for_test, plan, verify_for_test};
+    use crate::routes::admin::{
+        fetch_local_rebate_record_id_for_test, update_rebate_order_records,
+        UpdateRebateOrderRecordsRequest,
+    };
+    use crate::routes::system::run_topup_reconciliation;
+    use crate::session::SessionUser;
+    use crate::AppState;
 
     const LATEST_LEGACY_FIXTURE: &str = include_str!("../tests/fixtures/latest_legacy.sql");
     const NEWAPI_MARK_FIXTURE: &str = include_str!("../tests/fixtures/newapi_balance_marks.sql");
+
+    #[test]
+    fn check_verifier_accepts_known_equivalent_postgres_catalog_renderings() {
+        let expected = CRITICAL_CHECKS
+            .iter()
+            .find(|check| check.name == "ck_invitation_rebate_payouts_kind")
+            .unwrap();
+        assert!(is_supported_check_definition(
+            expected,
+            expected.definition_md5
+        ));
+        assert!(is_supported_check_definition(
+            expected,
+            "22cc0e52a6d8cfeef0bc543b79ef005c"
+        ));
+        assert!(!is_supported_check_definition(
+            expected,
+            "00000000000000000000000000000000"
+        ));
+    }
 
     struct TestDatabase {
         admin_pool: PgPool,
@@ -1937,6 +2114,84 @@ mod tests {
         }
     }
 
+    fn migrator_through_v6() -> Migrator {
+        Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 202607110006)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        }
+    }
+
+    async fn seed_legacy_redemption_history(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            )
+            SELECT 11, 10000 + redemption_id, 'default', 'topup', -redemption_id,
+                   10.00, 1700000000 + redemption_id, 1700600000 + redemption_id,
+                   250000, 0.0500, 'pending', 1700000000, 1700172800,
+                   1700000000, 1700000000
+            FROM generate_series(4000, 4639) AS redemption_id
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for redemption_id in [4432_i64, 4494, 4865] {
+            if redemption_id == 4865 {
+                sqlx::query(
+                    r#"
+                    INSERT INTO rebate_records (
+                        inviter_id, invitee_id, user_group, order_type, order_id,
+                        order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                        status, scan_started_at, initialization_ends_at, created_at, updated_at
+                    ) VALUES (
+                        11, $1, 'default', 'topup', $2, 10.00, $3, $4,
+                        250000, 0.0500, 'pending', 1700000000, 1700172800,
+                        1700000000, 1700000000
+                    )
+                    "#,
+                )
+                .bind(10000 + redemption_id)
+                .bind(-redemption_id)
+                .bind(1700000000 + redemption_id)
+                .bind(1700600000 + redemption_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO rebate_records (
+                    inviter_id, invitee_id, user_group, order_type, order_id,
+                    order_amount, order_time, rebate_effective_at, rebate_amount,
+                    status, scan_started_at, initialization_ends_at, created_at, updated_at
+                ) VALUES (
+                    11, $1, 'default', 'redemption', $2, 10.00, $3, $4, 0,
+                    'initializing', 1700000100, 1700172900, 1700000100, 1700000100
+                )
+                "#,
+            )
+            .bind(10000 + redemption_id)
+            .bind(redemption_id)
+            .bind(1700000000 + redemption_id)
+            .bind(1700600000 + redemption_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
     async fn empty_database_migrates_and_reruns_idempotently() {
@@ -1953,7 +2208,1513 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(migration_count, 6);
+        assert_eq!(migration_count, 7);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn canonical_event_migration_preserves_legacy_redemptions_and_supersedes_duplicates() {
+        let database = TestDatabase::create().await;
+        migrator_through_v6().run(&database.pool).await.unwrap();
+        seed_legacy_redemption_history(&database.pool).await;
+
+        database.prepare().await.unwrap();
+        database.verify().await.unwrap();
+
+        let canonical_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_records WHERE canonical_event_key LIKE 'newapi:redemption:%'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(canonical_count, 641);
+
+        let superseded: Vec<(i64, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT duplicate.order_id, duplicate.status, master.order_id
+            FROM rebate_records duplicate
+            JOIN rebate_records master ON master.id = duplicate.superseded_by_record_id
+            WHERE duplicate.order_type = 'redemption'
+            ORDER BY duplicate.order_id
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded,
+            vec![
+                (4432, "closed".to_string(), -4432),
+                (4494, "closed".to_string(), -4494),
+                (4865, "closed".to_string(), -4865),
+            ]
+        );
+
+        let resolved_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_reconciliation_cases WHERE issue_code = 'legacy_redemption_duplicate_superseded' AND case_state = 'resolved'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(resolved_cases, 3);
+
+        let master_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_records WHERE order_type = 'topup' AND order_id < 0",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(master_count, 641);
+
+        let superseded_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM rebate_records WHERE order_type = 'redemption' AND order_id = 4432",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let master_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:redemption:4432'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://test/invitations".to_string(),
+                newapi_database_url: "postgresql://test/newapi".to_string(),
+                session_secret: "test-session-secret".to_string(),
+                rebate_event_ingest_secret: "test-rebate-event-ingest-secret".to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                settlement_mode: SettlementMode::ReadOnly,
+                quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        assert_eq!(
+            fetch_local_rebate_record_id_for_test(&state, "redemption", 4432)
+                .await
+                .unwrap(),
+            Some(master_id)
+        );
+        let positive_legacy_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                11, 19000, 'default', 'redemption', 9000,
+                10.00, 1700009000, 1700609000, 0,
+                'initializing', 1700009000, 1700181800, 1700009000, 1700009000
+            )
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fetch_local_rebate_record_id_for_test(&state, "redemption", 9000)
+                .await
+                .unwrap(),
+            Some(positive_legacy_id)
+        );
+        assert!(
+            sqlx::query("UPDATE rebate_records SET status = 'pending' WHERE id = $1")
+                .bind(superseded_id)
+                .execute(&database.pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "UPDATE rebate_records SET superseded_by_record_id = NULL WHERE id = $1"
+        )
+        .bind(superseded_id)
+        .execute(&database.pool)
+        .await
+        .is_err());
+
+        database.prepare().await.unwrap();
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn canonical_event_migration_rejects_partial_legacy_redemption_history() {
+        let database = TestDatabase::create().await;
+        let migrator_v6 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 202607110006)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        migrator_v6.run(&database.pool).await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                11, 12, 'default', 'topup', -4000,
+                10.00, 1700000000, 1700600000, 250000, 0.0500,
+                'pending', 1700000000, 1700172800, 1700000000, 1700000000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let error = database.prepare().await.unwrap_err().to_string();
+        assert!(error.contains("legacy redemption master count"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn canonical_event_migration_rejects_nonzero_duplicate_economic_state() {
+        for drift in [
+            "admin_adjusted",
+            "rebate_amount",
+            "rebate_rate",
+            "request_ownership",
+            "settlement",
+            "calculation_snapshot",
+            "balance_operation",
+            "payout_attempt",
+        ] {
+            let database = TestDatabase::create().await;
+            migrator_through_v6().run(&database.pool).await.unwrap();
+            seed_legacy_redemption_history(&database.pool).await;
+            let duplicate_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM rebate_records WHERE order_type = 'redemption' AND order_id = 4432",
+            )
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+
+            match drift {
+                "admin_adjusted" => {
+                    sqlx::query("UPDATE rebate_records SET admin_adjusted = TRUE WHERE id = $1")
+                        .bind(duplicate_id)
+                        .execute(&database.pool)
+                        .await
+                        .unwrap();
+                }
+                "rebate_amount" => {
+                    sqlx::query("UPDATE rebate_records SET rebate_amount = 1 WHERE id = $1")
+                        .bind(duplicate_id)
+                        .execute(&database.pool)
+                        .await
+                        .unwrap();
+                }
+                "rebate_rate" => {
+                    sqlx::query("UPDATE rebate_records SET rebate_rate = 0.0500 WHERE id = $1")
+                        .bind(duplicate_id)
+                        .execute(&database.pool)
+                        .await
+                        .unwrap();
+                }
+                "request_ownership" => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO rebate_requests (
+                            user_id, rebate_record_ids, total_amount, status, created_at, updated_at
+                        ) VALUES (11, ARRAY[$1]::BIGINT[], 0, 'pending', 1, 1)
+                        "#,
+                    )
+                    .bind(duplicate_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+                }
+                "settlement" => {
+                    sqlx::query(
+                        r#"
+                        UPDATE rebate_record_settlements
+                        SET settlement_state = 'unsettled', state_version = 1
+                        WHERE rebate_record_id = $1
+                        "#,
+                    )
+                    .bind(duplicate_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+                }
+                "calculation_snapshot" => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO rebate_calculation_snapshots (
+                            rebate_record_id, inviter_group, rule_id, rule_type, rebate_rate,
+                            quota_per_unit, order_amount_minor, rebate_quota,
+                            source_revision, snapshotted_at
+                        ) VALUES ($1, 'default', NULL, 'redemption', 0, 500000, 1000, 0,
+                                  'test-drift', 1)
+                        "#,
+                    )
+                    .bind(duplicate_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+                }
+                "balance_operation" => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO balance_operations (
+                            operation_ulid, source, business_operation_key, operation_kind,
+                            rebate_record_id, user_id, delta_quota, idempotency_key,
+                            payload_sha256, operation_state, created_at, updated_at
+                        ) VALUES (
+                            '01J00000000000000000000099', 'test', 'test:duplicate:4432', 'credit',
+                            $1, 11, 1, 'test-duplicate-4432', repeat('a', 64), 'queued', 1, 1
+                        )
+                        "#,
+                    )
+                    .bind(duplicate_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+                }
+                "payout_attempt" => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO invitation_rebate_payout_attempts (
+                            rebate_record_id, action, request_id, status, http_status, created_at
+                        ) VALUES ($1, 'payout', 'test-duplicate-4432', 'failed', 500, 1)
+                        "#,
+                    )
+                    .bind(duplicate_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = MIGRATOR.run(&database.pool).await.unwrap_err().to_string();
+            assert!(
+                error.contains("legacy redemption duplicate"),
+                "unexpected migration result for {drift}: {error}"
+            );
+            database.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn rebate_source_event_ingest_is_transactional_idempotent_and_conflict_detecting() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('vip', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let event = RebateSourceEvent {
+            schema_version: 1,
+            event_key: "newapi:topup:842".to_string(),
+            event_type: "topup.completed".to_string(),
+            source_order_id: 842,
+            invitee_id: 3418,
+            inviter_id: Some(1001),
+            inviter_group: "vip".to_string(),
+            rebate_base_amount_cents: Some(7500),
+            credited_quota: None,
+            completed_at: 1_784_211_072,
+            payment_provider: "epay".to_string(),
+        };
+
+        let (first, concurrent_replay) = tokio::join!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000),
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000),
+        );
+        let outcomes = [first.unwrap(), concurrent_replay.unwrap()];
+        assert!(outcomes.contains(&IngestOutcome::Created));
+        assert!(outcomes.contains(&IngestOutcome::Replay));
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Replay
+        );
+
+        let record: (String, i64, i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT canonical_event_key, order_amount_cents, order_time,
+                   initialization_ends_at, rebate_amount, rebate_rate::TEXT
+            FROM rebate_records
+            WHERE canonical_event_key = 'newapi:topup:842'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(record.0, "newapi:topup:842");
+        assert_eq!(record.1, 7500);
+        assert_eq!(record.2, event.completed_at);
+        assert_eq!(record.3, event.completed_at + 48 * 60 * 60);
+        assert_eq!(record.4, 1_875_000);
+        assert_eq!(record.5, "0.0500");
+
+        let snapshot: (String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT inviter_group, order_amount_minor, rebate_quota
+            FROM rebate_calculation_snapshots
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'
+            )
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot, ("vip".to_string(), 7500, 1_875_000));
+
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                1001, 3419, 'vip', 'topup', 9999,
+                10.00, $1, $2, 250000, 0.0500,
+                'initializing', $1, $3, $1, $1
+            )
+            "#,
+        )
+        .bind(event.completed_at)
+        .bind(event.completed_at + 7 * 24 * 60 * 60)
+        .bind(event.completed_at + INITIALIZATION_SECONDS)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            finalize_ready_topup_event_records(
+                &database.pool,
+                event.completed_at + INITIALIZATION_SECONDS
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let lifecycle_status: String = sqlx::query_scalar(
+            "SELECT status FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle_status, "pending");
+        let legacy_status: String =
+            sqlx::query_scalar("SELECT status FROM rebate_records WHERE order_id = 9999")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy_status, "initializing");
+
+        sqlx::query("DELETE FROM rebate_source_event_receipts WHERE event_key = $1")
+            .bind(&event.event_key)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE rebate_rules SET rebate_rate = 0.9000 WHERE user_group = 'vip'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Replay
+        );
+
+        sqlx::query("DELETE FROM rebate_source_event_receipts WHERE event_key = $1")
+            .bind(&event.event_key)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = rebate_quota + 1
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000).await,
+            Err(IngestError::Conflict(_))
+        ));
+        let missing_receipt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_source_event_receipts WHERE event_key = $1",
+        )
+        .bind(&event.event_key)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(missing_receipt, 0);
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = 1875000
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Replay
+        );
+
+        let mut conflicting = event.clone();
+        conflicting.rebate_base_amount_cents = Some(7600);
+        assert!(matches!(
+            ingest_rebate_source_event(&database.pool, conflicting, 500_000).await,
+            Err(IngestError::Conflict(_))
+        ));
+
+        let mut invalid_rule_event = event;
+        invalid_rule_event.source_order_id = 843;
+        invalid_rule_event.event_key = "newapi:topup:843".to_string();
+        sqlx::query("UPDATE rebate_rules SET rebate_rate = 1.5000 WHERE user_group = 'vip'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ingest_rebate_source_event(&database.pool, invalid_rule_event, 500_000).await,
+            Err(IngestError::Invalid(_))
+        ));
+        let rolled_back: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_records WHERE canonical_event_key = 'newapi:topup:843'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(rolled_back, 0);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn online_ingest_reuses_only_unadjusted_matching_initializing_records() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('vip', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, finalized_at,
+                admin_adjusted, closed_at, created_at, updated_at,
+                order_amount_cents, credited_quota
+            ) VALUES
+                (1001, 3418, 'vip', 'topup', 850, 75.00, 1784211072, 1784815872,
+                 1875000, 0.0500, 'initializing', 1784211072, 1784383872, NULL,
+                 FALSE, NULL, 1784211072, 1784211072, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 851, 75.00, 1784211072, 1784815872,
+                 1875000, 0.0500, 'initializing', 1784211072, 1784383872, NULL,
+                 TRUE, NULL, 1784211072, 1784211072, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 852, 75.00, 1784211072, 1784815872,
+                 1875000, 0.0500, 'pending', 1784211072, 1784383872, 1784383872,
+                 FALSE, NULL, 1784211072, 1784211072, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 853, 75.00, 1784211072, 1784815872,
+                 1875000, 0.0500, 'closed', 1784211072, 1784383872, NULL,
+                 FALSE, 1784212000, 1784211072, 1784211072, 7500, 37500000)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let event = |source_order_id| RebateSourceEvent {
+            schema_version: 1,
+            event_key: format!("newapi:topup:{source_order_id}"),
+            event_type: "topup.completed".to_string(),
+            source_order_id,
+            invitee_id: 3418,
+            inviter_id: Some(1001),
+            inviter_group: "vip".to_string(),
+            rebate_base_amount_cents: Some(7500),
+            credited_quota: None,
+            completed_at: 1_784_211_072,
+            payment_provider: "epay".to_string(),
+        };
+
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event(850), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Created
+        );
+        for source_order_id in [851_i64, 852, 853] {
+            assert!(matches!(
+                ingest_rebate_source_event(&database.pool, event(source_order_id), 500_000).await,
+                Err(IngestError::Conflict(_))
+            ));
+        }
+
+        let attached: Vec<(i64, Option<String>, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT record.order_id, record.canonical_event_key,
+                   COUNT(receipt.id)::BIGINT, COUNT(snapshot.rebate_record_id)::BIGINT
+            FROM rebate_records record
+            LEFT JOIN rebate_source_event_receipts receipt
+              ON receipt.rebate_record_id = record.id
+            LEFT JOIN rebate_calculation_snapshots snapshot
+              ON snapshot.rebate_record_id = record.id
+            WHERE record.order_id BETWEEN 850 AND 853
+            GROUP BY record.id, record.order_id, record.canonical_event_key
+            ORDER BY record.order_id
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attached,
+            vec![
+                (850, Some("newapi:topup:850".to_string()), 1, 1),
+                (851, None, 0, 0),
+                (852, None, 0, 0),
+                (853, None, 0, 0),
+            ]
+        );
+        let v2_event = RebateSourceEvent {
+            schema_version: 2,
+            event_key: "newapi:topup:854".to_string(),
+            event_type: "topup.completed".to_string(),
+            source_order_id: 854,
+            invitee_id: 3418,
+            inviter_id: Some(1001),
+            inviter_group: "vip".to_string(),
+            rebate_base_amount_cents: None,
+            credited_quota: Some(37_500_000),
+            completed_at: 1_784_211_072,
+            payment_provider: "epay".to_string(),
+        };
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, v2_event, 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Created
+        );
+        let v2_accounting: (Option<i64>, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT record.order_amount_cents, record.credited_quota,
+                   record.rebate_amount, snapshot.credited_quota
+            FROM rebate_records record
+            JOIN rebate_calculation_snapshots snapshot ON snapshot.rebate_record_id = record.id
+            WHERE record.canonical_event_key = 'newapi:topup:854'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(v2_accounting, (None, 37_500_000, 1_875_000, 37_500_000));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn rebate_source_event_http_contract_classifies_replays_and_permanent_errors() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('default', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://test/invitations".to_string(),
+                newapi_database_url: "postgresql://test/newapi".to_string(),
+                session_secret: "test-session-secret".to_string(),
+                rebate_event_ingest_secret: secret.to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                settlement_mode: SettlementMode::ReadOnly,
+                quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let app = Router::new()
+            .route(
+                "/api/internal/rebate-source-events",
+                post(receive_rebate_source_event),
+            )
+            .with_state(state);
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "event_key": "newapi:topup:9001",
+            "event_type": "topup.completed",
+            "source_order_id": 9001,
+            "invitee_id": 3418,
+            "inviter_id": 1001,
+            "inviter_group": "default",
+            "rebate_base_amount_cents": 7500,
+            "completed_at": 1784211072_i64,
+            "payment_provider": "epay"
+        });
+        let request = |payload: serde_json::Value, authorization: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/api/internal/rebate-source-events")
+                .header("content-type", "application/json");
+            if let Some(authorization) = authorization {
+                builder = builder.header("authorization", authorization);
+            }
+            builder.body(Body::from(payload.to_string())).unwrap()
+        };
+        let bearer = format!("Bearer {secret}");
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request(event.clone(), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(event.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let mut replay_with_unknown_field = event.clone();
+        replay_with_unknown_field["future_field"] = serde_json::json!("accepted");
+        assert_eq!(
+            app.clone()
+                .oneshot(request(replay_with_unknown_field, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let v2_event = serde_json::json!({
+            "schema_version": 2,
+            "event_key": "newapi:topup:9010",
+            "event_type": "topup.completed",
+            "source_order_id": 9010,
+            "invitee_id": 3418,
+            "inviter_id": 1001,
+            "inviter_group": "default",
+            "credited_quota": 37500000_i64,
+            "completed_at": 1784211072_i64,
+            "payment_provider": "epay"
+        });
+        assert_eq!(
+            app.clone()
+                .oneshot(request(v2_event.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let mut invalid_v2 = v2_event;
+        invalid_v2["rebate_base_amount_cents"] = serde_json::json!(7500);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(invalid_v2, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut conflict = event.clone();
+        conflict["rebate_base_amount_cents"] = serde_json::json!(7600);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(conflict, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut no_inviter = event.clone();
+        no_inviter["source_order_id"] = serde_json::json!(9002);
+        no_inviter["event_key"] = serde_json::json!("newapi:topup:9002");
+        no_inviter["inviter_id"] = serde_json::Value::Null;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(no_inviter.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(no_inviter.clone(), Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        no_inviter["inviter_id"] = serde_json::json!(1001);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(no_inviter, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut invalid = event;
+        invalid["source_order_id"] = serde_json::json!(-1);
+        assert_eq!(
+            app.oneshot(request(invalid, Some(&bearer)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn reconciliation_manifest_apply_is_repeatable_and_verify_is_read_only() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('vip', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                1001, 3418, 'vip', 'topup', 842,
+                75.00, 1784211000, 1784815800, 1875000, 0.0500,
+                'initializing', 1784211000, 1784383800, 1784211000, 1784211000
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                inviter_id BIGINT,
+                "group" VARCHAR(64)
+            );
+            CREATE TABLE top_ups (
+                id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                money DOUBLE PRECISION NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                complete_time BIGINT NOT NULL,
+                create_time BIGINT NOT NULL,
+                payment_provider VARCHAR(50),
+                payment_method VARCHAR(50),
+                trade_no VARCHAR(255) NOT NULL,
+                status VARCHAR(20) NOT NULL
+            );
+            CREATE TABLE subscription_orders (trade_no VARCHAR(255));
+            INSERT INTO users (id, inviter_id, "group") VALUES
+                (1001, NULL, 'vip'),
+                (3418, 1001, 'default');
+            INSERT INTO top_ups (
+                id, user_id, money, amount, complete_time, create_time,
+                payment_provider, payment_method, trade_no, status
+            ) VALUES (
+                842, 3418, 75.00, 75.00, 1784211072, 1784211000,
+                'epay', 'alipay', 'trade-842', 'success'
+            );
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE rebate_records SET status = 'pending' WHERE order_id = 842")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(plan(&database.pool, &database.external_pool, 500_000, 842)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not initializing"));
+        sqlx::query(
+            "UPDATE rebate_records SET status = 'initializing', admin_adjusted = TRUE WHERE order_id = 842",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(plan(&database.pool, &database.external_pool, 500_000, 842)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("admin-adjusted"));
+        sqlx::query("UPDATE rebate_records SET admin_adjusted = FALSE WHERE order_id = 842")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let manifest = plan(&database.pool, &database.external_pool, 500_000, 842)
+            .await
+            .unwrap();
+        assert_eq!(manifest.orders.len(), 1);
+        assert_eq!(manifest.orders[0].inviter_group, "vip");
+        assert_eq!(manifest.orders[0].order_amount_cents, None);
+        assert_eq!(manifest.orders[0].credited_quota, 37_500_000);
+        assert_eq!(manifest.orders[0].expected_rebate_quota, 1_875_000);
+        assert_eq!(
+            manifest.orders[0].existing_record,
+            Some(crate::reconciliation_cli::ManifestRecordState {
+                record_id: manifest.orders[0]
+                    .existing_record
+                    .as_ref()
+                    .unwrap()
+                    .record_id,
+                status: "initializing".to_string(),
+                canonical_event_key: None,
+                credited_quota: None,
+                rebate_amount: 1_875_000,
+                rebate_rate: Some("0.0500".to_string()),
+                order_time: 1_784_211_000,
+                initialization_ends_at: 1_784_383_800,
+                rebate_effective_at: 1_784_815_800,
+                admin_adjusted: false,
+            })
+        );
+
+        sqlx::query("UPDATE rebate_rules SET rebate_rate = 0.0600 WHERE user_group = 'vip'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source data changed")
+        );
+        let unapplied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(unapplied, 0);
+        sqlx::query("UPDATE rebate_rules SET rebate_rate = 0.0500 WHERE user_group = 'vip'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let accounting_drifts = [
+            (
+                "UPDATE rebate_records SET credited_quota = 1 WHERE order_id = 842",
+                "UPDATE rebate_records SET credited_quota = NULL WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET rebate_amount = rebate_amount + 1 WHERE order_id = 842",
+                "UPDATE rebate_records SET rebate_amount = 1875000 WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET rebate_rate = 0.0600 WHERE order_id = 842",
+                "UPDATE rebate_records SET rebate_rate = 0.0500 WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET order_time = order_time + 1 WHERE order_id = 842",
+                "UPDATE rebate_records SET order_time = 1784211000 WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET initialization_ends_at = initialization_ends_at + 1 WHERE order_id = 842",
+                "UPDATE rebate_records SET initialization_ends_at = 1784383800 WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET rebate_effective_at = rebate_effective_at + 1 WHERE order_id = 842",
+                "UPDATE rebate_records SET rebate_effective_at = 1784815800 WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET admin_adjusted = TRUE WHERE order_id = 842",
+                "UPDATE rebate_records SET admin_adjusted = FALSE WHERE order_id = 842",
+            ),
+            (
+                "UPDATE rebate_records SET status = 'pending' WHERE order_id = 842",
+                "UPDATE rebate_records SET status = 'initializing' WHERE order_id = 842",
+            ),
+        ];
+        for (drift, restore) in accounting_drifts {
+            sqlx::query(drift).execute(&database.pool).await.unwrap();
+            assert!(
+                apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("source data changed")
+            );
+            sqlx::query(restore).execute(&database.pool).await.unwrap();
+        }
+
+        assert_eq!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+        let repaired_times: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT order_time, initialization_ends_at, rebate_effective_at
+            FROM rebate_records
+            WHERE canonical_event_key = 'newapi:topup:842'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repaired_times,
+            (
+                1_784_211_072,
+                1_784_211_072 + 48 * 60 * 60,
+                1_784_211_072 + 7 * 24 * 60 * 60,
+            )
+        );
+        sqlx::query(
+            "UPDATE rebate_records SET rebate_amount = rebate_amount + 1 WHERE canonical_event_key = 'newapi:topup:842'",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source data changed")
+        );
+        assert!(
+            verify_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("verification failed")
+        );
+        sqlx::query(
+            "UPDATE rebate_records SET rebate_amount = 1875000 WHERE canonical_event_key = 'newapi:topup:842'",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = rebate_quota + 1
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source data changed")
+        );
+        assert!(
+            verify_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("verification failed")
+        );
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = 1875000
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        assert_eq!(
+            verify_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap(),
+            1
+        );
+
+        sqlx::query("UPDATE top_ups SET money = 76.00 WHERE id = 842")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        sqlx::query("UPDATE top_ups SET amount = 76.00 WHERE id = 842")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        assert!(
+            apply_for_test(&database.pool, &database.external_pool, manifest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source data changed")
+        );
+        let record_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_records WHERE canonical_event_key = 'newapi:topup:842'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(record_count, 1);
+
+        sqlx::query("UPDATE top_ups SET complete_time = 0 WHERE id = 842")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        let completion_error = plan(&database.pool, &database.external_pool, 500_000, 842)
+            .await
+            .unwrap_err();
+        assert_eq!(completion_error.code(), "completion_evidence_required");
+        assert!(completion_error.to_string().contains("topup_id=842"));
+        assert!(completion_error.to_string().contains("trade-842"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn admin_rate_adjustment_uses_v2_credited_quota_and_legacy_cents() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        let record_ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at,
+                source_schema_version, credited_quota
+            ) VALUES
+                (1001, 3418, 'default', 'topup', 850, 0, 1, 1, 0, 0.01,
+                 'pending', 1, 1, 1, 1, 2, 10),
+                (1001, 3419, 'default', 'topup', 851, 75, 1, 1, 0, 0.01,
+                 'pending', 1, 1, 1, 1, NULL, NULL)
+            RETURNING id
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://test/invitations".to_string(),
+                newapi_database_url: "postgresql://test/newapi".to_string(),
+                session_secret: "test-session-secret".to_string(),
+                rebate_event_ingest_secret: "test-rebate-event-ingest-secret".to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                settlement_mode: SettlementMode::ReadOnly,
+                quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let _response = update_rebate_order_records(
+            axum::extract::State(state),
+            AdminUser(SessionUser {
+                id: 1,
+                username: "admin".to_string(),
+                role: 10,
+                status: 1,
+                group: "default".to_string(),
+            }),
+            axum::Json(UpdateRebateOrderRecordsRequest {
+                record_ids: record_ids.clone(),
+                rebate_amount: None,
+                rebate_ratio: Some(0.05),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let adjusted: Vec<(i64, i64, bool)> = sqlx::query_as(
+            r#"
+            SELECT order_id, rebate_amount, admin_adjusted
+            FROM rebate_records
+            WHERE id = ANY($1)
+            ORDER BY order_id
+            "#,
+        )
+        .bind(&record_ids)
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(adjusted, vec![(850, 1, true), (851, 1_875_000, true)]);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn topup_reconciliation_uses_receipt_outcomes_not_current_inviter_relationships() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('default', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let completed_at = chrono::Utc::now().timestamp() - 120;
+        let event = |source_order_id, invitee_id, inviter_id| RebateSourceEvent {
+            schema_version: 1,
+            event_key: format!("newapi:topup:{source_order_id}"),
+            event_type: "topup.completed".to_string(),
+            source_order_id,
+            invitee_id,
+            inviter_id,
+            inviter_group: "default".to_string(),
+            rebate_base_amount_cents: Some(7500),
+            credited_quota: None,
+            completed_at,
+            payment_provider: "epay".to_string(),
+        };
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event(9001, 3418, Some(1001)), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Created
+        );
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event(9002, 3419, None), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::IgnoredNoInviter
+        );
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                inviter_id BIGINT
+            );
+            CREATE TABLE top_ups (
+                id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                complete_time BIGINT NOT NULL,
+                create_time BIGINT NOT NULL,
+                trade_no VARCHAR(255) NOT NULL,
+                status VARCHAR(20) NOT NULL
+            );
+            CREATE TABLE subscription_orders (trade_no VARCHAR(255));
+            CREATE TABLE kkai_outbox (
+                event_key VARCHAR(191) NOT NULL,
+                topic VARCHAR(128) NOT NULL,
+                status VARCHAR(20) NOT NULL
+            );
+            INSERT INTO users (id, inviter_id) VALUES
+                (3418, NULL),
+                (3419, 1001),
+                (3420, NULL);
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        for (order_id, user_id) in [(9001_i64, 3418_i64), (9002, 3419), (9003, 3420)] {
+            sqlx::query(
+                r#"
+                INSERT INTO top_ups (
+                    id, user_id, complete_time, create_time, trade_no, status
+                ) VALUES ($1, $2, $3, $3, $4, 'success')
+                "#,
+            )
+            .bind(order_id)
+            .bind(user_id)
+            .bind(completed_at)
+            .bind(format!("trade-{order_id}"))
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+            if order_id != 9002 {
+                sqlx::query(
+                    r#"
+                    INSERT INTO kkai_outbox (event_key, topic, status)
+                    VALUES ($1, 'kkai.billing.topup.completed', 'delivered')
+                    "#,
+                )
+                .bind(format!("newapi:topup:{order_id}"))
+                .execute(&database.external_pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://test/invitations".to_string(),
+                newapi_database_url: "postgresql://test/newapi".to_string(),
+                session_secret: "test-session-secret".to_string(),
+                rebate_event_ingest_secret: "test-rebate-event-ingest-secret".to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 300,
+                topup_reconciliation_initial_delay_seconds: 0,
+                settlement_mode: SettlementMode::ReadOnly,
+                quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let first = run_topup_reconciliation(&state).await.unwrap();
+        assert_eq!(first.created_cases, 1);
+        let open_issue_codes: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT issue_code
+            FROM rebate_reconciliation_cases
+            WHERE case_state = 'open'
+            ORDER BY issue_code
+            "#,
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            open_issue_codes,
+            vec!["topup_event_receipt_missing".to_string()]
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET inviter_id = CASE id
+                WHEN 3418 THEN 1001
+                WHEN 3419 THEN NULL
+                WHEN 3420 THEN 1001
+            END
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE top_ups SET complete_time = $1, create_time = $1 WHERE id = 9003")
+            .bind(chrono::Utc::now().timestamp() - 2 * 24 * 60 * 60)
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event(9003, 3420, None), 500_000)
+                .await
+                .unwrap(),
+            IngestOutcome::IgnoredNoInviter
+        );
+        let second = run_topup_reconciliation(&state).await.unwrap();
+        assert_eq!(second.created_cases, 0);
+        let open_case_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_reconciliation_cases WHERE case_state = 'open'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(open_case_count, 0);
+
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = rebate_quota + 1
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:9001'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            1
+        );
+        let drift_issue: String = sqlx::query_scalar(
+            "SELECT issue_code FROM rebate_reconciliation_cases WHERE case_state = 'open'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(drift_issue, "topup_receipt_integrity_drift");
+        sqlx::query(
+            r#"
+            UPDATE rebate_calculation_snapshots
+            SET rebate_quota = 1875000
+            WHERE rebate_record_id = (
+                SELECT id FROM rebate_records WHERE canonical_event_key = 'newapi:topup:9001'
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            0
+        );
+
+        let conflicting_ignored_record: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at,
+                canonical_event_key
+            ) VALUES (
+                1001, 3419, 'default', 'topup', 9002,
+                75.00, $1, $2, 0,
+                'initializing', $1, $3, $1, $1,
+                'newapi:topup:9002'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(completed_at)
+        .bind(completed_at + 7 * 24 * 60 * 60)
+        .bind(completed_at + 48 * 60 * 60)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            1
+        );
+        sqlx::query("UPDATE rebate_records SET canonical_event_key = NULL WHERE id = $1")
+            .bind(conflicting_ignored_record)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            0
+        );
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rebate_reconciliation_cases WHERE case_state IN ('open', 'approved')",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(unresolved, 0);
         database.cleanup().await;
     }
 
@@ -2487,6 +4248,60 @@ mod tests {
                     .any(|detail| detail.contains("balance_operations.balance_after"))
         }));
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn preflight_accepts_pre_canonical_schema_and_rejects_canonical_column_drift() {
+        let database = TestDatabase::create().await;
+        let pre_canonical_migrator = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 202607170001)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        pre_canonical_migrator
+            .run(&database.pool)
+            .await
+            .expect("apply migrations before canonical source events");
+        let before_upgrade = database.preflight().await.unwrap();
+        assert!(
+            before_upgrade.schema_compatible_before_migration,
+            "unexpected issues: {:?}",
+            before_upgrade.issues
+        );
+        database.cleanup().await;
+
+        for (table, column) in [
+            ("rebate_records", "credited_quota"),
+            ("rebate_calculation_snapshots", "credited_quota"),
+            ("rebate_reconciliation_cases", "source_event_key"),
+            ("rebate_reconciliation_cases", "source_order_id"),
+        ] {
+            let database = TestDatabase::create().await;
+            database.prepare().await.unwrap();
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"
+            ))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+            let report = database.preflight().await.unwrap();
+            assert!(!report.schema_compatible_before_migration);
+            assert!(report.issues.iter().any(|issue| {
+                issue.code == "unsupported_table_shape"
+                    && issue
+                        .sample_ids
+                        .iter()
+                        .any(|detail| detail.contains(&format!("{table}.{column}")))
+            }));
+            database.cleanup().await;
+        }
     }
 
     #[tokio::test]

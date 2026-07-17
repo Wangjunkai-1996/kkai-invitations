@@ -978,6 +978,7 @@ fn app_error_message(error: &AppError) -> &str {
         AppError::NotFound(message)
         | AppError::BadRequest(message)
         | AppError::Conflict(message)
+        | AppError::UnprocessableEntity(message)
         | AppError::Locked(message)
         | AppError::Internal(message) => message,
         AppError::Database(_) => "数据库错误",
@@ -1159,9 +1160,12 @@ mod tests {
                 database_url: "postgresql://invalid/invitations".to_string(),
                 newapi_database_url: "postgresql://invalid/newapi".to_string(),
                 session_secret: "test-only-session-secret".to_string(),
+                rebate_event_ingest_secret: "0123456789abcdef0123456789abcdef".to_string(),
                 sync_secret: None,
                 auto_sync_interval_seconds: 0,
                 auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
                 settlement_mode: mode,
                 quota_per_unit: 500_000,
                 balance_api: None,

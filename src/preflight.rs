@@ -5,6 +5,7 @@ use sqlx::{PgConnection, Row};
 
 const SAMPLE_LIMIT: i64 = 50;
 const DISPATCHER_SCHEMA_MIGRATION: i64 = 202607110006;
+const CANONICAL_EVENT_SCHEMA_MIGRATION: i64 = 202607170001;
 pub const ROLLBACK_BOUNDARY: &str = "Schema changes are expand-only. Application rollback is allowed only while settlement remains disabled and no balance_operations rows exist; never down-migrate or roll back to a binary that writes NewAPI quota directly.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -95,6 +96,7 @@ pub async fn run(
     let known_tables = [
         "rebate_rules",
         "rebate_records",
+        "rebate_source_event_receipts",
         "invitation_registrations",
         "rebate_requests",
         "withdrawal_requests",
@@ -199,6 +201,26 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("unlock_required", "bool", false),
             column("created_at", "int8", false),
             column("updated_at", "int8", false),
+            column("canonical_event_key", "varchar", true),
+            column("source_payload_sha256", "bpchar", true),
+            column("source_schema_version", "int4", true),
+            column("order_amount_cents", "int8", true),
+            column("credited_quota", "int8", true),
+            column("superseded_by_record_id", "int8", true),
+        ],
+    },
+    TableShape {
+        name: "rebate_source_event_receipts",
+        columns: &[
+            column("id", "int8", false),
+            column("event_key", "varchar", false),
+            column("event_type", "varchar", false),
+            column("source_order_id", "int8", false),
+            column("source_payload_sha256", "bpchar", false),
+            column("source_schema_version", "int4", false),
+            column("outcome", "varchar", false),
+            column("rebate_record_id", "int8", true),
+            column("received_at", "int8", false),
         ],
     },
     TableShape {
@@ -312,6 +334,7 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("inviter_group", "varchar", false),
             column("quota_per_unit", "int8", false),
             column("rebate_quota", "int8", false),
+            column("credited_quota", "int8", true),
         ],
     },
     TableShape {
@@ -378,6 +401,8 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("issue_code", "varchar", false),
             column("case_state", "varchar", false),
             column("evidence_sha256", "bpchar", false),
+            column("source_event_key", "varchar", true),
+            column("source_order_id", "int8", true),
         ],
     },
     TableShape {
@@ -448,11 +473,17 @@ async fn inspect_schema_shapes(
 
     let dispatcher_schema_applied =
         migration_applied(connection, DISPATCHER_SCHEMA_MIGRATION).await?;
+    let canonical_event_schema_applied =
+        migration_applied(connection, CANONICAL_EVENT_SCHEMA_MIGRATION).await?;
     for shape in LOCAL_TABLE_SHAPES {
         if !table_exists(connection, shape.name).await? {
             continue;
         }
-        let shape = dispatcher_compatible_shape(*shape, dispatcher_schema_applied);
+        let shape = migration_compatible_shape(
+            *shape,
+            dispatcher_schema_applied,
+            canonical_event_schema_applied,
+        );
         let mismatches = table_shape_mismatches(connection, shape).await?;
         if !mismatches.is_empty() {
             block_unsupported_shape(report, shape.name, &mismatches);
@@ -488,22 +519,39 @@ async fn inspect_schema_shapes(
     Ok(())
 }
 
-fn dispatcher_compatible_shape(shape: TableShape, dispatcher_schema_applied: bool) -> TableShape {
-    if dispatcher_schema_applied {
-        return shape;
+fn migration_compatible_shape(
+    shape: TableShape,
+    dispatcher_schema_applied: bool,
+    canonical_event_schema_applied: bool,
+) -> TableShape {
+    if !canonical_event_schema_applied {
+        let legacy_column_count = match shape.name {
+            "rebate_records" => 6,
+            "rebate_calculation_snapshots" => 1,
+            "rebate_reconciliation_cases" => 2,
+            _ => 0,
+        };
+        if legacy_column_count > 0 {
+            return TableShape {
+                name: shape.name,
+                columns: &shape.columns[..shape.columns.len() - legacy_column_count],
+            };
+        }
     }
-
-    match shape.name {
-        "balance_operations" => TableShape {
-            name: shape.name,
-            columns: &shape.columns[..shape.columns.len() - 3],
-        },
-        "balance_operation_outbox" => TableShape {
-            name: shape.name,
-            columns: PRE_DISPATCHER_OUTBOX_COLUMNS,
-        },
-        _ => shape,
+    if !dispatcher_schema_applied {
+        return match shape.name {
+            "balance_operations" => TableShape {
+                name: shape.name,
+                columns: &shape.columns[..shape.columns.len() - 3],
+            },
+            "balance_operation_outbox" => TableShape {
+                name: shape.name,
+                columns: PRE_DISPATCHER_OUTBOX_COLUMNS,
+            },
+            _ => shape,
+        };
     }
+    shape
 }
 
 async fn migration_applied(

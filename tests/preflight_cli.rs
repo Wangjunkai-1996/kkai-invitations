@@ -37,3 +37,21 @@ fn missing_database_configuration_returns_json_exit_three() {
         })
     );
 }
+
+#[test]
+fn reconcile_apply_rejects_missing_settlement_mode_before_database_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_invitations"))
+        .args(["reconcile", "apply", "--expected-sha256", &"a".repeat(64)])
+        .env_clear()
+        .output()
+        .expect("run invitations reconcile apply");
+
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("reconcile error output is valid JSON");
+    assert_eq!(payload["error"]["code"], "configuration_error");
+    assert!(payload["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("SETTLEMENT_MODE=read_only exactly"));
+}
