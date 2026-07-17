@@ -46,6 +46,6 @@ jobs:
 
       - name: Verify the production image contract
         env:
-          EXPECTED_SHA: 0000000000000000000000000000000000000000
+          EXPECTED_SHA: '0000000000000000000000000000000000000000'
           EXPECTED_VERSION: kkai-prod-19700101.1-000000000
         run: build/kkai-image/verify-image.sh kkai-invitations-quality:local
