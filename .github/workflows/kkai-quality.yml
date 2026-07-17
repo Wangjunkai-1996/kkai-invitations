@@ -1,0 +1,51 @@
+name: KKAI Invitations Quality
+
+on:
+  pull_request:
+    branches:
+      - production/kkrich
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kkai-invitations-quality-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo +1.96.0 fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +1.96.0 clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.96.0 test --locked --all-targets
+
+      - name: Validate release scripts
+        run: bash -n build/kkai-image/verify-image.sh build/kkai-image/export-release.sh
+
+      - name: Build the production image contract
+        run: |
+          docker build \
+            --file build/kkai-image/Dockerfile \
+            --build-arg APP_VERSION=kkai-prod-19700101.1-000000000 \
+            --build-arg SOURCE_REVISION=0000000000000000000000000000000000000000 \
+            --tag kkai-invitations-quality:local \
+            .
+
+      - name: Verify the production image contract
+        env:
+          EXPECTED_SHA: 0000000000000000000000000000000000000000
+          EXPECTED_VERSION: kkai-prod-19700101.1-000000000
+        run: build/kkai-image/verify-image.sh kkai-invitations-quality:local
