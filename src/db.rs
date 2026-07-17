@@ -1982,6 +1982,8 @@ mod tests {
     use crate::AppState;
 
     const LATEST_LEGACY_FIXTURE: &str = include_str!("../tests/fixtures/latest_legacy.sql");
+    const NEWAPI_ADJUSTMENT_FIXTURE: &str =
+        include_str!("../tests/fixtures/newapi_balance_adjustments.sql");
     const NEWAPI_MARK_FIXTURE: &str = include_str!("../tests/fixtures/newapi_balance_marks.sql");
 
     #[test]
@@ -2095,6 +2097,13 @@ mod tests {
 
         async fn create_external_mark_table(&self) {
             sqlx::raw_sql(NEWAPI_MARK_FIXTURE)
+                .execute(&self.external_pool)
+                .await
+                .unwrap();
+        }
+
+        async fn create_external_adjustment_table(&self) {
+            sqlx::raw_sql(NEWAPI_ADJUSTMENT_FIXTURE)
                 .execute(&self.external_pool)
                 .await
                 .unwrap();
@@ -4713,6 +4722,164 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "external_orphan_balance_mark"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn preflight_accepts_legacy_marks_and_current_adjustments_with_overlapping_ids() {
+        let database = TestDatabase::create().await;
+        sqlx::raw_sql(LATEST_LEGACY_FIXTURE)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.prepare().await.unwrap();
+        database.create_external_mark_table().await;
+        database.create_external_adjustment_table().await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO invitation_rebate_payouts (
+                id, rebate_record_id, rebate_request_id, inviter_user_id, invitee_user_id,
+                order_id, order_type, amount_cents, quota_delta, kind, status,
+                request_id, newapi_mark_id, original_payout_id,
+                created_at, updated_at, completed_at, reversed_at
+            ) VALUES (
+                301, 101, 201, 11, 12, 501, 'topup', 1000, 5000000,
+                'payout', 'reversed', 'pay-301', NULL, NULL,
+                1700000000, 1700000002, 1700000001, 1700000002
+            ), (
+                302, 101, 201, 11, 12, 501, 'topup', 1000, -5000000,
+                'reversal', 'completed', 'reverse-302', 401, 301,
+                1700000002, 1700000002, 1700000002, NULL
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE rebate_record_settlements SET settlement_state = 'reversed' WHERE rebate_record_id = 101")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, user_id, delta_quota,
+                idempotency_key, payload_sha256, operation_state,
+                created_at, updated_at, completed_at
+            ) VALUES (
+                '01J00000000000000000000301', 'credit:mixed:301', 'credit',
+                101, 201, 11, 5000000, 'ki1-mixed-credit-301', repeat('a', 64),
+                'completed', 1700000000, 1700000001, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO balance_operations (
+                operation_ulid, business_operation_key, operation_kind,
+                rebate_record_id, rebate_request_id, original_operation_ulid,
+                user_id, delta_quota, idempotency_key, payload_sha256,
+                operation_state, created_at, updated_at, completed_at
+            ) VALUES (
+                '01J00000000000000000000302', 'reversal:mixed:302', 'reversal',
+                101, 201, '01J00000000000000000000301', 11, -5000000,
+                'ki1-mixed-reversal-302', repeat('b', 64),
+                'completed', 1700000002, 1700000002, 1700000002
+            )
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO kkai_invitation_rebate_balance_marks (
+                id, kind, rebate_record_id, payout_id, original_payout_id,
+                user_id, quota_delta, amount_cents, request_id, created_at
+            ) VALUES (
+                401, 'reversal', 101, 302, 301, 11, -5000000,
+                1000, 'reverse-302', 1700000002
+            )
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO kkai_internal_balance_adjustments (
+                id, operation_id, user_id, delta, reason, metadata,
+                payload_sha256, original_operation_id,
+                balance_before, balance_after, created_at
+            ) VALUES (
+                401, '01J00000000000000000000301', 11, 5000000,
+                'invitation_reward',
+                '{"rebate_record_id":101,"payout_id":301}',
+                repeat('a', 64), NULL,
+                4000000, 9000000, 1700000001
+            )
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+
+        let exact = database.preflight().await.unwrap();
+        assert!(
+            exact.safe_to_migrate,
+            "unexpected issues: {:?}",
+            exact.issues
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO kkai_invitation_rebate_balance_marks (
+                id, kind, rebate_record_id, payout_id, user_id, quota_delta,
+                amount_cents, request_id, created_at
+            ) VALUES (
+                402, 'payout', 101, 301, 11, 5000000,
+                1000, 'pay-301', 1700000001
+            )
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE invitation_rebate_payouts SET newapi_mark_id = 402 WHERE id = 301")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let duplicate_evidence = database.preflight().await.unwrap();
+        assert!(!duplicate_evidence.safe_to_migrate);
+        assert!(duplicate_evidence
+            .issues
+            .iter()
+            .any(|issue| issue.code == "external_mark_identity_mismatch"));
+
+        sqlx::query("DELETE FROM kkai_invitation_rebate_balance_marks WHERE id = 402")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE invitation_rebate_payouts SET newapi_mark_id = NULL WHERE id = 301")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kkai_internal_balance_adjustments SET delta = 4999999 WHERE id = 401")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        let mismatched = database.preflight().await.unwrap();
+        assert!(!mismatched.safe_to_migrate);
+        assert!(mismatched
+            .issues
+            .iter()
+            .any(|issue| issue.code == "external_mark_identity_mismatch"));
         database.cleanup().await;
     }
 

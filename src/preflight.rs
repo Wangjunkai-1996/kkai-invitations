@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 
 const SAMPLE_LIMIT: i64 = 50;
@@ -448,6 +448,23 @@ const EXTERNAL_MARK_SHAPE: TableShape = TableShape {
     ],
 };
 
+const EXTERNAL_ADJUSTMENT_SHAPE: TableShape = TableShape {
+    name: "kkai_internal_balance_adjustments",
+    columns: &[
+        column("id", "int8", false),
+        column("operation_id", "varchar", false),
+        column("user_id", "int4", false),
+        column("delta", "int8", false),
+        column("reason", "varchar", false),
+        column("metadata", "text", false),
+        column("payload_sha256", "bpchar", false),
+        column("original_operation_id", "varchar", true),
+        column("balance_before", "int8", false),
+        column("balance_after", "int8", false),
+        column("created_at", "int8", false),
+    ],
+};
+
 const PRE_DISPATCHER_OUTBOX_COLUMNS: &[ColumnSpec] = &[
     column("id", "int8", false),
     column("operation_id", "int8", false),
@@ -573,22 +590,24 @@ async fn inspect_external_schema_shape(
     connection: &mut PgConnection,
     report: &mut PreflightReport,
 ) -> Result<(), sqlx::Error> {
-    if !table_exists(connection, EXTERNAL_MARK_SHAPE.name).await? {
-        return Ok(());
-    }
-    report
-        .inspected_tables
-        .push(format!("newapi.{}", EXTERNAL_MARK_SHAPE.name));
-    let mismatches = table_shape_mismatches(connection, EXTERNAL_MARK_SHAPE).await?;
-    if !mismatches.is_empty() {
-        report.schema_compatible_before_migration = false;
-        report.issues.push(PreflightIssue {
-            code: "external_evidence_schema_incompatible",
-            severity: IssueSeverity::Blocking,
-            count: mismatches.len() as i64,
-            sample_ids: mismatches.into_iter().take(SAMPLE_LIMIT as usize).collect(),
-            message: "The NewAPI balance-mark table cannot provide provable settlement evidence.",
-        });
+    for shape in [EXTERNAL_MARK_SHAPE, EXTERNAL_ADJUSTMENT_SHAPE] {
+        if !table_exists(connection, shape.name).await? {
+            continue;
+        }
+        report
+            .inspected_tables
+            .push(format!("newapi.{}", shape.name));
+        let mismatches = table_shape_mismatches(connection, shape).await?;
+        if !mismatches.is_empty() {
+            report.schema_compatible_before_migration = false;
+            report.issues.push(PreflightIssue {
+                code: "external_evidence_schema_incompatible",
+                severity: IssueSeverity::Blocking,
+                count: mismatches.len() as i64,
+                sample_ids: mismatches.into_iter().take(SAMPLE_LIMIT as usize).collect(),
+                message: "A NewAPI balance evidence table cannot prove settlement identity.",
+            });
+        }
     }
     Ok(())
 }
@@ -745,7 +764,9 @@ fn expected_primary_key(table: &str) -> Option<&'static [&'static str]> {
         "rebate_request_money_snapshots" => Some(&["rebate_request_id"]),
         "rebate_sync_checkpoints" => Some(&["sync_type", "source_namespace"]),
         "_sqlx_migrations" => Some(&["version"]),
-        "kkai_invitation_rebate_balance_marks" => Some(&["id"]),
+        "kkai_invitation_rebate_balance_marks" | "kkai_internal_balance_adjustments" => {
+            Some(&["id"])
+        }
         _ => None,
     }
 }
@@ -764,6 +785,7 @@ fn expected_unique_keys(table: &str) -> &'static [&'static [&'static str]] {
         "balance_operation_outbox" => &[&["operation_id", "event_type"]],
         "rebate_background_jobs" => &[&["job_type", "partition_key"]],
         "kkai_invitation_rebate_balance_marks" => &[&["request_id"]],
+        "kkai_internal_balance_adjustments" => &[&["operation_id"], &["original_operation_id"]],
         _ => &[],
     }
 }
@@ -843,6 +865,36 @@ struct ExternalMarkEvidence {
     request_id: String,
 }
 
+#[derive(Debug)]
+struct LocalOperationEvidence {
+    operation_ulid: String,
+    operation_kind: String,
+    rebate_record_id: i64,
+    payout_id: i64,
+    user_id: i64,
+    delta_quota: i64,
+    original_operation_ulid: Option<String>,
+    operation_state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalAdjustmentMetadata {
+    rebate_record_id: Option<i64>,
+    payout_id: Option<i64>,
+    original_operation_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ExternalAdjustmentEvidence {
+    id: i64,
+    operation_id: String,
+    user_id: i64,
+    delta: i64,
+    reason: String,
+    metadata: Option<ExternalAdjustmentMetadata>,
+    original_operation_id: Option<String>,
+}
+
 async fn inspect_external_evidence(
     connection: &mut PgConnection,
     external_connection: &mut PgConnection,
@@ -867,13 +919,17 @@ async fn inspect_external_evidence(
         Vec::new()
     };
 
-    let external_table_exists = table_exists(external_connection, EXTERNAL_MARK_SHAPE.name).await?;
-    if !external_table_exists {
+    let local_operations = load_local_operation_evidence(connection).await?;
+
+    let mark_table_exists = table_exists(external_connection, EXTERNAL_MARK_SHAPE.name).await?;
+    let adjustment_table_exists =
+        table_exists(external_connection, EXTERNAL_ADJUSTMENT_SHAPE.name).await?;
+    if !mark_table_exists && !adjustment_table_exists {
         if !local_rows.is_empty() {
             push_memory_issue(
                 report,
                 "external_evidence_table_missing",
-                "Local payout rows exist but NewAPI has no verifiable balance-mark table.",
+                "Local payout rows exist but NewAPI has no verifiable balance evidence table.",
                 local_rows.iter().map(|row| row.id.to_string()).collect(),
             );
         }
@@ -881,19 +937,40 @@ async fn inspect_external_evidence(
         return Ok(());
     }
 
-    let external_rows = sqlx::query(
-        r#"
-        SELECT id, kind, rebate_record_id, payout_id, original_payout_id,
-               user_id, quota_delta, amount_cents, request_id
-        FROM kkai_invitation_rebate_balance_marks
-        ORDER BY id
-        "#,
-    )
-    .fetch_all(&mut *external_connection)
-    .await?
-    .iter()
-    .map(external_mark_evidence_from_row)
-    .collect::<Result<Vec<_>, _>>()?;
+    let external_rows = if mark_table_exists {
+        sqlx::query(
+            r#"
+            SELECT id, kind, rebate_record_id, payout_id, original_payout_id,
+                   user_id, quota_delta, amount_cents, request_id
+            FROM kkai_invitation_rebate_balance_marks
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&mut *external_connection)
+        .await?
+        .iter()
+        .map(external_mark_evidence_from_row)
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let external_adjustments = if adjustment_table_exists {
+        sqlx::query(
+            r#"
+            SELECT id, operation_id, user_id, delta, reason, metadata,
+                   original_operation_id
+            FROM kkai_internal_balance_adjustments
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&mut *external_connection)
+        .await?
+        .iter()
+        .map(external_adjustment_evidence_from_row)
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
 
     let mut marks_by_id: HashMap<i64, Vec<&ExternalMarkEvidence>> = HashMap::new();
     for mark in &external_rows {
@@ -917,32 +994,84 @@ async fn inspect_external_evidence(
     for payout in &local_rows {
         local_by_id.entry(payout.id).or_default().push(payout);
     }
+    let mut operations_by_payout_id: HashMap<i64, Vec<&LocalOperationEvidence>> = HashMap::new();
+    for operation in &local_operations {
+        operations_by_payout_id
+            .entry(operation.payout_id)
+            .or_default()
+            .push(operation);
+    }
+    let mut adjustments_by_payout_id: HashMap<i64, Vec<&ExternalAdjustmentEvidence>> =
+        HashMap::new();
+    for adjustment in &external_adjustments {
+        if let Some(payout_id) = adjustment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.payout_id)
+        {
+            adjustments_by_payout_id
+                .entry(payout_id)
+                .or_default()
+                .push(adjustment);
+        }
+    }
 
     let mut missing_mark_ids = Vec::new();
     let mut mismatched_mark_ids = Vec::new();
     for payout in &local_rows {
-        if matches!(payout.status.as_str(), "completed" | "reversed")
-            && payout.newapi_mark_id.is_none()
-        {
-            missing_mark_ids.push(payout.id.to_string());
+        if !matches!(payout.status.as_str(), "completed" | "reversed") {
             continue;
         }
-        let Some(mark_id) = payout.newapi_mark_id else {
-            continue;
+        let mark_candidates = payout
+            .newapi_mark_id
+            .and_then(|mark_id| marks_by_id.get(&mark_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let operations = operations_by_payout_id
+            .get(&payout.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let adjustments = adjustments_by_payout_id
+            .get(&payout.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let exact_mark_count = mark_candidates
+            .iter()
+            .filter(|mark| external_mark_matches(payout, mark))
+            .count();
+        let exact_adjustment_count = operations
+            .iter()
+            .flat_map(|operation| {
+                adjustments
+                    .iter()
+                    .map(move |adjustment| (*operation, *adjustment))
+            })
+            .filter(|(operation, adjustment)| {
+                external_adjustment_matches(payout, operation, adjustment)
+            })
+            .count();
+        let exact_match_count = exact_mark_count + exact_adjustment_count;
+        let selected_source_is_exact = match payout.newapi_mark_id {
+            Some(_) => exact_mark_count == 1 && exact_adjustment_count == 0,
+            None => exact_mark_count == 0 && exact_adjustment_count == 1,
         };
-        let Some(candidates) = marks_by_id.get(&mark_id) else {
+        if exact_match_count == 1 && selected_source_is_exact {
+            continue;
+        }
+        if mark_candidates.is_empty() && (operations.is_empty() || adjustments.is_empty()) {
             missing_mark_ids.push(payout.id.to_string());
-            continue;
-        };
-        if candidates.len() != 1 || !external_mark_matches(payout, candidates[0]) {
-            mismatched_mark_ids.push(format!("{}:{mark_id}", payout.id));
+        } else {
+            mismatched_mark_ids.push(format!(
+                "{}:mark={exact_mark_count}:adjustment={exact_adjustment_count}",
+                payout.id
+            ));
         }
     }
     if !missing_mark_ids.is_empty() {
         push_memory_issue(
             report,
             "external_mark_missing",
-            "A locally final or marked payout has no matching NewAPI evidence row.",
+            "A locally final payout has no matching NewAPI balance evidence row.",
             missing_mark_ids,
         );
     }
@@ -950,7 +1079,7 @@ async fn inspect_external_evidence(
         push_memory_issue(
             report,
             "external_mark_identity_mismatch",
-            "A NewAPI mark disagrees with local payout, record, user, kind, amount, delta, request, or original identity.",
+            "NewAPI balance evidence disagrees with local payout, operation, record, user, kind, delta, request, amount when available, or original identity.",
             mismatched_mark_ids,
         );
     }
@@ -977,6 +1106,48 @@ async fn inspect_external_evidence(
         );
     }
 
+    let mut orphan_adjustments = Vec::new();
+    for adjustment in &external_adjustments {
+        let Some(payout_id) = adjustment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.payout_id)
+        else {
+            orphan_adjustments.push(adjustment.id.to_string());
+            continue;
+        };
+        let payouts = local_by_id
+            .get(&payout_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let operations = operations_by_payout_id
+            .get(&payout_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let exact_match_count = payouts
+            .iter()
+            .flat_map(|payout| {
+                operations
+                    .iter()
+                    .map(move |operation| (*payout, *operation))
+            })
+            .filter(|(payout, operation)| {
+                external_adjustment_matches(payout, operation, adjustment)
+            })
+            .count();
+        if exact_match_count != 1 {
+            orphan_adjustments.push(adjustment.id.to_string());
+        }
+    }
+    if !orphan_adjustments.is_empty() {
+        push_memory_issue(
+            report,
+            "external_orphan_balance_adjustment",
+            "A NewAPI balance adjustment has no exact local payout operation owner.",
+            orphan_adjustments,
+        );
+    }
+
     report.external_evidence_checked = true;
     Ok(())
 }
@@ -990,6 +1161,72 @@ fn external_mark_matches(payout: &LocalPayoutEvidence, mark: &ExternalMarkEviden
         && mark.amount_cents == payout.amount_cents
         && mark.request_id == payout.request_id
         && mark.original_payout_id == payout.original_payout_id
+}
+
+fn external_adjustment_matches(
+    payout: &LocalPayoutEvidence,
+    operation: &LocalOperationEvidence,
+    adjustment: &ExternalAdjustmentEvidence,
+) -> bool {
+    let Some(metadata) = adjustment.metadata.as_ref() else {
+        return false;
+    };
+    let expected_reason = match payout.kind.as_str() {
+        "payout" => "invitation_reward",
+        "reversal" => "invitation_reward_reversal",
+        _ => return false,
+    };
+    let expected_operation_kind = match payout.kind.as_str() {
+        "payout" => "credit",
+        "reversal" => "reversal",
+        _ => return false,
+    };
+
+    operation.payout_id == payout.id
+        && operation.operation_state == "completed"
+        && operation.operation_kind == expected_operation_kind
+        && operation.rebate_record_id == payout.rebate_record_id
+        && operation.user_id == payout.inviter_user_id
+        && operation.delta_quota == payout.quota_delta
+        && adjustment.operation_id == operation.operation_ulid
+        && adjustment.user_id == payout.inviter_user_id
+        && adjustment.delta == payout.quota_delta
+        && adjustment.reason == expected_reason
+        && metadata.rebate_record_id == Some(payout.rebate_record_id)
+        && metadata.payout_id == Some(payout.id)
+        && metadata.original_operation_id == operation.original_operation_ulid
+        && adjustment.original_operation_id == operation.original_operation_ulid
+}
+
+async fn load_local_operation_evidence(
+    connection: &mut PgConnection,
+) -> Result<Vec<LocalOperationEvidence>, sqlx::Error> {
+    if !table_exists(connection, "balance_operations").await?
+        || !table_exists(connection, "invitation_rebate_payouts").await?
+    {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query(
+        r#"
+        SELECT operation.operation_ulid::TEXT AS operation_ulid,
+               operation.operation_kind, operation.rebate_record_id,
+               payout.id AS payout_id, operation.user_id, operation.delta_quota,
+               operation.original_operation_ulid::TEXT AS original_operation_ulid,
+               operation.operation_state
+        FROM balance_operations operation
+        JOIN invitation_rebate_payouts payout
+          ON payout.rebate_record_id = operation.rebate_record_id
+         AND ((operation.operation_kind = 'credit' AND payout.kind = 'payout')
+           OR (operation.operation_kind = 'reversal' AND payout.kind = 'reversal'))
+        ORDER BY operation.id
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await?
+    .iter()
+    .map(local_operation_evidence_from_row)
+    .collect()
 }
 
 fn local_payout_evidence_from_row(
@@ -1022,6 +1259,36 @@ fn external_mark_evidence_from_row(
         quota_delta: row.try_get("quota_delta")?,
         amount_cents: row.try_get("amount_cents")?,
         request_id: row.try_get("request_id")?,
+    })
+}
+
+fn local_operation_evidence_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<LocalOperationEvidence, sqlx::Error> {
+    Ok(LocalOperationEvidence {
+        operation_ulid: row.try_get("operation_ulid")?,
+        operation_kind: row.try_get("operation_kind")?,
+        rebate_record_id: row.try_get("rebate_record_id")?,
+        payout_id: row.try_get("payout_id")?,
+        user_id: row.try_get("user_id")?,
+        delta_quota: row.try_get("delta_quota")?,
+        original_operation_ulid: row.try_get("original_operation_ulid")?,
+        operation_state: row.try_get("operation_state")?,
+    })
+}
+
+fn external_adjustment_evidence_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ExternalAdjustmentEvidence, sqlx::Error> {
+    let metadata: String = row.try_get("metadata")?;
+    Ok(ExternalAdjustmentEvidence {
+        id: row.try_get("id")?,
+        operation_id: row.try_get("operation_id")?,
+        user_id: i64::from(row.try_get::<i32, _>("user_id")?),
+        delta: row.try_get("delta")?,
+        reason: row.try_get("reason")?,
+        metadata: serde_json::from_str(&metadata).ok(),
+        original_operation_id: row.try_get("original_operation_id")?,
     })
 }
 
@@ -1461,6 +1728,41 @@ async fn inspect_payouts(
         return Ok(());
     }
 
+    let external_state_sql = if table_exists(connection, "balance_operations").await? {
+        r#"
+        SELECT id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
+        FROM invitation_rebate_payouts payout
+        WHERE (payout.status IN ('completed', 'reversed')
+               AND payout.newapi_mark_id IS NULL
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM balance_operations operation
+                    WHERE operation.rebate_record_id = payout.rebate_record_id
+                      AND operation.operation_state = 'completed'
+                      AND ((payout.kind = 'payout' AND operation.operation_kind = 'credit')
+                        OR (payout.kind = 'reversal' AND operation.operation_kind = 'reversal'))
+               ))
+           OR (payout.kind = 'payout' AND payout.status = 'reversed' AND NOT EXISTS (
+                SELECT 1 FROM invitation_rebate_payouts reversal
+                WHERE reversal.original_payout_id = payout.id
+                  AND reversal.kind = 'reversal' AND reversal.status = 'completed'
+           ))
+        ORDER BY id LIMIT $1
+        "#
+    } else {
+        r#"
+        SELECT id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
+        FROM invitation_rebate_payouts payout
+        WHERE (payout.status IN ('completed', 'reversed') AND payout.newapi_mark_id IS NULL)
+           OR (payout.kind = 'payout' AND payout.status = 'reversed' AND NOT EXISTS (
+                SELECT 1 FROM invitation_rebate_payouts reversal
+                WHERE reversal.original_payout_id = payout.id
+                  AND reversal.kind = 'reversal' AND reversal.status = 'completed'
+           ))
+        ORDER BY id LIMIT $1
+        "#
+    };
+
     add_query_issue(
         connection,
         report,
@@ -1623,17 +1925,7 @@ async fn inspect_payouts(
             severity: IssueSeverity::Blocking,
             message: "A locally final payout state lacks its external mark, or a reversed payout lacks a completed reversal.",
         },
-        r#"
-        SELECT id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
-        FROM invitation_rebate_payouts payout
-        WHERE (payout.status IN ('completed', 'reversed') AND payout.newapi_mark_id IS NULL)
-           OR (payout.kind = 'payout' AND payout.status = 'reversed' AND NOT EXISTS (
-                SELECT 1 FROM invitation_rebate_payouts reversal
-                WHERE reversal.original_payout_id = payout.id
-                  AND reversal.kind = 'reversal' AND reversal.status = 'completed'
-           ))
-        ORDER BY id LIMIT $1
-        "#,
+        external_state_sql,
     )
     .await?;
 
