@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+
     #[error("Locked: {0}")]
     Locked(String),
 
@@ -50,6 +53,7 @@ impl AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
             AppError::Locked(msg) => (StatusCode::LOCKED, msg),
             AppError::FundsMaintenance => {
                 AppError::Locked(FUNDS_MAINTENANCE_MESSAGE.to_string()).response_parts()

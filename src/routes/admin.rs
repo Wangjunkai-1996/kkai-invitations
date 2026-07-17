@@ -4,6 +4,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{TimeZone, Utc};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -20,8 +22,9 @@ use crate::invitation_signup::{
 use crate::middleware::AdminUser;
 use crate::payout::{pay_rebate_record, request_id_from_headers, PayRecordInput, PayResult};
 use crate::rebate_lifecycle::{
-    finalize_initializing_records_by_ids, rebate_amount_for_yuan, ALL_USER_GROUP,
-    INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+    finalize_initializing_records_by_ids, rebate_amount_for_cents,
+    rebate_amount_for_credited_quota, ALL_USER_GROUP, INITIALIZATION_SECONDS,
+    REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::{
     is_invitation_signup_reward_order_type, is_order_rebate_order_type,
@@ -399,6 +402,8 @@ struct LocalRebateRecord {
     id: i64,
     order_type: String,
     order_id: i64,
+    canonical_event_key: Option<String>,
+    superseded_by_record_id: Option<i64>,
     rebate_amount: i64,
     rebate_ratio: Option<f64>,
     status: String,
@@ -421,7 +426,6 @@ struct NewApiRebateOrder {
     invitee_name: Option<String>,
     user_group: String,
     order_amount: i64,
-    order_amount_yuan: f64,
     order_time: i64,
 }
 
@@ -470,6 +474,62 @@ pub struct UpdateRebateOrderRecordsRequest {
     pub record_ids: Vec<i64>,
     pub rebate_amount: Option<i64>,
     pub rebate_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+enum AdminRebateAccountingBase {
+    CreditedQuota(i64),
+    OrderAmountCents(i64),
+}
+
+impl AdminRebateAccountingBase {
+    fn from_record(
+        source_schema_version: Option<i32>,
+        credited_quota: Option<i64>,
+        order_amount_cents: i64,
+    ) -> Result<Self> {
+        match source_schema_version {
+            Some(2) => credited_quota
+                .filter(|quota| *quota > 0)
+                .map(Self::CreditedQuota)
+                .ok_or_else(|| {
+                    AppError::Internal("schema v2 返利记录缺少有效 credited_quota".to_string())
+                }),
+            None | Some(1) => Ok(Self::OrderAmountCents(order_amount_cents)),
+            Some(version) => Err(AppError::Internal(format!(
+                "返利记录 source_schema_version 不受支持: {version}"
+            ))),
+        }
+    }
+
+    fn rebate_amount(self, rate: Decimal, quota_per_unit: i64) -> Result<i64> {
+        match self {
+            Self::CreditedQuota(credited_quota) => {
+                rebate_amount_for_credited_quota(credited_quota, rate)
+            }
+            Self::OrderAmountCents(order_amount_cents) => {
+                rebate_amount_for_cents(order_amount_cents, rate, quota_per_unit)
+            }
+        }
+    }
+
+    fn ratio_for_amount(self, amount_cents: i64, quota_per_unit: i64) -> Result<Option<f64>> {
+        match self {
+            Self::CreditedQuota(credited_quota) => {
+                let rebate_quota =
+                    rebate_amount_for_cents(amount_cents, Decimal::ONE, quota_per_unit)?;
+                Decimal::from(rebate_quota)
+                    .checked_div(Decimal::from(credited_quota))
+                    .and_then(|ratio| ratio.to_f64())
+                    .map(Some)
+                    .ok_or_else(|| AppError::Internal("返利比例超出可计算范围".to_string()))
+            }
+            Self::OrderAmountCents(order_amount_cents) => Ok(derive_ratio_from_amount(
+                Some(amount_cents),
+                order_amount_cents,
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1357,24 +1417,6 @@ pub async fn get_rebate_order_records(
     );
 
     let now = Utc::now().timestamp();
-    let order_rebate_enabled = get_config_bool(&state.pool, ORDER_REBATE_ENABLED_KEY).await?;
-    let hydrated = if order_rebate_enabled {
-        hydrate_newapi_rebate_orders(&state, &orders, now).await?
-    } else {
-        tracing::info!(
-            admin_id = admin.0.id,
-            requested_count = orders.len(),
-            "Admin order rebate hydration skipped: disabled"
-        );
-        0
-    };
-    tracing::info!(
-        admin_id = admin.0.id,
-        requested_count = orders.len(),
-        hydrated_count = hydrated,
-        "Admin rebate order list hydration finished"
-    );
-
     let local_record_map = fetch_local_rebate_record_map(&state, &orders).await?;
     tracing::info!(
         admin_id = admin.0.id,
@@ -1433,7 +1475,12 @@ pub async fn update_rebate_order_records(
     let mut tx = state.pool.begin().await?;
     let rows = sqlx::query(
         r#"
-        SELECT id, order_amount::TEXT AS order_amount, status
+        SELECT id,
+               COALESCE(order_amount_cents, ROUND(order_amount * 100)::BIGINT)
+                   AS order_amount_cents,
+               credited_quota,
+               source_schema_version,
+               status
         FROM rebate_records
         WHERE id = ANY($1)
         ORDER BY id
@@ -1449,18 +1496,36 @@ pub async fn update_rebate_order_records(
     let mut updated = 0;
     for row in &rows {
         let id: i64 = row.try_get("id")?;
-        let order_amount_yuan = text_to_f64(&row.try_get::<String, _>("order_amount")?);
-        let order_amount_cents = (order_amount_yuan * 100.0).round() as i64;
-        let rebate_ratio = req
-            .rebate_ratio
-            .or_else(|| derive_ratio_from_amount(req.rebate_amount, order_amount_cents));
+        let order_amount_cents: i64 = row.try_get("order_amount_cents")?;
+        let accounting_base = AdminRebateAccountingBase::from_record(
+            row.try_get("source_schema_version")?,
+            row.try_get("credited_quota")?,
+            order_amount_cents,
+        )?;
+        let direct_rebate_quota = req
+            .rebate_amount
+            .map(|amount_cents| {
+                rebate_amount_for_cents(amount_cents, Decimal::ONE, state.config.quota_per_unit)
+            })
+            .transpose()?;
+        let rebate_ratio = match (req.rebate_ratio, req.rebate_amount) {
+            (Some(ratio), _) => Some(ratio),
+            (None, Some(amount_cents)) => {
+                accounting_base.ratio_for_amount(amount_cents, state.config.quota_per_unit)?
+            }
+            (None, None) => None,
+        };
         if let Some(ratio) = rebate_ratio {
             validate_rebate_ratio(ratio)?;
         }
-        let rebate_amount = req.rebate_amount.map(cents_to_quota).unwrap_or_else(|| {
+        let rebate_amount = if let Some(rebate_quota) = direct_rebate_quota {
+            rebate_quota
+        } else {
             let ratio = rebate_ratio.unwrap_or_default();
-            rebate_amount_for_yuan(order_amount_yuan, ratio)
-        });
+            let rate = Decimal::from_f64(ratio)
+                .ok_or_else(|| AppError::BadRequest("返利比例格式无效".to_string()))?;
+            accounting_base.rebate_amount(rate, state.config.quota_per_unit)?
+        };
 
         let rows_affected = sqlx::query(
             r#"
@@ -1548,7 +1613,7 @@ pub async fn reopen_rebate_order_records(
     let now = Utc::now().timestamp();
     let mut tx = state.pool.begin().await?;
     let rows = lock_rebate_records(&mut tx, &record_ids).await?;
-    validate_operation_rows(&rows, &record_ids, |status| status == "closed")?;
+    validate_reopen_rows(&rows, &record_ids, state.config.topup_rebate_active_from_id)?;
 
     let updated = sqlx::query(
         r#"
@@ -2223,6 +2288,7 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
             FROM top_ups t
             JOIN users u ON t.user_id = u.id
             WHERE t.status = 'success'
+              AND t.id >= $2
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
               AND NOT EXISTS (
@@ -2251,6 +2317,7 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
         "#,
     )
     .bind(order_type)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_one(&state.newapi_pool)
     .await
     .map_err(AppError::from)
@@ -2269,6 +2336,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
                 FROM top_ups t
                 JOIN users u ON t.user_id = u.id
                 WHERE t.status = 'success'
+                  AND t.id >= $1
                   AND u.inviter_id IS NOT NULL
                   AND u.inviter_id > 0
             )::BIGINT AS topup_invited,
@@ -2277,6 +2345,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
                 FROM top_ups t
                 JOIN users u ON t.user_id = u.id
                 WHERE t.status = 'success'
+                  AND t.id >= $1
                   AND u.inviter_id IS NOT NULL
                   AND u.inviter_id > 0
                   AND NOT EXISTS (
@@ -2307,6 +2376,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
             )::BIGINT AS redemption_invited
         "#,
     )
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_one(&state.newapi_pool)
     .await?;
 
@@ -2338,7 +2408,7 @@ async fn fetch_newapi_rebate_orders(
             invitee_id,
             invitee_name,
             user_group,
-            order_amount,
+            order_amount_cents,
             order_time
         FROM (
             SELECT
@@ -2348,13 +2418,14 @@ async fn fetch_newapi_rebate_orders(
                 COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
                 t.user_id AS invitee_id,
                 COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
-                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
-                t.money::TEXT AS order_amount,
+                COALESCE(NULLIF(inviter."group", ''), 'default') AS user_group,
+                ROUND(t.money::NUMERIC * 100)::BIGINT AS order_amount_cents,
                 COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS order_time
             FROM top_ups t
             JOIN users u ON t.user_id = u.id
             LEFT JOIN users inviter ON inviter.id = u.inviter_id
             WHERE t.status = 'success'
+              AND t.id >= $5
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
               AND NOT EXISTS (
@@ -2370,8 +2441,8 @@ async fn fetch_newapi_rebate_orders(
                 COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
                 s.user_id AS invitee_id,
                 COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
-                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
-                s.money::TEXT AS order_amount,
+                COALESCE(NULLIF(inviter."group", ''), 'default') AS user_group,
+                ROUND(s.money::NUMERIC * 100)::BIGINT AS order_amount_cents,
                 COALESCE(NULLIF(s.complete_time, 0), NULLIF(s.create_time, 0), 0) AS order_time
             FROM subscription_orders s
             JOIN users u ON s.user_id = u.id
@@ -2387,8 +2458,8 @@ async fn fetch_newapi_rebate_orders(
                 COALESCE(NULLIF(inviter.display_name, ''), NULLIF(inviter.username, '')) AS inviter_name,
                 r.used_user_id::BIGINT AS invitee_id,
                 COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, '')) AS invitee_name,
-                COALESCE(NULLIF(u."group", ''), 'default') AS user_group,
-                (r.quota::DOUBLE PRECISION / $2::DOUBLE PRECISION)::TEXT AS order_amount,
+                COALESCE(NULLIF(inviter."group", ''), 'default') AS user_group,
+                ROUND(r.quota::NUMERIC * 100 / $2::NUMERIC)::BIGINT AS order_amount_cents,
                 COALESCE(NULLIF(r.redeemed_time, 0), NULLIF(r.created_time, 0), 0) AS order_time
             FROM redemptions r
             JOIN users u ON r.used_user_id = u.id
@@ -2408,13 +2479,12 @@ async fn fetch_newapi_rebate_orders(
     .bind(state.config.quota_per_unit)
     .bind(page_size)
     .bind(offset)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_all(&state.newapi_pool)
     .await?;
 
     rows.iter()
         .map(|row| {
-            let order_amount_text: String = row.try_get("order_amount")?;
-            let order_amount_yuan = text_to_f64(&order_amount_text);
             Ok(NewApiRebateOrder {
                 order_type: row.try_get("order_type")?,
                 order_id: row.try_get("order_id")?,
@@ -2423,63 +2493,23 @@ async fn fetch_newapi_rebate_orders(
                 invitee_id: row.try_get("invitee_id")?,
                 invitee_name: row.try_get("invitee_name")?,
                 user_group: row.try_get("user_group")?,
-                order_amount: (order_amount_yuan * 100.0).round() as i64,
-                order_amount_yuan,
+                order_amount: row.try_get("order_amount_cents")?,
                 order_time: row.try_get("order_time")?,
             })
         })
         .collect::<Result<Vec<_>>>()
 }
 
-async fn hydrate_newapi_rebate_orders(
+#[cfg(test)]
+pub(crate) async fn fetch_newapi_topup_rebate_order_ids_for_test(
     state: &AppState,
-    orders: &[NewApiRebateOrder],
-    now: i64,
-) -> Result<i64> {
-    let mut hydrated = 0;
-
-    for order in orders {
-        let ulid = ulid::Ulid::new().to_string();
-        let order_time = if order.order_time > 0 {
-            order.order_time
-        } else {
-            now
-        };
-        let scan_started_at = now;
-        let initialization_ends_at = scan_started_at + INITIALIZATION_SECONDS;
-        let rebate_effective_at = order_time + REBATE_EFFECTIVE_DELAY_SECONDS;
-
-        let rows_affected = sqlx::query(
-            r#"
-            INSERT INTO rebate_records
-            (
-                ulid, inviter_id, invitee_id, user_group, order_type, order_id,
-                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
-                status, scan_started_at, initialization_ends_at, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NULL, 'initializing', $10, $11, $10, $10)
-            ON CONFLICT (order_type, order_id) DO NOTHING
-            "#,
-        )
-        .bind(&ulid)
-        .bind(order.inviter_id)
-        .bind(order.invitee_id)
-        .bind(&order.user_group)
-        .bind(&order.order_type)
-        .bind(order.order_id)
-        .bind(order.order_amount_yuan)
-        .bind(order_time)
-        .bind(rebate_effective_at)
-        .bind(scan_started_at)
-        .bind(initialization_ends_at)
-        .execute(&state.pool)
-        .await?
-        .rows_affected();
-
-        hydrated += rows_affected as i64;
-    }
-
-    Ok(hydrated)
+) -> Result<(i64, Vec<i64>)> {
+    let total = count_newapi_rebate_orders(state, Some("topup")).await?;
+    let orders = fetch_newapi_rebate_orders(state, Some("topup"), 1_000, 0).await?;
+    Ok((
+        total,
+        orders.into_iter().map(|order| order.order_id).collect(),
+    ))
 }
 
 async fn fetch_local_rebate_record_map(
@@ -2501,6 +2531,10 @@ async fn fetch_local_rebate_record_map(
         .filter(|order| order.order_type == REDEMPTION_ORDER_TYPE)
         .map(|order| order.order_id)
         .collect();
+    let redemption_event_keys = redemption_order_ids
+        .iter()
+        .map(|order_id| format!("newapi:redemption:{order_id}"))
+        .collect::<Vec<_>>();
 
     if topup_order_ids.is_empty()
         && subscription_order_ids.is_empty()
@@ -2515,6 +2549,8 @@ async fn fetch_local_rebate_record_map(
             id,
             order_type,
             order_id,
+            canonical_event_key,
+            superseded_by_record_id,
             rebate_amount,
             rebate_rate::TEXT AS rebate_rate,
             status,
@@ -2526,23 +2562,58 @@ async fn fetch_local_rebate_record_map(
             closed_at,
             admin_adjusted
         FROM rebate_records
-        WHERE (order_type = 'topup' AND order_id = ANY($1))
-           OR (order_type = 'subscription' AND order_id = ANY($2))
-           OR (order_type = 'redemption' AND order_id = ANY($3))
+        WHERE superseded_by_record_id IS NULL
+          AND (
+              (order_type = 'topup' AND order_id = ANY($1))
+              OR (order_type = 'subscription' AND order_id = ANY($2))
+              OR canonical_event_key::TEXT = ANY($3::TEXT[])
+              OR (order_type = 'redemption' AND order_id = ANY($4))
+          )
         "#,
     )
     .bind(&topup_order_ids)
     .bind(&subscription_order_ids)
+    .bind(&redemption_event_keys)
     .bind(&redemption_order_ids)
     .fetch_all(&state.pool)
     .await?;
 
-    rows.iter()
-        .map(|row| {
-            let record = local_rebate_record_from_row(row)?;
-            Ok(((record.order_type.clone(), record.order_id), record))
-        })
-        .collect()
+    let mut records = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let record = local_rebate_record_from_row(row)?;
+        let Some(key) = local_rebate_record_key(&record)? else {
+            continue;
+        };
+        if records.insert(key, record).is_some() {
+            return Err(AppError::Internal(
+                "同一 New API 订单映射到多条有效返利记录".to_string(),
+            ));
+        }
+    }
+    Ok(records)
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_local_rebate_record_id_for_test(
+    state: &AppState,
+    order_type: &str,
+    order_id: i64,
+) -> Result<Option<i64>> {
+    let order = NewApiRebateOrder {
+        order_type: order_type.to_string(),
+        order_id,
+        inviter_id: 1,
+        inviter_name: None,
+        invitee_id: 2,
+        invitee_name: None,
+        user_group: "default".to_string(),
+        order_amount: 0,
+        order_time: 1,
+    };
+    let records = fetch_local_rebate_record_map(state, &[order]).await?;
+    Ok(records
+        .get(&(order_type.to_string(), order_id))
+        .map(|record| record.id))
 }
 
 fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
@@ -2551,6 +2622,8 @@ fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
         id: row.try_get("id")?,
         order_type: row.try_get("order_type")?,
         order_id: row.try_get("order_id")?,
+        canonical_event_key: row.try_get("canonical_event_key")?,
+        superseded_by_record_id: row.try_get("superseded_by_record_id")?,
         rebate_amount: quota_to_cents(row.try_get("rebate_amount")?),
         rebate_ratio: rebate_rate.as_deref().map(text_to_f64),
         status: row.try_get("status")?,
@@ -2562,6 +2635,31 @@ fn local_rebate_record_from_row(row: &PgRow) -> Result<LocalRebateRecord> {
         closed_at: row.try_get("closed_at")?,
         admin_adjusted: row.try_get("admin_adjusted")?,
     })
+}
+
+fn local_rebate_record_key(record: &LocalRebateRecord) -> Result<Option<(String, i64)>> {
+    if record.superseded_by_record_id.is_some() {
+        return Ok(None);
+    }
+    let Some(event_key) = record.canonical_event_key.as_deref() else {
+        return Ok(Some((record.order_type.clone(), record.order_id)));
+    };
+    let Some(redemption_id) = event_key.strip_prefix("newapi:redemption:") else {
+        return Ok(Some((record.order_type.clone(), record.order_id)));
+    };
+    let redemption_id = redemption_id.parse::<i64>().map_err(|_| {
+        AppError::Internal(format!(
+            "返利记录 {} 的 canonical redemption event key 无效",
+            record.id
+        ))
+    })?;
+    if redemption_id <= 0 {
+        return Err(AppError::Internal(format!(
+            "返利记录 {} 的 canonical redemption ID 无效",
+            record.id
+        )));
+    }
+    Ok(Some((REDEMPTION_ORDER_TYPE.to_string(), redemption_id)))
 }
 
 fn admin_rebate_order_record_from_parts(
@@ -2630,7 +2728,7 @@ fn admin_rebate_order_record_from_parts(
             .map(|record| is_rebate_record_mutable(&record.status))
             .unwrap_or(false),
         can_reopen: local_record
-            .map(|record| record.status == "closed")
+            .map(|record| can_reopen_rebate_record(&record.status, record.superseded_by_record_id))
             .unwrap_or(false),
         can_end_initialization: local_record
             .map(|record| record.status == "initializing")
@@ -3152,6 +3250,7 @@ fn app_error_message(error: &AppError) -> &str {
         AppError::NotFound(message)
         | AppError::BadRequest(message)
         | AppError::Conflict(message)
+        | AppError::UnprocessableEntity(message)
         | AppError::Locked(message)
         | AppError::Internal(message) => message,
         AppError::Database(_) => "数据库错误",
@@ -3250,7 +3349,7 @@ async fn lock_rebate_records(
 ) -> Result<Vec<PgRow>> {
     sqlx::query(
         r#"
-        SELECT id, status
+        SELECT id, order_type, order_id, status, superseded_by_record_id
         FROM rebate_records
         WHERE id = ANY($1)
         ORDER BY id
@@ -3407,6 +3506,42 @@ fn validate_operation_rows(
     Ok(())
 }
 
+fn validate_reopen_rows(
+    rows: &[PgRow],
+    record_ids: &[i64],
+    topup_rebate_active_from_id: i64,
+) -> Result<()> {
+    validate_operation_rows(rows, record_ids, |status| status == "closed")?;
+    for row in rows {
+        let superseded_by_record_id: Option<i64> = row.try_get("superseded_by_record_id")?;
+        if superseded_by_record_id.is_some() {
+            return Err(AppError::BadRequest(
+                "已被主记录取代的返利记录必须永久关闭".to_string(),
+            ));
+        }
+        let order_type: String = row.try_get("order_type")?;
+        let order_id: i64 = row.try_get("order_id")?;
+        if is_topup_before_active_boundary(&order_type, order_id, topup_rebate_active_from_id) {
+            return Err(AppError::BadRequest(
+                "在线充值记录早于返利生效边界，必须永久关闭".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_topup_before_active_boundary(
+    order_type: &str,
+    order_id: i64,
+    topup_rebate_active_from_id: i64,
+) -> bool {
+    order_type == "topup" && order_id > 0 && order_id < topup_rebate_active_from_id
+}
+
+fn can_reopen_rebate_record(status: &str, superseded_by_record_id: Option<i64>) -> bool {
+    status == "closed" && superseded_by_record_id.is_none()
+}
+
 fn is_rebate_record_mutable(status: &str) -> bool {
     matches!(status, "initializing" | "pending" | "rejected")
 }
@@ -3559,6 +3694,68 @@ mod tests {
         };
 
         assert_eq!(params.order_type_filter(), Some("redemption"));
+    }
+
+    #[test]
+    fn canonical_redemption_master_maps_to_the_newapi_redemption_order() {
+        let record = LocalRebateRecord {
+            id: 77,
+            order_type: "topup".to_string(),
+            order_id: -4432,
+            canonical_event_key: Some("newapi:redemption:4432".to_string()),
+            superseded_by_record_id: None,
+            rebate_amount: 250,
+            rebate_ratio: Some(0.05),
+            status: "pending".to_string(),
+            order_time: 1,
+            rebate_effective_at: 2,
+            scan_started_at: 1,
+            initialization_ends_at: 2,
+            finalized_at: Some(2),
+            closed_at: None,
+            admin_adjusted: false,
+        };
+
+        assert_eq!(
+            local_rebate_record_key(&record).unwrap(),
+            Some(("redemption".to_string(), 4432))
+        );
+    }
+
+    #[test]
+    fn superseded_records_are_not_mapped_or_reopened() {
+        let record = LocalRebateRecord {
+            id: 78,
+            order_type: "redemption".to_string(),
+            order_id: 4432,
+            canonical_event_key: None,
+            superseded_by_record_id: Some(77),
+            rebate_amount: 0,
+            rebate_ratio: None,
+            status: "closed".to_string(),
+            order_time: 1,
+            rebate_effective_at: 2,
+            scan_started_at: 1,
+            initialization_ends_at: 2,
+            finalized_at: None,
+            closed_at: Some(2),
+            admin_adjusted: false,
+        };
+
+        assert_eq!(local_rebate_record_key(&record).unwrap(), None);
+        assert!(!can_reopen_rebate_record(
+            &record.status,
+            record.superseded_by_record_id
+        ));
+        assert!(can_reopen_rebate_record("closed", None));
+    }
+
+    #[test]
+    fn topups_before_active_boundary_cannot_be_reopened() {
+        assert!(is_topup_before_active_boundary("topup", 426, 444));
+        assert!(!is_topup_before_active_boundary("topup", 444, 444));
+        assert!(!is_topup_before_active_boundary("topup", -4432, 444));
+        assert!(!is_topup_before_active_boundary("redemption", 426, 444));
     }
 
     #[test]

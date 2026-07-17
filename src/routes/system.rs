@@ -1,7 +1,12 @@
+use std::collections::HashMap;
+
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::pool::PoolConnection;
+use sqlx::Postgres;
 use sqlx::Row;
 
 use crate::error::{AppError, Result};
@@ -11,11 +16,12 @@ use crate::invitation_signup::{
     upsert_invitation_registration, InsertInvitationSignupReward, UpsertInvitationRegistration,
 };
 use crate::rebate_lifecycle::{
-    finalize_ready_initializing_records, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+    finalize_ready_initializing_records, finalize_ready_topup_event_records,
+    INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::{
     INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
-    REDEMPTION_ORDER_TYPE, SUBSCRIPTION_ORDER_TYPE, TOPUP_ORDER_TYPE,
+    REDEMPTION_ORDER_TYPE, SUBSCRIPTION_ORDER_TYPE,
 };
 use crate::response::{message, ApiResponse};
 use crate::system_config::{
@@ -28,6 +34,24 @@ use crate::system_config::{
 use crate::AppState;
 
 const REBATE_SYNC_ADVISORY_LOCK_ID: i64 = 6_212_202_606_050;
+const TOPUP_RECONCILIATION_SOURCE: &str = "newapi";
+const TOPUP_RECONCILIATION_LOOKBACK_SECONDS: i64 = 24 * 60 * 60;
+const TOPUP_EVENT_DELIVERY_GRACE_SECONDS: i64 = 60;
+const TOPUP_EVENT_STALLED_SECONDS: i64 = 5 * 60;
+const TOPUP_COMPLETED_TOPIC: &str = "kkai.billing.topup.completed";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RebateSourceReceiptOutcome {
+    Created,
+    IgnoredNoInviter,
+}
+
+#[derive(Clone, Copy)]
+struct RebateSourceReceiptAudit {
+    outcome: RebateSourceReceiptOutcome,
+    canonical_exists: bool,
+    integrity_valid: bool,
+}
 
 // POST /api/system/sync-rebates
 pub async fn sync_rebates(
@@ -48,6 +72,46 @@ pub async fn sync_rebates(
 }
 
 pub async fn run_rebate_sync(state: &AppState) -> Result<SyncResponse> {
+    let Some(lock_conn) = acquire_rebate_sync_lock(state, "rebate sync").await? else {
+        return Ok(SyncResponse::skipped());
+    };
+
+    release_rebate_sync_lock(lock_conn, run_rebate_sync_unlocked(state).await).await
+}
+
+pub struct TopUpReconciliationResult {
+    pub skipped: bool,
+    pub finalized: i64,
+    pub created_cases: i64,
+}
+
+pub async fn run_topup_reconciliation(state: &AppState) -> Result<TopUpReconciliationResult> {
+    let Some(lock_conn) = acquire_rebate_sync_lock(state, "top-up reconciliation").await? else {
+        return Ok(TopUpReconciliationResult {
+            skipped: true,
+            finalized: 0,
+            created_cases: 0,
+        });
+    };
+
+    let result = async {
+        let now = chrono::Utc::now().timestamp();
+        let finalized = finalize_ready_topup_event_records(&state.pool, now).await?;
+        let created_cases = sync_topup_orders(state, now).await?;
+        Ok(TopUpReconciliationResult {
+            skipped: false,
+            finalized,
+            created_cases,
+        })
+    }
+    .await;
+    release_rebate_sync_lock(lock_conn, result).await
+}
+
+async fn acquire_rebate_sync_lock(
+    state: &AppState,
+    operation: &str,
+) -> Result<Option<PoolConnection<Postgres>>> {
     let mut lock_conn = state.pool.acquire().await?;
     let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(REBATE_SYNC_ADVISORY_LOCK_ID)
@@ -55,11 +119,19 @@ pub async fn run_rebate_sync(state: &AppState) -> Result<SyncResponse> {
         .await?;
 
     if !lock_acquired {
-        tracing::info!("Rebate sync skipped: another sync is already running");
-        return Ok(SyncResponse::skipped());
+        tracing::info!(
+            operation,
+            "Operation skipped: another rebate sync is already running"
+        );
+        return Ok(None);
     }
+    Ok(Some(lock_conn))
+}
 
-    let result = run_rebate_sync_unlocked(state).await;
+async fn release_rebate_sync_lock<T>(
+    mut lock_conn: PoolConnection<Postgres>,
+    result: Result<T>,
+) -> Result<T> {
     let unlock_result: std::result::Result<bool, sqlx::Error> =
         sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
             .bind(REBATE_SYNC_ADVISORY_LOCK_ID)
@@ -67,10 +139,10 @@ pub async fn run_rebate_sync(state: &AppState) -> Result<SyncResponse> {
             .await;
 
     match (result, unlock_result) {
-        (Ok(response), Ok(true)) => Ok(response),
-        (Ok(response), Ok(false)) => {
+        (Ok(value), Ok(true)) => Ok(value),
+        (Ok(value), Ok(false)) => {
             tracing::warn!("Rebate sync advisory lock was not held while unlocking");
-            Ok(response)
+            Ok(value)
         }
         (Ok(_), Err(err)) => Err(AppError::from(err)),
         (Err(err), Ok(_)) => Err(err),
@@ -405,85 +477,367 @@ async fn sync_invitation_signup_reward_unlocks(state: &AppState, now: i64) -> Re
 }
 
 async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
-    let last_sync_id = last_sync_id(state, "topup").await?;
+    let cursor = topup_reconciliation_cursor(state).await?;
+    let open_case_order_ids = load_open_topup_case_order_ids(state).await?;
+    let lookback_start = if cursor.last_time == 0 {
+        now.saturating_sub(TOPUP_RECONCILIATION_LOOKBACK_SECONDS)
+    } else {
+        cursor
+            .last_time
+            .saturating_sub(TOPUP_RECONCILIATION_LOOKBACK_SECONDS)
+    };
     let orders = sqlx::query(
         r#"
         SELECT
             t.id,
-            t.user_id,
-            t.money,
             COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS order_time,
-            u.inviter_id,
-            u."group"
+            outbox.status AS outbox_status
         FROM top_ups t
-        JOIN users u ON t.user_id = u.id
-        WHERE t.id > $1
-          AND t.status = 'success'
-          AND u.inviter_id IS NOT NULL
-          AND u.inviter_id > 0
+        LEFT JOIN kkai_outbox outbox
+          ON outbox.event_key = 'newapi:topup:' || t.id::TEXT
+         AND outbox.topic = $2
+        WHERE t.status = 'success'
+          AND t.id >= $4
+          AND (
+              COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) >= $1
+              OR t.id = ANY($3)
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM subscription_orders s
               WHERE s.trade_no = t.trade_no
           )
-        ORDER BY t.id
-        LIMIT 1000
+        ORDER BY order_time, t.id
         "#,
     )
-    .bind(last_sync_id)
+    .bind(lookback_start)
+    .bind(TOPUP_COMPLETED_TOPIC)
+    .bind(&open_case_order_ids)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_all(&state.newapi_pool)
     .await?;
 
     tracing::info!(
-        last_sync_id,
+        cursor_time = cursor.last_time,
+        cursor_id = cursor.last_id,
+        lookback_start,
         fetched_count = orders.len(),
-        "Topup rebate sync loaded new-api orders"
+        "Topup reconciliation loaded successful new-api orders"
     );
 
-    let mut synced = 0;
-    let mut max_processed_id = last_sync_id;
+    let event_keys = orders
+        .iter()
+        .map(|order| {
+            order
+                .try_get::<i64, _>("id")
+                .map(|id| format!("newapi:topup:{id}"))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let receipt_audits = load_rebate_source_receipt_audits(state, &event_keys).await?;
+    let mut created_cases = 0;
+    let mut max_processed = cursor;
 
-    for order in orders {
+    for order in &orders {
         let order_id: i64 = order.try_get("id")?;
-        let user_id: i64 = order.try_get("user_id")?;
-        let money: f64 = order.try_get("money")?;
         let order_time: i64 = order.try_get("order_time")?;
-        let inviter_id: i64 = order.try_get("inviter_id")?;
-        let group: Option<String> = order.try_get("group")?;
+        let outbox_status: Option<String> = order.try_get("outbox_status")?;
+        let event_key = format!("newapi:topup:{order_id}");
+        let elapsed = now.saturating_sub(order_time);
+        let receipt_audit = receipt_audits.get(&event_key).copied();
+        let receipt_outcome = receipt_audit.map(|audit| audit.outcome);
 
-        match insert_rebate_record(
+        created_cases += reconcile_topup_issue(
             state,
-            InsertRebateRecord {
-                order_type: TOPUP_ORDER_TYPE,
-                order_id,
-                user_id,
-                inviter_id,
-                money,
-                order_time,
-                group: group.as_deref().unwrap_or("default"),
-                now,
-            },
+            "topup_outbox_missing",
+            &event_key,
+            order_id,
+            elapsed >= TOPUP_EVENT_DELIVERY_GRACE_SECONDS
+                && receipt_outcome.is_none()
+                && outbox_status.is_none(),
+            now,
         )
-        .await?
-        {
-            InsertOutcome::Inserted => {
-                synced += 1;
-                max_processed_id = order_id;
-            }
-            InsertOutcome::Duplicate => {
-                max_processed_id = order_id;
-            }
+        .await?;
+        let canonical_missing = receipt_audit.is_some_and(|audit| {
+            audit.outcome == RebateSourceReceiptOutcome::Created && !audit.canonical_exists
+        });
+        created_cases += reconcile_topup_issue(
+            state,
+            "topup_outbox_stalled",
+            &event_key,
+            order_id,
+            elapsed >= TOPUP_EVENT_STALLED_SECONDS
+                && receipt_outcome.is_none()
+                && outbox_status.as_deref() == Some("pending"),
+            now,
+        )
+        .await?;
+        created_cases += reconcile_topup_issue(
+            state,
+            "topup_outbox_dead",
+            &event_key,
+            order_id,
+            outbox_status.as_deref() == Some("dead"),
+            now,
+        )
+        .await?;
+        created_cases += reconcile_topup_issue(
+            state,
+            "topup_event_receipt_missing",
+            &event_key,
+            order_id,
+            elapsed >= TOPUP_EVENT_DELIVERY_GRACE_SECONDS && receipt_outcome.is_none(),
+            now,
+        )
+        .await?;
+        created_cases += reconcile_topup_issue(
+            state,
+            "topup_canonical_record_missing",
+            &event_key,
+            order_id,
+            canonical_missing,
+            now,
+        )
+        .await?;
+        created_cases += reconcile_topup_issue(
+            state,
+            "topup_receipt_integrity_drift",
+            &event_key,
+            order_id,
+            receipt_audit.is_some_and(|audit| !audit.integrity_valid) && !canonical_missing,
+            now,
+        )
+        .await?;
+
+        let processed = SyncCursor {
+            last_time: order_time,
+            last_id: order_id,
+        };
+        if sync_cursor_advanced(processed, max_processed) {
+            max_processed = processed;
         }
     }
 
-    update_sync_log_if_advanced(state, "topup", max_processed_id, last_sync_id, now).await?;
+    update_topup_reconciliation_checkpoint(state, max_processed, now).await?;
     tracing::info!(
-        last_sync_id,
-        max_processed_id,
-        inserted_count = synced,
-        "Topup rebate sync processed"
+        cursor_time = max_processed.last_time,
+        cursor_id = max_processed.last_id,
+        created_case_count = created_cases,
+        "Topup read-only reconciliation completed"
     );
-    Ok(synced)
+    Ok(created_cases)
+}
+
+async fn load_open_topup_case_order_ids(state: &AppState) -> Result<Vec<i64>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT source_order_id
+        FROM rebate_reconciliation_cases
+        WHERE case_state IN ('open', 'approved')
+          AND issue_code LIKE 'topup\_%' ESCAPE '\'
+          AND source_event_key IS NOT NULL
+          AND source_order_id IS NOT NULL
+        ORDER BY source_order_id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::from)
+}
+
+async fn load_rebate_source_receipt_audits(
+    state: &AppState,
+    event_keys: &[String],
+) -> Result<HashMap<String, RebateSourceReceiptAudit>> {
+    if event_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT receipt.event_key, receipt.outcome,
+               canonical.id IS NOT NULL AS canonical_exists,
+               CASE receipt.outcome
+                   WHEN 'created' THEN
+                       receipt.event_type = 'topup.completed'
+                       AND receipt.source_schema_version IN (1, 2)
+                       AND receipt.event_key = 'newapi:topup:' || receipt.source_order_id::TEXT
+                       AND linked.id = receipt.rebate_record_id
+                       AND canonical.id = linked.id
+                       AND linked.order_type = 'topup'
+                       AND linked.order_id = receipt.source_order_id
+                       AND linked.canonical_event_key = receipt.event_key
+                       AND linked.source_payload_sha256 = receipt.source_payload_sha256
+                       AND linked.source_schema_version = receipt.source_schema_version
+                       AND snapshot.rebate_record_id = linked.id
+                       AND snapshot.inviter_group = linked.user_group
+                       AND snapshot.rule_type = 'topup'
+                       AND snapshot.order_amount_minor = COALESCE(linked.order_amount_cents, 0)
+                       AND snapshot.credited_quota = linked.credited_quota
+                       AND linked.credited_quota IS NOT NULL
+                       AND snapshot.rebate_quota = linked.rebate_amount
+                       AND snapshot.rebate_quota =
+                           ROUND(snapshot.credited_quota::NUMERIC * snapshot.rebate_rate)::BIGINT
+                       AND snapshot.quota_per_unit > 0
+                       AND snapshot.quota_per_unit % 100 = 0
+                       AND snapshot.source_revision = CASE receipt.source_schema_version
+                           WHEN 1 THEN 'rebate-source-event:v1'
+                           WHEN 2 THEN 'rebate-source-event:v2'
+                       END
+                       AND (
+                           linked.rebate_rate = snapshot.rebate_rate
+                           OR (linked.rebate_rate IS NULL AND snapshot.rebate_rate = 0)
+                       )
+                   WHEN 'ignored_no_inviter' THEN
+                       receipt.event_type = 'topup.completed'
+                       AND receipt.source_schema_version IN (1, 2)
+                       AND receipt.event_key = 'newapi:topup:' || receipt.source_order_id::TEXT
+                       AND receipt.rebate_record_id IS NULL
+                       AND canonical.id IS NULL
+                   ELSE FALSE
+               END AS integrity_valid
+        FROM rebate_source_event_receipts receipt
+        LEFT JOIN rebate_records linked ON linked.id = receipt.rebate_record_id
+        LEFT JOIN rebate_records canonical
+          ON canonical.canonical_event_key = receipt.event_key
+        LEFT JOIN rebate_calculation_snapshots snapshot
+          ON snapshot.rebate_record_id = linked.id
+        WHERE receipt.event_key::TEXT = ANY($1::TEXT[])
+        "#,
+    )
+    .bind(event_keys)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut outcomes = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let event_key: String = row.try_get("event_key")?;
+        let outcome = match row.try_get::<String, _>("outcome")?.as_str() {
+            "created" => RebateSourceReceiptOutcome::Created,
+            "ignored_no_inviter" => RebateSourceReceiptOutcome::IgnoredNoInviter,
+            value => {
+                return Err(AppError::Internal(format!(
+                    "返利源事件 receipt outcome 无效: {value}"
+                )))
+            }
+        };
+        outcomes.insert(
+            event_key,
+            RebateSourceReceiptAudit {
+                outcome,
+                canonical_exists: row.try_get("canonical_exists")?,
+                integrity_valid: row.try_get("integrity_valid")?,
+            },
+        );
+    }
+    Ok(outcomes)
+}
+
+async fn reconcile_topup_issue(
+    state: &AppState,
+    issue_code: &str,
+    event_key: &str,
+    source_order_id: i64,
+    issue_present: bool,
+    now: i64,
+) -> Result<i64> {
+    let evidence_sha256 = hex::encode(Sha256::digest(
+        format!("topup-reconciliation:v1:{issue_code}:{event_key}").as_bytes(),
+    ));
+    if !issue_present {
+        sqlx::query(
+            r#"
+            UPDATE rebate_reconciliation_cases
+            SET case_state = 'resolved', resolved_at = $3, updated_at = $3
+            WHERE issue_code = $1 AND evidence_sha256 = $2
+              AND case_state IN ('open', 'approved')
+            "#,
+        )
+        .bind(issue_code)
+        .bind(&evidence_sha256)
+        .bind(now)
+        .execute(&state.pool)
+        .await?;
+        return Ok(0);
+    }
+
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO rebate_reconciliation_cases (
+            issue_code, case_state, evidence_sha256,
+            source_event_key, source_order_id, created_at, updated_at
+        )
+        SELECT $1, 'open', $2, $3, $4, $5, $5
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM rebate_reconciliation_cases
+            WHERE issue_code = $1 AND evidence_sha256 = $2
+              AND case_state IN ('open', 'approved')
+        )
+        "#,
+    )
+    .bind(issue_code)
+    .bind(evidence_sha256)
+    .bind(event_key)
+    .bind(source_order_id)
+    .bind(now)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    Ok(inserted as i64)
+}
+
+async fn topup_reconciliation_cursor(state: &AppState) -> Result<SyncCursor> {
+    let row = sqlx::query(
+        r#"
+        SELECT cursor_time, cursor_id
+        FROM rebate_sync_checkpoints
+        WHERE sync_type = 'topup' AND source_namespace = $1
+        "#,
+    )
+    .bind(TOPUP_RECONCILIATION_SOURCE)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(row.map_or(
+        SyncCursor {
+            last_id: 0,
+            last_time: 0,
+        },
+        |row| SyncCursor {
+            last_id: row.get("cursor_id"),
+            last_time: row.get("cursor_time"),
+        },
+    ))
+}
+
+async fn update_topup_reconciliation_checkpoint(
+    state: &AppState,
+    cursor: SyncCursor,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO rebate_sync_checkpoints (
+            sync_type, source_namespace, cursor_time, cursor_id, lookback_seconds, updated_at
+        ) VALUES ('topup', $1, $2, $3, $4, $5)
+        ON CONFLICT (sync_type, source_namespace) DO UPDATE
+        SET cursor_time = GREATEST(rebate_sync_checkpoints.cursor_time, EXCLUDED.cursor_time),
+            cursor_id = CASE
+                WHEN EXCLUDED.cursor_time > rebate_sync_checkpoints.cursor_time
+                    THEN EXCLUDED.cursor_id
+                WHEN EXCLUDED.cursor_time = rebate_sync_checkpoints.cursor_time
+                    THEN GREATEST(rebate_sync_checkpoints.cursor_id, EXCLUDED.cursor_id)
+                ELSE rebate_sync_checkpoints.cursor_id
+            END,
+            lookback_seconds = EXCLUDED.lookback_seconds,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(TOPUP_RECONCILIATION_SOURCE)
+    .bind(cursor.last_time)
+    .bind(cursor.last_id)
+    .bind(TOPUP_RECONCILIATION_LOOKBACK_SECONDS)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 async fn sync_subscription_orders(state: &AppState, now: i64) -> Result<i64> {
