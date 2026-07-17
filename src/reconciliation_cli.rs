@@ -18,7 +18,7 @@ use crate::rebate_source_events::{
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
 
-const MANIFEST_VERSION: i32 = 2;
+const MANIFEST_VERSION: i32 = 3;
 const SOURCE_NAMESPACE: &str = "newapi";
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +68,7 @@ pub struct ReconciliationManifest {
     pub manifest_version: i32,
     pub source_namespace: String,
     pub generated_at: i64,
+    pub active_from_topup_id: i64,
     pub cutoff_topup_id: i64,
     pub quota_per_unit: i64,
     pub orders: Vec<ManifestOrder>,
@@ -180,6 +181,8 @@ pub async fn run(args: &[String]) -> Result<String, ReconciliationCliError> {
     let newapi_url =
         config::newapi_database_url_from_env().map_err(ReconciliationCliError::Configuration)?;
     let quota_per_unit = config::quota_per_unit_from_env();
+    let active_from_topup_id = config::topup_rebate_active_from_id_from_env()
+        .map_err(ReconciliationCliError::Configuration)?;
     let invitations_pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&invitations_url)
@@ -189,7 +192,14 @@ pub async fn run(args: &[String]) -> Result<String, ReconciliationCliError> {
     match command {
         "plan" => {
             let cutoff = required_positive_i64_flag(args, "--cutoff-topup-id")?;
-            let manifest = plan(&invitations_pool, &newapi_pool, quota_per_unit, cutoff).await?;
+            let manifest = plan(
+                &invitations_pool,
+                &newapi_pool,
+                quota_per_unit,
+                active_from_topup_id,
+                cutoff,
+            )
+            .await?;
             let envelope = envelope(manifest)?;
             Ok(serde_json::to_string_pretty(&envelope)?)
         }
@@ -197,14 +207,27 @@ pub async fn run(args: &[String]) -> Result<String, ReconciliationCliError> {
             let expected = required_sha256_flag(args)?;
             let envelope = read_manifest_from_stdin()?;
             validate_envelope(&envelope, &expected)?;
-            let report = apply(&invitations_pool, &newapi_pool, envelope, settlement_mode).await?;
+            let report = apply(
+                &invitations_pool,
+                &newapi_pool,
+                envelope,
+                settlement_mode,
+                active_from_topup_id,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&report)?)
         }
         "verify" => {
             let expected = required_sha256_flag(args)?;
             let envelope = read_manifest_from_stdin()?;
             validate_envelope(&envelope, &expected)?;
-            let report = verify(&invitations_pool, &newapi_pool, envelope).await?;
+            let report = verify(
+                &invitations_pool,
+                &newapi_pool,
+                envelope,
+                active_from_topup_id,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&report)?)
         }
         value => Err(ReconciliationCliError::InvalidCommand(format!(
@@ -231,9 +254,21 @@ pub async fn plan(
     invitations_pool: &PgPool,
     newapi_pool: &PgPool,
     quota_per_unit: i64,
+    active_from_topup_id: i64,
     cutoff_topup_id: i64,
 ) -> Result<ReconciliationManifest, ReconciliationCliError> {
-    let source_orders = load_source_orders(newapi_pool, Some(cutoff_topup_id), None).await?;
+    if active_from_topup_id <= 0 || active_from_topup_id > cutoff_topup_id {
+        return Err(ReconciliationCliError::Configuration(
+            "TOPUP_REBATE_ACTIVE_FROM_ID must be positive and not exceed the cutoff".to_string(),
+        ));
+    }
+    let source_orders = load_source_orders(
+        newapi_pool,
+        active_from_topup_id,
+        Some(cutoff_topup_id),
+        None,
+    )
+    .await?;
     let mut rules = HashMap::new();
     let mut orders = Vec::with_capacity(source_orders.len());
     for source in source_orders {
@@ -272,6 +307,7 @@ pub async fn plan(
         manifest_version: MANIFEST_VERSION,
         source_namespace: SOURCE_NAMESPACE.to_string(),
         generated_at: chrono::Utc::now().timestamp(),
+        active_from_topup_id,
         cutoff_topup_id,
         quota_per_unit,
         orders,
@@ -283,12 +319,14 @@ async fn apply(
     newapi_pool: &PgPool,
     envelope: ManifestEnvelope,
     settlement_mode: SettlementMode,
+    configured_active_from_topup_id: i64,
 ) -> Result<ApplyReport, ReconciliationCliError> {
     if settlement_mode != SettlementMode::ReadOnly {
         return Err(ReconciliationCliError::Configuration(
             "reconcile apply requires read_only settlement mode".to_string(),
         ));
     }
+    validate_configured_active_boundary(&envelope.manifest, configured_active_from_topup_id)?;
     revalidate_source(newapi_pool, &envelope.manifest).await?;
     let mut transaction = invitations_pool.begin().await?;
     sqlx::query("LOCK TABLE rebate_rules IN SHARE MODE")
@@ -309,6 +347,7 @@ async fn apply(
             &mut transaction,
             manifest_event(order),
             envelope.manifest.quota_per_unit,
+            envelope.manifest.active_from_topup_id,
         )
         .await?
         {
@@ -326,7 +365,9 @@ async fn verify(
     invitations_pool: &PgPool,
     newapi_pool: &PgPool,
     envelope: ManifestEnvelope,
+    configured_active_from_topup_id: i64,
 ) -> Result<VerifyReport, ReconciliationCliError> {
+    validate_configured_active_boundary(&envelope.manifest, configured_active_from_topup_id)?;
     revalidate_source(newapi_pool, &envelope.manifest).await?;
     for order in &envelope.manifest.orders {
         verify_order(invitations_pool, order, envelope.manifest.quota_per_unit).await?;
@@ -345,11 +386,13 @@ pub(crate) async fn apply_for_test(
     newapi_pool: &PgPool,
     manifest: ReconciliationManifest,
 ) -> Result<(usize, usize), ReconciliationCliError> {
+    let active_from_topup_id = manifest.active_from_topup_id;
     let report = apply(
         invitations_pool,
         newapi_pool,
         envelope(manifest)?,
         SettlementMode::ReadOnly,
+        active_from_topup_id,
     )
     .await?;
     Ok((report.created, report.replayed))
@@ -361,12 +404,20 @@ pub(crate) async fn verify_for_test(
     newapi_pool: &PgPool,
     manifest: ReconciliationManifest,
 ) -> Result<usize, ReconciliationCliError> {
-    let report = verify(invitations_pool, newapi_pool, envelope(manifest)?).await?;
+    let active_from_topup_id = manifest.active_from_topup_id;
+    let report = verify(
+        invitations_pool,
+        newapi_pool,
+        envelope(manifest)?,
+        active_from_topup_id,
+    )
+    .await?;
     Ok(report.verified)
 }
 
 async fn load_source_orders(
     pool: &PgPool,
+    active_from_topup_id: i64,
     cutoff_topup_id: Option<i64>,
     order_ids: Option<&[i64]>,
 ) -> Result<Vec<SourceOrder>, ReconciliationCliError> {
@@ -388,8 +439,9 @@ async fn load_source_orders(
         WHERE t.status = 'success'
           AND invitee.inviter_id IS NOT NULL
           AND invitee.inviter_id > 0
-          AND ($1::BIGINT IS NULL OR t.id <= $1)
-          AND ($2::BIGINT[] IS NULL OR t.id = ANY($2))
+          AND t.id >= $1
+          AND ($2::BIGINT IS NULL OR t.id <= $2)
+          AND ($3::BIGINT[] IS NULL OR t.id = ANY($3))
           AND NOT EXISTS (
               SELECT 1 FROM subscription_orders subscription
               WHERE subscription.trade_no = t.trade_no
@@ -397,6 +449,7 @@ async fn load_source_orders(
         ORDER BY t.id
         "#,
     )
+    .bind(active_from_topup_id)
     .bind(cutoff_topup_id)
     .bind(order_ids)
     .fetch_all(pool)
@@ -437,6 +490,7 @@ async fn revalidate_source(
         .collect::<Vec<_>>();
     let rows = load_source_orders(
         newapi_pool,
+        manifest.active_from_topup_id,
         Some(manifest.cutoff_topup_id),
         Some(&order_ids),
     )
@@ -1084,11 +1138,28 @@ fn validate_envelope(
     Ok(())
 }
 
+fn validate_configured_active_boundary(
+    manifest: &ReconciliationManifest,
+    configured_active_from_topup_id: i64,
+) -> Result<(), ReconciliationCliError> {
+    if configured_active_from_topup_id <= 0
+        || manifest.active_from_topup_id != configured_active_from_topup_id
+    {
+        return Err(ReconciliationCliError::Configuration(format!(
+            "manifest active boundary {} does not match TOPUP_REBATE_ACTIVE_FROM_ID {}",
+            manifest.active_from_topup_id, configured_active_from_topup_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_manifest(manifest: &ReconciliationManifest) -> Result<(), ReconciliationCliError> {
     if manifest.manifest_version != MANIFEST_VERSION
         || manifest.source_namespace != SOURCE_NAMESPACE
         || manifest.generated_at <= 0
+        || manifest.active_from_topup_id <= 0
         || manifest.cutoff_topup_id <= 0
+        || manifest.active_from_topup_id > manifest.cutoff_topup_id
         || manifest.quota_per_unit <= 0
         || manifest.quota_per_unit % 100 != 0
     {
@@ -1099,7 +1170,7 @@ fn validate_manifest(manifest: &ReconciliationManifest) -> Result<(), Reconcilia
     let mut ids = HashSet::new();
     for order in &manifest.orders {
         let expected_event_key = format!("newapi:topup:{}", order.source_order_id);
-        if order.source_order_id <= 0
+        if order.source_order_id < manifest.active_from_topup_id
             || order.source_order_id > manifest.cutoff_topup_id
             || !ids.insert(order.source_order_id)
             || order.source_row_sha256.len() != 64
@@ -1212,9 +1283,10 @@ mod tests {
     #[test]
     fn manifest_hash_detects_content_changes() {
         let manifest = ReconciliationManifest {
-            manifest_version: 2,
+            manifest_version: 3,
             source_namespace: "newapi".to_string(),
             generated_at: 1,
+            active_from_topup_id: 1,
             cutoff_topup_id: 1,
             quota_per_unit: 500_000,
             orders: Vec::new(),
@@ -1224,6 +1296,7 @@ mod tests {
         assert!(validate_envelope(&envelope, &expected).is_ok());
         envelope.manifest.generated_at = 2;
         assert!(validate_envelope(&envelope, &expected).is_err());
+        assert!(validate_configured_active_boundary(&envelope.manifest, 2).is_err());
     }
 
     #[test]
@@ -1323,9 +1396,10 @@ mod tests {
     #[test]
     fn manifest_rejects_an_inconsistent_rebate_expectation() {
         let manifest = ReconciliationManifest {
-            manifest_version: 2,
+            manifest_version: 3,
             source_namespace: "newapi".to_string(),
             generated_at: 1,
+            active_from_topup_id: 842,
             cutoff_topup_id: 842,
             quota_per_unit: 500_000,
             orders: vec![ManifestOrder {
@@ -1343,6 +1417,36 @@ mod tests {
                 existing_record: None,
                 rebate_rate: "0.05".to_string(),
                 expected_rebate_quota: 1,
+            }],
+        };
+
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_orders_before_the_active_boundary() {
+        let manifest = ReconciliationManifest {
+            manifest_version: 3,
+            source_namespace: "newapi".to_string(),
+            generated_at: 1,
+            active_from_topup_id: 843,
+            cutoff_topup_id: 900,
+            quota_per_unit: 500_000,
+            orders: vec![ManifestOrder {
+                source_order_id: 842,
+                invitee_id: 3418,
+                inviter_id: 1001,
+                inviter_group: "default".to_string(),
+                order_amount_cents: None,
+                credited_quota: 37_500_000,
+                credited_quota_source_field: "amount".to_string(),
+                credited_quota_source_value: "75".to_string(),
+                completed_at: 1_784_211_072,
+                payment_provider: "epay".to_string(),
+                source_row_sha256: "a".repeat(64),
+                existing_record: None,
+                rebate_rate: "0.05".to_string(),
+                expected_rebate_quota: 1_875_000,
             }],
         };
 

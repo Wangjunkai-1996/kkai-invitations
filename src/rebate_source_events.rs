@@ -128,7 +128,14 @@ pub async fn receive_rebate_source_event(
     let Json(event) = payload
         .map_err(|_| AppError::UnprocessableEntity("返利源事件 JSON 格式无效".to_string()))?;
 
-    match ingest_rebate_source_event(&state.pool, event, state.config.quota_per_unit).await {
+    match ingest_rebate_source_event(
+        &state.pool,
+        event,
+        state.config.quota_per_unit,
+        state.config.topup_rebate_active_from_id,
+    )
+    .await
+    {
         Ok(IngestOutcome::Created) => Ok(StatusCode::CREATED),
         Ok(IngestOutcome::Replay) => Ok(StatusCode::OK),
         Ok(IngestOutcome::IgnoredNoInviter) => Ok(StatusCode::NO_CONTENT),
@@ -142,12 +149,14 @@ pub async fn ingest_rebate_source_event(
     pool: &sqlx::PgPool,
     event: RebateSourceEvent,
     quota_per_unit: i64,
+    topup_rebate_active_from_id: i64,
 ) -> std::result::Result<IngestOutcome, IngestError> {
     let mut transaction = pool.begin().await?;
     let outcome = ingest_rebate_source_event_with_policy(
         &mut transaction,
         event,
         quota_per_unit,
+        topup_rebate_active_from_id,
         ExistingRecordPolicy::StrictOnline,
     )
     .await?;
@@ -159,11 +168,13 @@ pub(crate) async fn attach_legacy_rebate_source_event_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     event: RebateSourceEvent,
     quota_per_unit: i64,
+    topup_rebate_active_from_id: i64,
 ) -> std::result::Result<IngestOutcome, IngestError> {
     ingest_rebate_source_event_with_policy(
         transaction,
         event,
         quota_per_unit,
+        topup_rebate_active_from_id,
         ExistingRecordPolicy::AuditedLegacyAttach,
     )
     .await
@@ -173,10 +184,12 @@ async fn ingest_rebate_source_event_with_policy(
     transaction: &mut Transaction<'_, Postgres>,
     event: RebateSourceEvent,
     quota_per_unit: i64,
+    topup_rebate_active_from_id: i64,
     existing_record_policy: ExistingRecordPolicy,
 ) -> std::result::Result<IngestOutcome, IngestError> {
     let event = validate_event(event)?;
     validate_quota_per_unit(quota_per_unit)?;
+    validate_topup_rebate_scope(&event, topup_rebate_active_from_id)?;
     let payload_hash = source_payload_hash(&event)?;
     lock_event_identity(transaction, &event.event_key).await?;
     if let Some(receipt) = lock_existing_receipt(transaction, &event.event_key).await? {
@@ -436,6 +449,24 @@ fn source_revision(event: &ValidatedEvent) -> &'static str {
 fn validate_quota_per_unit(quota_per_unit: i64) -> std::result::Result<(), IngestError> {
     if quota_per_unit <= 0 || quota_per_unit % 100 != 0 {
         return Err(IngestError::Invalid("quota_per_unit 配置无效".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_topup_rebate_scope(
+    event: &ValidatedEvent,
+    topup_rebate_active_from_id: i64,
+) -> std::result::Result<(), IngestError> {
+    if topup_rebate_active_from_id <= 0 {
+        return Err(IngestError::Invalid(
+            "topup rebate active boundary 配置无效".to_string(),
+        ));
+    }
+    if event.source_order_id < topup_rebate_active_from_id {
+        return Err(IngestError::Invalid(format!(
+            "topup {} 早于在线充值返利生效边界 {}",
+            event.source_order_id, topup_rebate_active_from_id
+        )));
     }
     Ok(())
 }
@@ -957,6 +988,20 @@ mod tests {
         overflowing.completed_at = i64::MAX;
         assert!(matches!(
             validate_event(overflowing),
+            Err(IngestError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_topups_before_the_configured_active_boundary() {
+        let validated = validate_event(event()).unwrap();
+        assert!(validate_topup_rebate_scope(&validated, 842).is_ok());
+        assert!(matches!(
+            validate_topup_rebate_scope(&validated, 843),
+            Err(IngestError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_topup_rebate_scope(&validated, 0),
             Err(IngestError::Invalid(_))
         ));
     }

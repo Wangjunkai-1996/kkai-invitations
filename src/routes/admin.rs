@@ -1613,7 +1613,7 @@ pub async fn reopen_rebate_order_records(
     let now = Utc::now().timestamp();
     let mut tx = state.pool.begin().await?;
     let rows = lock_rebate_records(&mut tx, &record_ids).await?;
-    validate_reopen_rows(&rows, &record_ids)?;
+    validate_reopen_rows(&rows, &record_ids, state.config.topup_rebate_active_from_id)?;
 
     let updated = sqlx::query(
         r#"
@@ -2288,6 +2288,7 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
             FROM top_ups t
             JOIN users u ON t.user_id = u.id
             WHERE t.status = 'success'
+              AND t.id >= $2
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
               AND NOT EXISTS (
@@ -2316,6 +2317,7 @@ async fn count_newapi_rebate_orders(state: &AppState, order_type: Option<&str>) 
         "#,
     )
     .bind(order_type)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_one(&state.newapi_pool)
     .await
     .map_err(AppError::from)
@@ -2334,6 +2336,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
                 FROM top_ups t
                 JOIN users u ON t.user_id = u.id
                 WHERE t.status = 'success'
+                  AND t.id >= $1
                   AND u.inviter_id IS NOT NULL
                   AND u.inviter_id > 0
             )::BIGINT AS topup_invited,
@@ -2342,6 +2345,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
                 FROM top_ups t
                 JOIN users u ON t.user_id = u.id
                 WHERE t.status = 'success'
+                  AND t.id >= $1
                   AND u.inviter_id IS NOT NULL
                   AND u.inviter_id > 0
                   AND NOT EXISTS (
@@ -2372,6 +2376,7 @@ async fn fetch_newapi_rebate_order_diagnostics(
             )::BIGINT AS redemption_invited
         "#,
     )
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_one(&state.newapi_pool)
     .await?;
 
@@ -2420,6 +2425,7 @@ async fn fetch_newapi_rebate_orders(
             JOIN users u ON t.user_id = u.id
             LEFT JOIN users inviter ON inviter.id = u.inviter_id
             WHERE t.status = 'success'
+              AND t.id >= $5
               AND u.inviter_id IS NOT NULL
               AND u.inviter_id > 0
               AND NOT EXISTS (
@@ -2473,6 +2479,7 @@ async fn fetch_newapi_rebate_orders(
     .bind(state.config.quota_per_unit)
     .bind(page_size)
     .bind(offset)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_all(&state.newapi_pool)
     .await?;
 
@@ -2491,6 +2498,18 @@ async fn fetch_newapi_rebate_orders(
             })
         })
         .collect::<Result<Vec<_>>>()
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_newapi_topup_rebate_order_ids_for_test(
+    state: &AppState,
+) -> Result<(i64, Vec<i64>)> {
+    let total = count_newapi_rebate_orders(state, Some("topup")).await?;
+    let orders = fetch_newapi_rebate_orders(state, Some("topup"), 1_000, 0).await?;
+    Ok((
+        total,
+        orders.into_iter().map(|order| order.order_id).collect(),
+    ))
 }
 
 async fn fetch_local_rebate_record_map(
@@ -3330,7 +3349,7 @@ async fn lock_rebate_records(
 ) -> Result<Vec<PgRow>> {
     sqlx::query(
         r#"
-        SELECT id, status, superseded_by_record_id
+        SELECT id, order_type, order_id, status, superseded_by_record_id
         FROM rebate_records
         WHERE id = ANY($1)
         ORDER BY id
@@ -3487,7 +3506,11 @@ fn validate_operation_rows(
     Ok(())
 }
 
-fn validate_reopen_rows(rows: &[PgRow], record_ids: &[i64]) -> Result<()> {
+fn validate_reopen_rows(
+    rows: &[PgRow],
+    record_ids: &[i64],
+    topup_rebate_active_from_id: i64,
+) -> Result<()> {
     validate_operation_rows(rows, record_ids, |status| status == "closed")?;
     for row in rows {
         let superseded_by_record_id: Option<i64> = row.try_get("superseded_by_record_id")?;
@@ -3496,8 +3519,23 @@ fn validate_reopen_rows(rows: &[PgRow], record_ids: &[i64]) -> Result<()> {
                 "已被主记录取代的返利记录必须永久关闭".to_string(),
             ));
         }
+        let order_type: String = row.try_get("order_type")?;
+        let order_id: i64 = row.try_get("order_id")?;
+        if is_topup_before_active_boundary(&order_type, order_id, topup_rebate_active_from_id) {
+            return Err(AppError::BadRequest(
+                "在线充值记录早于返利生效边界，必须永久关闭".to_string(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn is_topup_before_active_boundary(
+    order_type: &str,
+    order_id: i64,
+    topup_rebate_active_from_id: i64,
+) -> bool {
+    order_type == "topup" && order_id > 0 && order_id < topup_rebate_active_from_id
 }
 
 fn can_reopen_rebate_record(status: &str, superseded_by_record_id: Option<i64>) -> bool {
@@ -3710,6 +3748,14 @@ mod tests {
             record.superseded_by_record_id
         ));
         assert!(can_reopen_rebate_record("closed", None));
+    }
+
+    #[test]
+    fn topups_before_active_boundary_cannot_be_reopened() {
+        assert!(is_topup_before_active_boundary("topup", 426, 444));
+        assert!(!is_topup_before_active_boundary("topup", 444, 444));
+        assert!(!is_topup_before_active_boundary("topup", -4432, 444));
+        assert!(!is_topup_before_active_boundary("redemption", 426, 444));
     }
 
     #[test]

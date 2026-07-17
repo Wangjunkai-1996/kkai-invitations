@@ -1166,6 +1166,7 @@ mod tests {
                 auto_sync_initial_delay_seconds: 0,
                 topup_reconciliation_interval_seconds: 0,
                 topup_reconciliation_initial_delay_seconds: 0,
+                topup_rebate_active_from_id: 1,
                 settlement_mode: mode,
                 quota_per_unit: 500_000,
                 balance_api: None,

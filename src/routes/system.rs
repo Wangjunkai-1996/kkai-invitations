@@ -497,6 +497,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
           ON outbox.event_key = 'newapi:topup:' || t.id::TEXT
          AND outbox.topic = $2
         WHERE t.status = 'success'
+          AND t.id >= $4
           AND (
               COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) >= $1
               OR t.id = ANY($3)
@@ -512,6 +513,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
     .bind(lookback_start)
     .bind(TOPUP_COMPLETED_TOPIC)
     .bind(&open_case_order_ids)
+    .bind(state.config.topup_rebate_active_from_id)
     .fetch_all(&state.newapi_pool)
     .await?;
 

@@ -37,6 +37,7 @@ pub struct Config {
     pub auto_sync_initial_delay_seconds: u64,
     pub topup_reconciliation_interval_seconds: u64,
     pub topup_reconciliation_initial_delay_seconds: u64,
+    pub topup_rebate_active_from_id: i64,
     pub settlement_mode: SettlementMode,
     pub quota_per_unit: i64,
     pub balance_api: Option<BalanceApiConfig>,
@@ -81,6 +82,7 @@ impl Config {
                 "TOPUP_RECONCILIATION_INITIAL_DELAY_SECONDS",
                 DEFAULT_TOPUP_RECONCILIATION_INITIAL_DELAY_SECONDS,
             ),
+            topup_rebate_active_from_id: required_positive_i64_env("TOPUP_REBATE_ACTIVE_FROM_ID")?,
             settlement_mode,
             quota_per_unit: quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN),
             balance_api: balance_api_config_from_env(settlement_mode)?,
@@ -109,6 +111,10 @@ pub fn newapi_database_url_from_env() -> std::result::Result<String, String> {
 
 pub fn quota_per_unit_from_env() -> i64 {
     quota_per_unit_env("QUOTA_PER_UNIT", DEFAULT_QUOTA_UNITS_PER_YUAN)
+}
+
+pub fn topup_rebate_active_from_id_from_env() -> std::result::Result<i64, String> {
+    required_positive_i64_env("TOPUP_REBATE_ACTIVE_FROM_ID")
 }
 
 fn database_url_env_value(
@@ -250,6 +256,27 @@ fn optional_trimmed_env(name: &str) -> Option<String> {
 fn required_secret_env(name: &str) -> std::result::Result<String, String> {
     let raw = env::var(name).map_err(|_| format!("{name} must be set"))?;
     validate_secret_value(name, &raw)
+}
+
+fn required_positive_i64_env(name: &str) -> std::result::Result<i64, String> {
+    required_positive_i64_env_value(name, env::var(name).ok().as_deref())
+}
+
+fn required_positive_i64_env_value(
+    name: &str,
+    raw: Option<&str>,
+) -> std::result::Result<i64, String> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} must be set"))?;
+    let value = raw
+        .parse::<i64>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if value <= 0 {
+        return Err(format!("{name} must be a positive integer"));
+    }
+    Ok(value)
 }
 
 fn validate_secret_value(name: &str, raw: &str) -> std::result::Result<String, String> {
@@ -445,6 +472,17 @@ mod tests {
     #[test]
     fn parses_i64_env_values_with_whitespace() {
         assert_eq!(parse_i64_env_value("TEST_QUOTA", " 500000 "), 500_000);
+    }
+
+    #[test]
+    fn topup_rebate_active_boundary_is_explicit_and_positive() {
+        assert_eq!(
+            required_positive_i64_env_value("TOPUP_REBATE_ACTIVE_FROM_ID", Some(" 444 ")).unwrap(),
+            444
+        );
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("abc")] {
+            assert!(required_positive_i64_env_value("TOPUP_REBATE_ACTIVE_FROM_ID", value).is_err());
+        }
     }
 
     #[test]
