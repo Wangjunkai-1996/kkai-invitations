@@ -677,6 +677,11 @@ fn validate_existing_record_for_policy(
     if matches!(policy, ExistingRecordPolicy::AuditedLegacyAttach) {
         return Ok(());
     }
+    if event.schema_version == CREDITED_QUOTA_SCHEMA_VERSION
+        && is_pristine_legacy_placeholder(record)
+    {
+        return Ok(());
+    }
 
     let expected_rate = rule.rule_id.map(|_| rule.rate);
     let actual_rate = record
@@ -702,6 +707,18 @@ fn validate_existing_record_for_policy(
         ));
     }
     Ok(())
+}
+
+fn is_pristine_legacy_placeholder(record: &ExistingRecord) -> bool {
+    record.canonical_event_key.is_none()
+        && record.source_payload_sha256.is_none()
+        && record.source_schema_version.is_none()
+        && record.stored_order_amount_cents.is_none()
+        && record.credited_quota.is_none()
+        && record.rebate_amount == 0
+        && record.rebate_rate.is_none()
+        && record.status == "initializing"
+        && !record.admin_adjusted
 }
 
 async fn validate_canonical_record_and_snapshot(
@@ -954,6 +971,29 @@ async fn insert_calculation_snapshot(
 mod tests {
     use super::*;
 
+    fn pristine_legacy_placeholder() -> ExistingRecord {
+        ExistingRecord {
+            id: 1,
+            order_type: TOPUP_ORDER_TYPE.to_string(),
+            order_id: 842,
+            canonical_event_key: None,
+            source_payload_sha256: None,
+            source_schema_version: None,
+            inviter_id: 1001,
+            invitee_id: 3418,
+            user_group: "default".to_string(),
+            stored_order_amount_cents: None,
+            credited_quota: None,
+            rebate_amount: 0,
+            rebate_rate: None,
+            status: "initializing".to_string(),
+            order_time: 1,
+            initialization_ends_at: 1,
+            rebate_effective_at: 1,
+            admin_adjusted: false,
+        }
+    }
+
     fn event() -> RebateSourceEvent {
         RebateSourceEvent {
             schema_version: 1,
@@ -1052,6 +1092,63 @@ mod tests {
             validate_event(invalid),
             Err(IngestError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn strict_online_ingest_accepts_only_pristine_legacy_placeholders() {
+        let record = pristine_legacy_placeholder();
+        assert!(is_pristine_legacy_placeholder(&record));
+        let mut schema_v2 = event();
+        schema_v2.schema_version = 2;
+        schema_v2.rebate_base_amount_cents = None;
+        schema_v2.credited_quota = Some(37_500_000);
+        let schema_v2 = validate_event(schema_v2).unwrap();
+        let rule = RebateRuleSnapshot {
+            rule_id: Some(1),
+            rate: "0.05".parse().unwrap(),
+        };
+        assert!(validate_existing_record_for_policy(
+            &schema_v2,
+            1001,
+            &record,
+            ExistingRecordPolicy::StrictOnline,
+            &rule,
+            1_875_000,
+            37_500_000,
+        )
+        .is_ok());
+
+        let schema_v1 = validate_event(event()).unwrap();
+        assert!(matches!(
+            validate_existing_record_for_policy(
+                &schema_v1,
+                1001,
+                &record,
+                ExistingRecordPolicy::StrictOnline,
+                &rule,
+                1_875_000,
+                37_500_000,
+            ),
+            Err(IngestError::Conflict(_))
+        ));
+
+        for mutate in [
+            |record: &mut ExistingRecord| record.rebate_amount = 1,
+            |record: &mut ExistingRecord| record.rebate_rate = Some("0.05".to_string()),
+            |record: &mut ExistingRecord| record.credited_quota = Some(1),
+            |record: &mut ExistingRecord| record.stored_order_amount_cents = Some(1),
+            |record: &mut ExistingRecord| record.source_schema_version = Some(2),
+            |record: &mut ExistingRecord| record.source_payload_sha256 = Some("a".repeat(64)),
+            |record: &mut ExistingRecord| {
+                record.canonical_event_key = Some("newapi:topup:842".to_string())
+            },
+            |record: &mut ExistingRecord| record.status = "pending".to_string(),
+            |record: &mut ExistingRecord| record.admin_adjusted = true,
+        ] {
+            let mut changed = pristine_legacy_placeholder();
+            mutate(&mut changed);
+            assert!(!is_pristine_legacy_placeholder(&changed));
+        }
     }
 
     #[test]
