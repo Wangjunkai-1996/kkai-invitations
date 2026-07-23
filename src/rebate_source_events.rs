@@ -20,6 +20,7 @@ const LEGACY_SCHEMA_VERSION: i32 = 1;
 const CREDITED_QUOTA_SCHEMA_VERSION: i32 = 2;
 const SUPPORTED_EVENT_TYPE: &str = "topup.completed";
 const DEFAULT_INVITER_GROUP: &str = "default";
+const REDEMPTION_PAYMENT_PROVIDER: &str = "redemption";
 const SOURCE_REVISION_V1: &str = "rebate-source-event:v1";
 const SOURCE_REVISION_V2: &str = "rebate-source-event:v2";
 const RECEIPT_OUTCOME_CREATED: &str = "created";
@@ -368,7 +369,16 @@ fn validate_event(event: RebateSourceEvent) -> std::result::Result<ValidatedEven
     if event.source_order_id <= 0 || event.invitee_id <= 0 {
         return Err(IngestError::Invalid("订单和用户 ID 必须为正数".to_string()));
     }
-    let expected_event_key = format!("newapi:topup:{}", event.source_order_id);
+    let payment_provider = event.payment_provider.trim();
+    if payment_provider.is_empty() || payment_provider.len() > 64 {
+        return Err(IngestError::Invalid("支付渠道无效".to_string()));
+    }
+    let event_key_source = if payment_provider == REDEMPTION_PAYMENT_PROVIDER {
+        "redemption"
+    } else {
+        "topup"
+    };
+    let expected_event_key = format!("newapi:{event_key_source}:{}", event.source_order_id);
     if event.event_key != expected_event_key {
         return Err(IngestError::Invalid("event_key 与源订单不匹配".to_string()));
     }
@@ -418,11 +428,6 @@ fn validate_event(event: RebateSourceEvent) -> std::result::Result<ValidatedEven
         value if value.len() <= 64 => value.to_string(),
         _ => return Err(IngestError::Invalid("邀请人分组过长".to_string())),
     };
-    let payment_provider = event.payment_provider.trim();
-    if payment_provider.is_empty() || payment_provider.len() > 64 {
-        return Err(IngestError::Invalid("支付渠道无效".to_string()));
-    }
-
     Ok(ValidatedEvent {
         schema_version: event.schema_version,
         event_key: event.event_key,
@@ -462,13 +467,23 @@ fn validate_topup_rebate_scope(
             "topup rebate active boundary 配置无效".to_string(),
         ));
     }
-    if event.source_order_id < topup_rebate_active_from_id {
+    if event.payment_provider != REDEMPTION_PAYMENT_PROVIDER
+        && event.source_order_id < topup_rebate_active_from_id
+    {
         return Err(IngestError::Invalid(format!(
             "topup {} 早于在线充值返利生效边界 {}",
             event.source_order_id, topup_rebate_active_from_id
         )));
     }
     Ok(())
+}
+
+fn rebate_record_order_id(event: &ValidatedEvent) -> i64 {
+    if event.payment_provider == REDEMPTION_PAYMENT_PROVIDER {
+        -event.source_order_id
+    } else {
+        event.source_order_id
+    }
 }
 
 fn source_payload_hash(event: &ValidatedEvent) -> std::result::Result<String, IngestError> {
@@ -530,7 +545,7 @@ async fn lock_existing_record(
         "#,
     )
     .bind(&event.event_key)
-    .bind(event.source_order_id)
+    .bind(rebate_record_order_id(event))
     .fetch_all(&mut **transaction)
     .await?;
     if rows.len() > 1 {
@@ -729,7 +744,7 @@ async fn validate_canonical_record_and_snapshot(
     record: &ExistingRecord,
 ) -> std::result::Result<(), IngestError> {
     if record.order_type != TOPUP_ORDER_TYPE
-        || record.order_id != event.source_order_id
+        || record.order_id != rebate_record_order_id(event)
         || record.source_payload_sha256.as_deref() != Some(payload_hash)
         || record.source_schema_version != Some(event.schema_version)
         || record.inviter_id != inviter_id
@@ -881,7 +896,7 @@ async fn insert_rebate_record(
     .bind(inviter_id)
     .bind(event.invitee_id)
     .bind(&event.inviter_group)
-    .bind(event.source_order_id)
+    .bind(rebate_record_order_id(event))
     .bind(event.rebate_base_amount_cents)
     .bind(event.completed_at)
     .bind(event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
@@ -1010,6 +1025,22 @@ mod tests {
         }
     }
 
+    fn redemption_event() -> RebateSourceEvent {
+        RebateSourceEvent {
+            schema_version: 2,
+            event_key: "newapi:redemption:7878".to_string(),
+            event_type: "topup.completed".to_string(),
+            source_order_id: 7878,
+            invitee_id: 3120,
+            inviter_id: Some(3118),
+            inviter_group: "default".to_string(),
+            rebate_base_amount_cents: None,
+            credited_quota: Some(500_000_000),
+            completed_at: 1_784_010_626,
+            payment_provider: REDEMPTION_PAYMENT_PROVIDER.to_string(),
+        }
+    }
+
     #[test]
     fn validates_canonical_event_identity_and_normalizes_empty_group() {
         let mut input = event();
@@ -1040,6 +1071,41 @@ mod tests {
             validate_topup_rebate_scope(&validated, 843),
             Err(IngestError::Invalid(_))
         ));
+        assert!(matches!(
+            validate_topup_rebate_scope(&validated, 0),
+            Err(IngestError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_redemption_event_identity_and_maps_to_legacy_order_id() {
+        let validated = validate_event(redemption_event()).unwrap();
+        assert_eq!(validated.event_key, "newapi:redemption:7878");
+        assert_eq!(validated.payment_provider, REDEMPTION_PAYMENT_PROVIDER);
+        assert_eq!(rebate_record_order_id(&validated), -7878);
+    }
+
+    #[test]
+    fn rejects_redemption_provider_and_event_key_mismatches() {
+        let mut redemption_with_topup_key = redemption_event();
+        redemption_with_topup_key.event_key = "newapi:topup:7878".to_string();
+        assert!(matches!(
+            validate_event(redemption_with_topup_key),
+            Err(IngestError::Invalid(_))
+        ));
+
+        let mut topup_with_redemption_key = event();
+        topup_with_redemption_key.event_key = "newapi:redemption:842".to_string();
+        assert!(matches!(
+            validate_event(topup_with_redemption_key),
+            Err(IngestError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn redemptions_bypass_the_online_topup_active_boundary() {
+        let validated = validate_event(redemption_event()).unwrap();
+        assert!(validate_topup_rebate_scope(&validated, 9_000).is_ok());
         assert!(matches!(
             validate_topup_rebate_scope(&validated, 0),
             Err(IngestError::Invalid(_))

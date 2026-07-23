@@ -59,7 +59,10 @@ pub async fn finalize_ready_topup_event_records(pool: &PgPool, now: i64) -> Resu
         WHERE record.status = 'initializing'
           AND record.initialization_ends_at <= $1
           AND record.order_type = 'topup'
-          AND record.canonical_event_key LIKE 'newapi:topup:%'
+          AND (
+              record.canonical_event_key LIKE 'newapi:topup:%'
+              OR record.canonical_event_key LIKE 'newapi:redemption:%'
+          )
         ORDER BY record.initialization_ends_at, record.id
         LIMIT 1000
         "#,

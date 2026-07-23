@@ -2739,6 +2739,143 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn redemption_source_event_creates_canonical_record_snapshot_and_receipt() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules (
+                user_group, rule_type, rebate_rate, effective_time, created_at, updated_at
+            ) VALUES ('default', 'topup', 0.0500, 1, 1, 1)
+            "#,
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let event = RebateSourceEvent {
+            schema_version: 2,
+            event_key: "newapi:redemption:7878".to_string(),
+            event_type: "topup.completed".to_string(),
+            source_order_id: 7878,
+            invitee_id: 3120,
+            inviter_id: Some(3118),
+            inviter_group: "default".to_string(),
+            rebate_base_amount_cents: None,
+            credited_quota: Some(500_000_000),
+            completed_at: 1_784_010_626,
+            payment_provider: "redemption".to_string(),
+        };
+
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000, 9_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Created
+        );
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event.clone(), 500_000, 9_000)
+                .await
+                .unwrap(),
+            IngestOutcome::Replay
+        );
+
+        let record: (i64, String, i64, String, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT id, order_type, order_id, canonical_event_key,
+                   credited_quota, rebate_amount, status
+            FROM rebate_records
+            WHERE canonical_event_key = 'newapi:redemption:7878'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(record.1, "topup");
+        assert_eq!(record.2, -7878);
+        assert_eq!(record.3, "newapi:redemption:7878");
+        assert_eq!(record.4, 500_000_000);
+        assert_eq!(record.5, 25_000_000);
+        assert_eq!(record.6, "initializing");
+
+        let receipt: (i64, String, i64, String) = sqlx::query_as(
+            r#"
+            SELECT rebate_record_id, event_key, source_order_id, outcome
+            FROM rebate_source_event_receipts
+            WHERE event_key = 'newapi:redemption:7878'
+            "#,
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt,
+            (
+                record.0,
+                event.event_key.clone(),
+                7878,
+                "created".to_string()
+            )
+        );
+
+        let snapshot: (i64, i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT credited_quota, rebate_quota, order_amount_minor, source_revision
+            FROM rebate_calculation_snapshots
+            WHERE rebate_record_id = $1
+            "#,
+        )
+        .bind(record.0)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot,
+            (
+                500_000_000,
+                25_000_000,
+                0,
+                "rebate-source-event:v2".to_string()
+            )
+        );
+
+        assert_eq!(
+            finalize_ready_topup_event_records(
+                &database.pool,
+                event.completed_at + INITIALIZATION_SECONDS
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM rebate_records WHERE canonical_event_key = 'newapi:redemption:7878'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "pending");
+
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM rebate_records
+                 WHERE canonical_event_key = 'newapi:redemption:7878'),
+                (SELECT COUNT(*) FROM rebate_source_event_receipts
+                 WHERE event_key = 'newapi:redemption:7878'),
+                (SELECT COUNT(*) FROM rebate_calculation_snapshots
+                 WHERE rebate_record_id = $1)
+            "#,
+        )
+        .bind(record.0)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1, 1));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
     async fn online_ingest_reuses_only_unadjusted_matching_initializing_records() {
         let database = TestDatabase::create().await;
         database.prepare().await.unwrap();
