@@ -53,6 +53,7 @@ pub struct InvitationStats {
     pub total_rebate: i64,
     pub completed_rebate: i64,
     pub pending_rebate: i64,
+    pub confirming_rebate: i64,
 }
 
 #[derive(Serialize)]
@@ -150,9 +151,9 @@ impl PaginationParams {
 
     fn rebate_status_filter(&self) -> Option<&str> {
         match self.status.as_deref() {
-            Some("pending" | "requested" | "approved" | "completed" | "rejected") => {
-                self.status.as_deref()
-            }
+            Some(
+                "initializing" | "pending" | "requested" | "approved" | "completed" | "rejected",
+            ) => self.status.as_deref(),
             _ => None,
         }
     }
@@ -212,9 +213,10 @@ pub async fn my_code(
         SELECT
             COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
             COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
-            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_rebate
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_rebate,
+            COALESCE(SUM(CASE WHEN status = 'initializing' THEN rebate_amount ELSE 0 END), 0)::BIGINT as confirming_rebate
         FROM rebate_records
-        WHERE inviter_id = $1 AND status NOT IN ('initializing', 'closed')
+        WHERE inviter_id = $1 AND status <> 'closed'
           AND (
               ($2::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
               OR ($3::BOOLEAN = TRUE AND order_type IN ($4, $5))
@@ -235,6 +237,7 @@ pub async fn my_code(
         total_rebate: quota_to_cents(stats.try_get("total")?),
         completed_rebate: quota_to_cents(stats.try_get("completed")?),
         pending_rebate: quota_to_cents(stats.try_get("pending_rebate")?),
+        confirming_rebate: quota_to_cents(stats.try_get("confirming_rebate")?),
     }))
 }
 
@@ -253,7 +256,7 @@ pub async fn rebate_records(
         &state.pool,
         Some(user.id),
         params.rebate_status_filter(),
-        true,
+        false,
         Some(source_filter),
         params.page_size(),
         params.offset(),
@@ -264,7 +267,7 @@ pub async fn rebate_records(
         &state.pool,
         Some(user.id),
         params.rebate_status_filter(),
-        true,
+        false,
         Some(source_filter),
     )
     .await?;
@@ -643,7 +646,7 @@ pub async fn fetch_rebate_records(
     pool: &PgPool,
     inviter_id: Option<i64>,
     status: Option<&str>,
-    visible_only: bool,
+    hide_initializing: bool,
     source_filter: Option<RebateRecordSourceFilter>,
     page_size: i64,
     offset: i64,
@@ -664,7 +667,8 @@ pub async fn fetch_rebate_records(
         FROM rebate_records
         WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
           AND ($2::TEXT IS NULL OR status = $2)
-          AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
+          AND status <> 'closed'
+          AND ($3::BOOLEAN = FALSE OR status <> 'initializing')
           AND (
               $4::BOOLEAN = FALSE
               OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
@@ -676,7 +680,7 @@ pub async fn fetch_rebate_records(
     )
     .bind(inviter_id)
     .bind(status)
-    .bind(visible_only)
+    .bind(hide_initializing)
     .bind(source_filter_enabled)
     .bind(order_rebate_enabled)
     .bind(invitation_signup_reward_enabled)
@@ -697,7 +701,7 @@ pub async fn count_rebate_records(
     pool: &PgPool,
     inviter_id: Option<i64>,
     status: Option<&str>,
-    visible_only: bool,
+    hide_initializing: bool,
     source_filter: Option<RebateRecordSourceFilter>,
 ) -> Result<i64> {
     let source_filter_enabled = source_filter.is_some();
@@ -714,7 +718,8 @@ pub async fn count_rebate_records(
         FROM rebate_records
         WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
           AND ($2::TEXT IS NULL OR status = $2)
-          AND ($3::BOOLEAN = FALSE OR status NOT IN ('initializing', 'closed'))
+          AND status <> 'closed'
+          AND ($3::BOOLEAN = FALSE OR status <> 'initializing')
           AND (
               $4::BOOLEAN = FALSE
               OR ($5::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
@@ -724,7 +729,7 @@ pub async fn count_rebate_records(
     )
     .bind(inviter_id)
     .bind(status)
-    .bind(visible_only)
+    .bind(hide_initializing)
     .bind(source_filter_enabled)
     .bind(order_rebate_enabled)
     .bind(invitation_signup_reward_enabled)
@@ -833,6 +838,7 @@ fn derive_rebate_display_status(
     waiting_unlock: bool,
 ) -> &'static str {
     match status {
+        "initializing" => "confirming",
         "requested" => "requested",
         "approved" => "approved",
         "completed" => "paid",
@@ -995,6 +1001,14 @@ mod tests {
 
     #[test]
     fn separates_rebate_and_rebate_request_status_filters() {
+        let initializing = PaginationParams {
+            page: None,
+            page_size: None,
+            status: Some("initializing".to_string()),
+        };
+        assert_eq!(initializing.rebate_status_filter(), Some("initializing"));
+        assert_eq!(initializing.rebate_request_status_filter(), None);
+
         let requested = PaginationParams {
             page: None,
             page_size: None,
@@ -1023,6 +1037,10 @@ mod tests {
     #[test]
     fn derives_user_facing_rebate_statuses() {
         assert_eq!(
+            derive_rebate_display_status("initializing", 1_000, 2_000, false, false),
+            "confirming"
+        );
+        assert_eq!(
             derive_rebate_display_status("pending", 1_000, 2_000, false, false),
             "estimated"
         );
@@ -1050,6 +1068,21 @@ mod tests {
             derive_rebate_display_status("pending", 2_000, 1_000, false, true),
             "waiting_unlock"
         );
+    }
+
+    #[test]
+    fn serializes_confirming_rebate_in_invitation_stats() {
+        let stats = InvitationStats {
+            invitation_code: "invite".to_string(),
+            invited_count: 2,
+            total_rebate: 1_500,
+            completed_rebate: 500,
+            pending_rebate: 500,
+            confirming_rebate: 500,
+        };
+
+        let value = serde_json::to_value(stats).unwrap();
+        assert_eq!(value["confirmingRebate"], 500);
     }
 
     #[test]

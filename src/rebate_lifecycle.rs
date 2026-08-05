@@ -4,11 +4,44 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{AppError, Result};
 
-pub const INITIALIZATION_SECONDS: i64 = 2 * 24 * 60 * 60;
-pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const INITIALIZATION_SECONDS: i64 = 5 * 60;
+pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 24 * 60 * 60;
 pub const ALL_USER_GROUP: &str = "__all__";
 
+const LEGACY_INITIALIZATION_SECONDS: i64 = 2 * 24 * 60 * 60;
+const LEGACY_REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
 const QUOTA_UNITS_PER_YUAN: i64 = 500_000;
+
+pub(crate) fn matches_supported_rebate_schedule(
+    order_time: i64,
+    initialization_ends_at: i64,
+    rebate_effective_at: i64,
+) -> bool {
+    matches_rebate_schedule(
+        order_time,
+        initialization_ends_at,
+        rebate_effective_at,
+        INITIALIZATION_SECONDS,
+        REBATE_EFFECTIVE_DELAY_SECONDS,
+    ) || matches_rebate_schedule(
+        order_time,
+        initialization_ends_at,
+        rebate_effective_at,
+        LEGACY_INITIALIZATION_SECONDS,
+        LEGACY_REBATE_EFFECTIVE_DELAY_SECONDS,
+    )
+}
+
+fn matches_rebate_schedule(
+    order_time: i64,
+    initialization_ends_at: i64,
+    rebate_effective_at: i64,
+    initialization_seconds: i64,
+    effective_delay_seconds: i64,
+) -> bool {
+    order_time.checked_add(initialization_seconds) == Some(initialization_ends_at)
+        && order_time.checked_add(effective_delay_seconds) == Some(rebate_effective_at)
+}
 
 struct InitializingRebateRecord {
     id: i64,
@@ -305,5 +338,31 @@ mod tests {
             rebate_amount_for_credited_quota(10, "0.05".parse::<Decimal>().unwrap()).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn uses_short_confirmation_and_one_day_effective_windows() {
+        assert_eq!(INITIALIZATION_SECONDS, 5 * 60);
+        assert_eq!(REBATE_EFFECTIVE_DELAY_SECONDS, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn accepts_current_and_legacy_schedules_without_mixing_them() {
+        let order_time = 1_000;
+        assert!(matches_supported_rebate_schedule(
+            order_time,
+            order_time + INITIALIZATION_SECONDS,
+            order_time + REBATE_EFFECTIVE_DELAY_SECONDS,
+        ));
+        assert!(matches_supported_rebate_schedule(
+            order_time,
+            order_time + LEGACY_INITIALIZATION_SECONDS,
+            order_time + LEGACY_REBATE_EFFECTIVE_DELAY_SECONDS,
+        ));
+        assert!(!matches_supported_rebate_schedule(
+            order_time,
+            order_time + LEGACY_INITIALIZATION_SECONDS,
+            order_time + REBATE_EFFECTIVE_DELAY_SECONDS,
+        ));
     }
 }

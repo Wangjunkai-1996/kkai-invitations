@@ -9,9 +9,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::config::{self, SettlementMode};
-use crate::rebate_lifecycle::{
-    ALL_USER_GROUP, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
-};
+use crate::rebate_lifecycle::{matches_supported_rebate_schedule, ALL_USER_GROUP};
 use crate::rebate_source_events::{
     attach_legacy_rebate_source_event_in_transaction, calculate_rebate_from_credited_quota,
     payload_hash_for_event, IngestError, IngestOutcome, RebateSourceEvent,
@@ -594,10 +592,11 @@ fn verify_applied_order_row(
         && row.try_get::<Option<i64>, _>("order_amount_cents")? == order.order_amount_cents
         && row.try_get::<Option<i64>, _>("credited_quota")? == Some(order.credited_quota)
         && row.try_get::<i64, _>("order_time")? == order.completed_at
-        && row.try_get::<i64, _>("initialization_ends_at")?
-            == order.completed_at + INITIALIZATION_SECONDS
-        && row.try_get::<i64, _>("rebate_effective_at")?
-            == order.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS
+        && matches_supported_rebate_schedule(
+            order.completed_at,
+            row.try_get("initialization_ends_at")?,
+            row.try_get("rebate_effective_at")?,
+        )
         && row.try_get::<i64, _>("rebate_amount")? == order.expected_rebate_quota
         && record_rate_matches(record_rate, manifest_rate)
         && !row.try_get::<bool, _>("admin_adjusted")?

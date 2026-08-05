@@ -1966,7 +1966,9 @@ mod tests {
     };
     use crate::config::{Config, SettlementMode};
     use crate::middleware::AdminUser;
-    use crate::rebate_lifecycle::{finalize_ready_topup_event_records, INITIALIZATION_SECONDS};
+    use crate::rebate_lifecycle::{
+        finalize_ready_topup_event_records, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+    };
     use crate::rebate_source_events::{
         ingest_rebate_source_event, receive_rebate_source_event, IngestError, IngestOutcome,
         RebateSourceEvent,
@@ -1978,6 +1980,7 @@ mod tests {
         UpdateRebateOrderRecordsRequest,
     };
     use crate::routes::system::run_topup_reconciliation;
+    use crate::routes::user::{count_rebate_records, fetch_rebate_records};
     use crate::session::SessionUser;
     use crate::AppState;
 
@@ -2584,7 +2587,7 @@ mod tests {
         assert_eq!(record.0, "newapi:topup:842");
         assert_eq!(record.1, 7500);
         assert_eq!(record.2, event.completed_at);
-        assert_eq!(record.3, event.completed_at + 48 * 60 * 60);
+        assert_eq!(record.3, event.completed_at + INITIALIZATION_SECONDS);
         assert_eq!(record.4, 1_875_000);
         assert_eq!(record.5, "0.0500");
 
@@ -2616,7 +2619,7 @@ mod tests {
             "#,
         )
         .bind(event.completed_at)
-        .bind(event.completed_at + 7 * 24 * 60 * 60)
+        .bind(event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
         .bind(event.completed_at + INITIALIZATION_SECONDS)
         .execute(&database.pool)
         .await
@@ -2734,6 +2737,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rolled_back, 0);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn user_rebate_records_include_initializing_and_always_hide_closed() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        let order_time = 1_784_211_072;
+
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount, rebate_rate,
+                status, scan_started_at, initialization_ends_at, closed_at,
+                created_at, updated_at
+            ) VALUES
+                (990001, 990101, 'default', 'topup', 991001,
+                 75.00, $1, $2, 1875000, 0.0500,
+                 'initializing', $1, $3, NULL, $1, $1),
+                (990001, 990102, 'default', 'topup', 991002,
+                 75.00, $1, $2, 1875000, 0.0500,
+                 'pending', $1, $3, NULL, $1, $1),
+                (990001, 990103, 'default', 'topup', 991003,
+                 75.00, $1, $2, 1875000, 0.0500,
+                 'closed', $1, $3, $1, $1, $1)
+            "#,
+        )
+        .bind(order_time)
+        .bind(order_time + REBATE_EFFECTIVE_DELAY_SECONDS)
+        .bind(order_time + INITIALIZATION_SECONDS)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let records = fetch_rebate_records(&database.pool, Some(990001), None, false, None, 100, 0)
+            .await
+            .unwrap();
+        let total = count_rebate_records(&database.pool, Some(990001), None, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len() as i64, total);
+        assert_eq!(total, 2);
+        assert!(records.iter().all(|record| record.status != "closed"));
+        let confirming = records
+            .iter()
+            .find(|record| record.status == "initializing")
+            .unwrap();
+        assert_eq!(confirming.display_status, "confirming");
+
+        let hidden_initializing =
+            fetch_rebate_records(&database.pool, Some(990001), None, true, None, 100, 0)
+                .await
+                .unwrap();
+        assert_eq!(hidden_initializing.len(), 1);
+        assert_eq!(hidden_initializing[0].status, "pending");
+
         database.cleanup().await;
     }
 
@@ -2879,6 +2941,7 @@ mod tests {
     async fn online_ingest_reuses_only_unadjusted_matching_initializing_records() {
         let database = TestDatabase::create().await;
         database.prepare().await.unwrap();
+        let completed_at = 1_784_211_072;
         sqlx::query(
             r#"
             INSERT INTO rebate_rules (
@@ -2898,20 +2961,23 @@ mod tests {
                 admin_adjusted, closed_at, created_at, updated_at,
                 order_amount_cents, credited_quota
             ) VALUES
-                (1001, 3418, 'vip', 'topup', 850, 75.00, 1784211072, 1784815872,
-                 1875000, 0.0500, 'initializing', 1784211072, 1784383872, NULL,
-                 FALSE, NULL, 1784211072, 1784211072, 7500, 37500000),
-                (1001, 3418, 'vip', 'topup', 851, 75.00, 1784211072, 1784815872,
-                 1875000, 0.0500, 'initializing', 1784211072, 1784383872, NULL,
-                 TRUE, NULL, 1784211072, 1784211072, 7500, 37500000),
-                (1001, 3418, 'vip', 'topup', 852, 75.00, 1784211072, 1784815872,
-                 1875000, 0.0500, 'pending', 1784211072, 1784383872, 1784383872,
-                 FALSE, NULL, 1784211072, 1784211072, 7500, 37500000),
-                (1001, 3418, 'vip', 'topup', 853, 75.00, 1784211072, 1784815872,
-                 1875000, 0.0500, 'closed', 1784211072, 1784383872, NULL,
-                 FALSE, 1784212000, 1784211072, 1784211072, 7500, 37500000)
+                (1001, 3418, 'vip', 'topup', 850, 75.00, $1, $2,
+                 1875000, 0.0500, 'initializing', $1, $3, NULL,
+                 FALSE, NULL, $1, $1, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 851, 75.00, $1, $2,
+                 1875000, 0.0500, 'initializing', $1, $3, NULL,
+                 TRUE, NULL, $1, $1, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 852, 75.00, $1, $2,
+                 1875000, 0.0500, 'pending', $1, $3, $3,
+                 FALSE, NULL, $1, $1, 7500, 37500000),
+                (1001, 3418, 'vip', 'topup', 853, 75.00, $1, $2,
+                 1875000, 0.0500, 'closed', $1, $3, NULL,
+                 FALSE, $1, $1, $1, 7500, 37500000)
             "#,
         )
+        .bind(completed_at)
+        .bind(completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
+        .bind(completed_at + INITIALIZATION_SECONDS)
         .execute(&database.pool)
         .await
         .unwrap();
@@ -2926,7 +2992,7 @@ mod tests {
             inviter_group: "vip".to_string(),
             rebate_base_amount_cents: Some(7500),
             credited_quota: None,
-            completed_at: 1_784_211_072,
+            completed_at,
             payment_provider: "epay".to_string(),
         };
 
@@ -3489,8 +3555,8 @@ mod tests {
             repaired_times,
             (
                 1_784_211_072,
-                1_784_211_072 + 48 * 60 * 60,
-                1_784_211_072 + 7 * 24 * 60 * 60,
+                1_784_211_072 + INITIALIZATION_SECONDS,
+                1_784_211_072 + REBATE_EFFECTIVE_DELAY_SECONDS,
             )
         );
         sqlx::query(
@@ -3935,8 +4001,8 @@ mod tests {
             "#,
         )
         .bind(completed_at)
-        .bind(completed_at + 7 * 24 * 60 * 60)
-        .bind(completed_at + 48 * 60 * 60)
+        .bind(completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
+        .bind(completed_at + INITIALIZATION_SECONDS)
         .fetch_one(&database.pool)
         .await
         .unwrap();

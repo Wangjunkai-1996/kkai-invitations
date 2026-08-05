@@ -11,7 +11,8 @@ use subtle::ConstantTimeEq;
 
 use crate::error::{AppError, Result};
 use crate::rebate_lifecycle::{
-    ALL_USER_GROUP, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+    matches_supported_rebate_schedule, ALL_USER_GROUP, INITIALIZATION_SECONDS,
+    REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
 use crate::AppState;
@@ -714,8 +715,11 @@ fn validate_existing_record_for_policy(
         || actual_rate != expected_rate
         || record.rebate_amount != rebate_quota
         || record.order_time != event.completed_at
-        || record.initialization_ends_at != event.completed_at + INITIALIZATION_SECONDS
-        || record.rebate_effective_at != event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS
+        || !matches_supported_rebate_schedule(
+            event.completed_at,
+            record.initialization_ends_at,
+            record.rebate_effective_at,
+        )
     {
         return Err(IngestError::Conflict(
             "已有返利记录的会计字段与源事件不一致".to_string(),
@@ -752,8 +756,11 @@ async fn validate_canonical_record_and_snapshot(
         || record.user_group != event.inviter_group
         || record.stored_order_amount_cents != event.rebate_base_amount_cents
         || record.order_time != event.completed_at
-        || record.initialization_ends_at != event.completed_at + INITIALIZATION_SECONDS
-        || record.rebate_effective_at != event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS
+        || !matches_supported_rebate_schedule(
+            event.completed_at,
+            record.initialization_ends_at,
+            record.rebate_effective_at,
+        )
         || record.admin_adjusted
     {
         return Err(IngestError::Conflict(
@@ -1215,6 +1222,49 @@ mod tests {
             mutate(&mut changed);
             assert!(!is_pristine_legacy_placeholder(&changed));
         }
+    }
+
+    #[test]
+    fn strict_online_ingest_accepts_the_previous_complete_schedule() {
+        let event = validate_event(event()).unwrap();
+        let rule = RebateRuleSnapshot {
+            rule_id: Some(1),
+            rate: "0.05".parse().unwrap(),
+        };
+        let mut record = pristine_legacy_placeholder();
+        record.user_group = event.inviter_group.clone();
+        record.stored_order_amount_cents = event.rebate_base_amount_cents;
+        record.credited_quota = Some(37_500_000);
+        record.rebate_amount = 1_875_000;
+        record.rebate_rate = Some("0.05".to_string());
+        record.order_time = event.completed_at;
+        record.initialization_ends_at = event.completed_at + 2 * 24 * 60 * 60;
+        record.rebate_effective_at = event.completed_at + 7 * 24 * 60 * 60;
+
+        assert!(validate_existing_record_for_policy(
+            &event,
+            1001,
+            &record,
+            ExistingRecordPolicy::StrictOnline,
+            &rule,
+            1_875_000,
+            37_500_000,
+        )
+        .is_ok());
+
+        record.rebate_effective_at = event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS;
+        assert!(matches!(
+            validate_existing_record_for_policy(
+                &event,
+                1001,
+                &record,
+                ExistingRecordPolicy::StrictOnline,
+                &rule,
+                1_875_000,
+                37_500_000,
+            ),
+            Err(IngestError::Conflict(_))
+        ));
     }
 
     #[test]
