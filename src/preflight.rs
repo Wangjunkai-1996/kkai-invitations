@@ -6,6 +6,8 @@ use sqlx::{PgConnection, Row};
 const SAMPLE_LIMIT: i64 = 50;
 const DISPATCHER_SCHEMA_MIGRATION: i64 = 202607110006;
 const CANONICAL_EVENT_SCHEMA_MIGRATION: i64 = 202607170001;
+const PAYOUT_ADJUSTMENT_REASON: &str = "invitation_reward";
+const REVERSAL_ADJUSTMENT_REASON: &str = "invitation_reward_reversal";
 pub const ROLLBACK_BOUNDARY: &str = "Schema changes are expand-only. Application rollback is allowed only while settlement remains disabled and no balance_operations rows exist; never down-migrate or roll back to a binary that writes NewAPI quota directly.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -960,9 +962,12 @@ async fn inspect_external_evidence(
             SELECT id, operation_id, user_id, delta, reason, metadata,
                    original_operation_id
             FROM kkai_internal_balance_adjustments
+            WHERE reason IN ($1, $2)
             ORDER BY id
             "#,
         )
+        .bind(PAYOUT_ADJUSTMENT_REASON)
+        .bind(REVERSAL_ADJUSTMENT_REASON)
         .fetch_all(&mut *external_connection)
         .await?
         .iter()
@@ -1172,8 +1177,8 @@ fn external_adjustment_matches(
         return false;
     };
     let expected_reason = match payout.kind.as_str() {
-        "payout" => "invitation_reward",
-        "reversal" => "invitation_reward_reversal",
+        "payout" => PAYOUT_ADJUSTMENT_REASON,
+        "reversal" => REVERSAL_ADJUSTMENT_REASON,
         _ => return false,
     };
     let expected_operation_kind = match payout.kind.as_str() {

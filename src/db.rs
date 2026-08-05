@@ -5042,6 +5042,29 @@ mod tests {
 
         sqlx::query(
             r#"
+            INSERT INTO kkai_internal_balance_adjustments (
+                id, operation_id, user_id, delta, reason, metadata,
+                payload_sha256, original_operation_id,
+                balance_before, balance_after, created_at
+            ) VALUES (
+                402, '01J00000000000000000000402', 11, 5000000,
+                'cache_incident_compensation', '{}', repeat('c', 64), NULL,
+                9000000, 14000000, 1700000003
+            )
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+        let unrelated_adjustment = database.preflight().await.unwrap();
+        assert!(
+            unrelated_adjustment.safe_to_migrate,
+            "unexpected issues: {:?}",
+            unrelated_adjustment.issues
+        );
+
+        sqlx::query(
+            r#"
             INSERT INTO kkai_invitation_rebate_balance_marks (
                 id, kind, rebate_record_id, payout_id, user_id, quota_delta,
                 amount_cents, request_id, created_at
