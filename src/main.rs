@@ -1,5 +1,6 @@
 mod balance_dispatcher;
 mod config;
+mod credit_currency;
 mod db;
 mod error;
 mod invitation_signup;
@@ -39,6 +40,16 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("credit-migrate") {
+        match credit_currency::run(&args[2..]).await {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("credit migration failed: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("reconcile") {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env())
@@ -124,6 +135,9 @@ async fn main() {
             panic!("invitations database is not ready: {error}");
         }
     };
+    credit_currency::verify_runtime(&pool, &newapi_pool)
+        .await
+        .expect("currency cutover receipts must match before starting workers");
     let balance_client = config
         .balance_api
         .as_ref()

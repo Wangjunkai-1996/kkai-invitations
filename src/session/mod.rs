@@ -3,7 +3,7 @@ pub mod securecookie;
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct SessionUser {
     pub id: i64,

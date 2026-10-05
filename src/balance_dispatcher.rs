@@ -56,6 +56,8 @@ struct BalanceAdjustmentResponse {
     reason: BalanceReason,
     balance_before: i64,
     balance_after: i64,
+    #[serde(default)]
+    wallet_delta: Option<i64>,
     created_at: serde_json::Value,
     replayed: bool,
 }
@@ -431,7 +433,13 @@ pub async fn dispatch_available(state: &AppState, limit: usize) -> Result<usize,
         let Some(claimed) = claim_next_operation(&state.pool, now).await? else {
             break;
         };
-        let outcome = dispatch_claim(client, api_config, &claimed).await;
+        let epoch = crate::credit_currency::source_epoch(
+            &state.pool,
+            claimed.operation_id,
+            claimed.original_operation_ulid.as_deref(),
+        )
+        .await?;
+        let outcome = dispatch_claim(client, api_config, &claimed, epoch).await;
         persist_outcome(
             &state.pool,
             &claimed,
@@ -512,6 +520,7 @@ pub async fn persist_applied_for_test(
         reason: claimed.operation_kind.reason(),
         balance_before: 10_000_000,
         balance_after: 10_000_000 + claimed.delta_quota,
+        wallet_delta: None,
         created_at: serde_json::json!(now),
         replayed: false,
     };
@@ -658,6 +667,7 @@ async fn dispatch_claim(
     client: &reqwest::Client,
     config: &BalanceApiConfig,
     claimed: &ClaimedOperation,
+    quota_epoch: &str,
 ) -> DispatchOutcome {
     let request = request_for(RequestIdentity {
         operation_ulid: &claimed.operation_ulid,
@@ -683,6 +693,7 @@ async fn dispatch_claim(
     let response = match client
         .post(url)
         .bearer_auth(&config.secret)
+        .header("X-KKAI-Quota-Epoch", quota_epoch)
         .json(&request)
         .send()
         .await
@@ -771,7 +782,7 @@ async fn dispatch_claim(
             };
         }
     };
-    if !response_matches_request(&response, &request) {
+    if !response_matches_request(&response, &request, quota_epoch) {
         return DispatchOutcome::Retry {
             status: Some(status.as_u16()),
             code: "success_response_mismatch",
@@ -802,12 +813,26 @@ fn classify_review_code(status: StatusCode, upstream_code: Option<&str>) -> &'st
 fn response_matches_request(
     response: &BalanceAdjustmentResponse,
     request: &BalanceAdjustmentRequest,
+    quota_epoch: &str,
 ) -> bool {
-    response.operation_id == request.operation_id
+    let wallet_delta = response.wallet_delta.unwrap_or(response.delta);
+    let expected_delta = if quota_epoch == crate::credit_currency::LEGACY {
+        crate::credit_currency::convert(request.delta)
+    } else {
+        request.delta
+    };
+    (wallet_delta == expected_delta
+        || (quota_epoch == crate::credit_currency::LEGACY
+            && wallet_delta == request.delta
+            && (response.replayed || response.wallet_delta.is_none())))
+        && response.operation_id == request.operation_id
         && response.user_id == request.user_id
         && response.delta == request.delta
         && response.reason == request.reason
-        && response.balance_after == response.balance_before.saturating_add(response.delta)
+        && response
+            .balance_before
+            .checked_add(response.wallet_delta.unwrap_or(response.delta))
+            == Some(response.balance_after)
         && !response.created_at.is_null()
 }
 
@@ -1312,6 +1337,11 @@ mod tests {
                 headers.get("authorization").unwrap(),
                 &format!("Bearer {secret}")
             );
+            assert_eq!(
+                headers.get("X-KKAI-Quota-Epoch").unwrap(),
+                crate::credit_currency::LEGACY
+            );
+            assert!(body.get("quota_epoch").is_none());
             assert_eq!(body["operation_id"], "01J00000000000000000000001");
             assert_eq!(body["metadata"]["rebate_record_id"], 42);
             assert_eq!(body["metadata"]["payout_id"], 88);
@@ -1373,7 +1403,7 @@ mod tests {
         };
         let client = build_http_client(&config).unwrap();
         assert!(matches!(
-            dispatch_claim(&client, &config, &claimed).await,
+            dispatch_claim(&client, &config, &claimed, crate::credit_currency::LEGACY).await,
             DispatchOutcome::Applied(_, 201)
         ));
     }
@@ -1389,16 +1419,46 @@ mod tests {
             original_operation_id: Some("01J00000000000000000000000"),
             delta_quota: -500_000,
         });
-        let response = BalanceAdjustmentResponse {
+        let mut response = BalanceAdjustmentResponse {
             operation_id: request.operation_id.clone(),
             user_id: 7,
             delta: -500_000,
             reason: BalanceReason::InvitationRewardReversal,
             balance_before: 1_000_000,
             balance_after: 500_000,
+            wallet_delta: None,
             created_at: serde_json::json!(1_700_000_000),
             replayed: true,
         };
-        assert!(response_matches_request(&response, &request));
+        assert!(response_matches_request(
+            &response,
+            &request,
+            crate::credit_currency::LEGACY
+        ));
+        response.wallet_delta = Some(-37_500);
+        response.balance_after = 962_500;
+        assert!(response_matches_request(
+            &response,
+            &request,
+            crate::credit_currency::LEGACY
+        ));
+        assert!(!response_matches_request(
+            &response,
+            &request,
+            crate::credit_currency::USD
+        ));
+        response.balance_after += 1;
+        assert!(!response_matches_request(
+            &response,
+            &request,
+            crate::credit_currency::LEGACY
+        ));
+        response.wallet_delta = Some(-1);
+        response.balance_after = 999_999;
+        assert!(!response_matches_request(
+            &response,
+            &request,
+            crate::credit_currency::LEGACY
+        ));
     }
 }

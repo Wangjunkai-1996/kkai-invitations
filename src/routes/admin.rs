@@ -1493,15 +1493,28 @@ pub async fn update_rebate_order_records(
 
     validate_operation_rows(&rows, &record_ids, is_rebate_record_mutable)?;
 
+    let currency_boundary = crate::credit_currency::boundary(&mut *tx).await?;
+
     let mut updated = 0;
     for row in &rows {
         let id: i64 = row.try_get("id")?;
         let order_amount_cents: i64 = row.try_get("order_amount_cents")?;
-        let accounting_base = AdminRebateAccountingBase::from_record(
+        let mut accounting_base = AdminRebateAccountingBase::from_record(
             row.try_get("source_schema_version")?,
             row.try_get("credited_quota")?,
             order_amount_cents,
         )?;
+        if let AdminRebateAccountingBase::OrderAmountCents(cents) = accounting_base {
+            if currency_boundary
+                .as_ref()
+                .is_some_and(|b| id <= b.max_rebate_id)
+            {
+                let base =
+                    rebate_amount_for_cents(cents, Decimal::ONE, state.config.quota_per_unit)?;
+                accounting_base =
+                    AdminRebateAccountingBase::CreditedQuota(crate::credit_currency::convert(base));
+            }
+        }
         let direct_rebate_quota = req
             .rebate_amount
             .map(|amount_cents| {

@@ -1108,7 +1108,7 @@ const REQUIRED_NOT_NULL_COLUMNS: &[(&str, &[&str])] = &[
     ),
 ];
 
-static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
+pub(crate) static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
     migrations: Cow::Owned(vec![
         Migration::new(
             202607110001,

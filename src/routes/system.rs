@@ -651,6 +651,9 @@ async fn load_rebate_source_receipt_audits(
     if event_keys.is_empty() {
         return Ok(HashMap::new());
     }
+    // Validate the receipt before using its retained pre-conversion values to
+    // audit exact rounding. New events continue to use their current quota.
+    crate::credit_currency::boundary(&state.pool).await?;
     let rows = sqlx::query(
         r#"
         SELECT receipt.event_key, receipt.outcome,
@@ -674,8 +677,13 @@ async fn load_rebate_source_receipt_audits(
                        AND snapshot.credited_quota = linked.credited_quota
                        AND linked.credited_quota IS NOT NULL
                        AND snapshot.rebate_quota = linked.rebate_amount
-                       AND snapshot.rebate_quota =
-                           ROUND(snapshot.credited_quota::NUMERIC * snapshot.rebate_rate)::BIGINT
+                       AND CASE WHEN legacy.original IS NOT NULL THEN
+                           snapshot.rebate_quota = ROUND((legacy.original->'values'->>'rebate_quota')::NUMERIC*3/40)
+                           AND snapshot.credited_quota = ROUND((legacy.original->'values'->>'credited_quota')::NUMERIC*3/40)
+                           AND (legacy.original->'values'->>'rebate_quota')::NUMERIC =
+                               ROUND((legacy.original->'values'->>'credited_quota')::NUMERIC * snapshot.rebate_rate)
+                       ELSE snapshot.rebate_quota =
+                           ROUND(snapshot.credited_quota::NUMERIC * snapshot.rebate_rate)::BIGINT END
                        AND snapshot.quota_per_unit > 0
                        AND snapshot.quota_per_unit % 100 = 0
                        AND snapshot.source_revision = CASE receipt.source_schema_version
@@ -700,10 +708,17 @@ async fn load_rebate_source_receipt_audits(
           ON canonical.canonical_event_key = receipt.event_key
         LEFT JOIN rebate_calculation_snapshots snapshot
           ON snapshot.rebate_record_id = linked.id
+        LEFT JOIN LATERAL (
+            SELECT original FROM system_config cfg,
+                LATERAL jsonb_array_elements(cfg.value::JSONB #> '{envelope,plan,before,tables,rebate_calculation_snapshots}') originals(original)
+            WHERE cfg.key=$2 AND cfg.value::JSONB->>'state'='applied'
+                AND (original->>'id')::BIGINT=snapshot.rebate_record_id
+        ) legacy ON TRUE
         WHERE receipt.event_key::TEXT = ANY($1::TEXT[])
         "#,
     )
     .bind(event_keys)
+    .bind(crate::credit_currency::RECEIPT_KEY)
     .fetch_all(&state.pool)
     .await?;
     let mut outcomes = HashMap::with_capacity(rows.len());
@@ -1038,6 +1053,23 @@ async fn insert_rebate_record(
     state: &AppState,
     params: InsertRebateRecord<'_>,
 ) -> Result<InsertOutcome> {
+    if let Some(boundary) = crate::credit_currency::boundary(&state.pool).await? {
+        if params.order_time < boundary.applied_at {
+            let existing: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM rebate_records WHERE order_type=$1 AND order_id=$2)",
+            )
+            .bind(params.order_type)
+            .bind(params.order_id)
+            .fetch_one(&state.pool)
+            .await?;
+            if existing {
+                return Ok(InsertOutcome::Duplicate);
+            }
+            return Err(AppError::Conflict(
+                "币制切换前遗漏的返利来源需要审计，禁止自动补发".into(),
+            ));
+        }
+    }
     let ulid = ulid::Ulid::new().to_string();
     let order_time = if params.order_time > 0 {
         params.order_time

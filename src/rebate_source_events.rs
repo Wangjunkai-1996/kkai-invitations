@@ -108,8 +108,9 @@ struct ExistingReceipt {
     source_payload_sha256: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum ExistingRecordPolicy {
+    LegacyReplayOnly,
     StrictOnline,
     AuditedLegacyAttach,
 }
@@ -130,11 +131,17 @@ pub async fn receive_rebate_source_event(
     let Json(event) = payload
         .map_err(|_| AppError::UnprocessableEntity("返利源事件 JSON 格式无效".to_string()))?;
 
-    match ingest_rebate_source_event(
+    match ingest_rebate_source_event_in_epoch(
         &state.pool,
         event,
         state.config.quota_per_unit,
         state.config.topup_rebate_active_from_id,
+        headers
+            .get("X-KKAI-Credit-Epoch")
+            .and_then(|v| v.to_str().ok()),
+        headers
+            .get("X-KKAI-Credit-Migration")
+            .and_then(|v| v.to_str().ok()),
     )
     .await
     {
@@ -147,19 +154,71 @@ pub async fn receive_rebate_source_event(
     }
 }
 
+#[cfg(test)]
 pub async fn ingest_rebate_source_event(
     pool: &sqlx::PgPool,
     event: RebateSourceEvent,
     quota_per_unit: i64,
     topup_rebate_active_from_id: i64,
 ) -> std::result::Result<IngestOutcome, IngestError> {
+    ingest_rebate_source_event_in_epoch(
+        pool,
+        event,
+        quota_per_unit,
+        topup_rebate_active_from_id,
+        None,
+        None,
+    )
+    .await
+}
+
+fn source_event_policy(
+    boundary: Option<&crate::credit_currency::CreditBoundary>,
+    epoch: Option<&str>,
+    migration_id: Option<&str>,
+    schema_version: i32,
+) -> std::result::Result<ExistingRecordPolicy, IngestError> {
+    match (boundary, epoch) {
+        (None, None | Some(crate::credit_currency::LEGACY))
+            if migration_id.is_none_or(str::is_empty) =>
+        {
+            Ok(ExistingRecordPolicy::StrictOnline)
+        }
+        (Some(boundary), None | Some(crate::credit_currency::LEGACY))
+            if migration_id.is_none_or(str::is_empty)
+                || migration_id == Some(boundary.migration_id.as_str()) =>
+        {
+            Ok(ExistingRecordPolicy::LegacyReplayOnly)
+        }
+        (Some(boundary), Some(crate::credit_currency::USD))
+            if migration_id == Some(boundary.migration_id.as_str())
+                && schema_version == CREDITED_QUOTA_SCHEMA_VERSION =>
+        {
+            Ok(ExistingRecordPolicy::StrictOnline)
+        }
+        _ => Err(IngestError::Conflict(
+            "返利源事件币制与迁移凭据不一致".into(),
+        )),
+    }
+}
+
+async fn ingest_rebate_source_event_in_epoch(
+    pool: &sqlx::PgPool,
+    event: RebateSourceEvent,
+    quota_per_unit: i64,
+    topup_rebate_active_from_id: i64,
+    epoch: Option<&str>,
+    migration_id: Option<&str>,
+) -> std::result::Result<IngestOutcome, IngestError> {
     let mut transaction = pool.begin().await?;
+    let boundary = crate::credit_currency::boundary(&mut *transaction).await?;
+    let policy = source_event_policy(boundary.as_ref(), epoch, migration_id, event.schema_version)?;
     let outcome = ingest_rebate_source_event_with_policy(
         &mut transaction,
         event,
         quota_per_unit,
         topup_rebate_active_from_id,
-        ExistingRecordPolicy::StrictOnline,
+        policy,
     )
     .await?;
     transaction.commit().await?;
@@ -172,6 +231,14 @@ pub(crate) async fn attach_legacy_rebate_source_event_in_transaction(
     quota_per_unit: i64,
     topup_rebate_active_from_id: i64,
 ) -> std::result::Result<IngestOutcome, IngestError> {
+    if crate::credit_currency::boundary(&mut **transaction)
+        .await?
+        .is_some()
+    {
+        return Err(IngestError::Conflict(
+            "币制迁移后禁止附加未审计旧事件".into(),
+        ));
+    }
     ingest_rebate_source_event_with_policy(
         transaction,
         event,
@@ -202,6 +269,12 @@ async fn ingest_rebate_source_event_with_policy(
                 "相同 event_key 的事件内容不一致".to_string(),
             ))
         };
+    }
+
+    if existing_record_policy == ExistingRecordPolicy::LegacyReplayOnly {
+        return Err(IngestError::Conflict(
+            "旧币制事件仅允许按原始收据重放；未知旧事件保持冻结".into(),
+        ));
     }
 
     let Some(inviter_id) = event.inviter_id else {
@@ -1285,5 +1358,56 @@ mod tests {
             authorize_bearer(&headers, secret),
             Err(AppError::Unauthorized)
         ));
+    }
+}
+
+#[cfg(test)]
+mod credit_epoch_tests {
+    use super::*;
+    #[test]
+    fn events_require_known_denomination_and_exact_migration() {
+        let boundary = crate::credit_currency::CreditBoundary {
+            applied_at: 1,
+            migration_id: "cutover".into(),
+            max_payout_id: 1,
+            max_rebate_id: 1,
+        };
+        assert!(source_event_policy(None, None, None, 1).is_ok());
+        assert!(
+            source_event_policy(None, Some(crate::credit_currency::USD), Some("cutover"), 2)
+                .is_err()
+        );
+        assert!(matches!(
+            source_event_policy(
+                Some(&boundary),
+                Some(crate::credit_currency::LEGACY),
+                None,
+                2
+            ),
+            Ok(ExistingRecordPolicy::LegacyReplayOnly)
+        ));
+        assert!(matches!(
+            source_event_policy(
+                Some(&boundary),
+                Some(crate::credit_currency::USD),
+                Some("cutover"),
+                2
+            ),
+            Ok(ExistingRecordPolicy::StrictOnline)
+        ));
+        assert!(source_event_policy(
+            Some(&boundary),
+            Some(crate::credit_currency::USD),
+            Some("other"),
+            2
+        )
+        .is_err());
+        assert!(source_event_policy(
+            Some(&boundary),
+            Some(crate::credit_currency::USD),
+            Some("cutover"),
+            1
+        )
+        .is_err());
     }
 }

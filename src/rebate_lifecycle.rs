@@ -229,6 +229,7 @@ async fn finalize_rows(
     now: i64,
 ) -> Result<i64> {
     let mut finalized = 0;
+    let boundary = crate::credit_currency::boundary(pool).await?;
 
     for record in rows {
         let rows_affected = if record.admin_adjusted {
@@ -273,6 +274,14 @@ async fn finalize_rows(
                 rebate_rate,
                 QUOTA_UNITS_PER_YUAN,
             )?;
+            let rebate_amount = if boundary
+                .as_ref()
+                .is_some_and(|b| record.id <= b.max_rebate_id)
+            {
+                crate::credit_currency::convert(rebate_amount)
+            } else {
+                rebate_amount
+            };
 
             sqlx::query(
                 r#"

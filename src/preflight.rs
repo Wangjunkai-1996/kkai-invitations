@@ -1733,6 +1733,16 @@ async fn inspect_payouts(
         return Ok(());
     }
 
+    let credit_boundary = if table_exists(connection, "system_config").await? {
+        crate::credit_currency::boundary(&mut *connection).await?
+    } else {
+        None
+    };
+    let payout_quota = match credit_boundary {
+        Some(boundary) => format!("(CASE WHEN COALESCE(payout.original_payout_id,payout.id) <= {} THEN ROUND(payout.quota_delta::NUMERIC*3/40) ELSE payout.quota_delta::NUMERIC END)", boundary.max_payout_id),
+        None => "payout.quota_delta::NUMERIC".to_string(),
+    };
+
     let external_state_sql = if table_exists(connection, "balance_operations").await? {
         r#"
         SELECT id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
@@ -1961,7 +1971,7 @@ async fn inspect_payouts(
                 severity: IssueSeverity::Blocking,
                 message: "A payout or reversal disagrees with its record/request/order/user identity or exact rebate quota.",
             },
-            r#"
+            &format!(r#"
             SELECT payout.id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
             FROM invitation_rebate_payouts payout
             LEFT JOIN rebate_records record ON record.id = payout.rebate_record_id
@@ -1971,9 +1981,9 @@ async fn inspect_payouts(
                OR payout.invitee_user_id <> record.invitee_id
                OR payout.order_id <> record.order_id
                OR payout.order_type <> record.order_type
-               OR (payout.kind = 'payout' AND payout.quota_delta <> record.rebate_amount)
+               OR (payout.kind = 'payout' AND {payout_quota} <> record.rebate_amount)
                OR (payout.kind = 'reversal'
-                   AND payout.quota_delta::NUMERIC + record.rebate_amount::NUMERIC <> 0)
+                   AND {payout_quota} + record.rebate_amount::NUMERIC <> 0)
                OR (payout.rebate_request_id IS NOT NULL AND (
                     request.id IS NULL
                     OR request.user_id <> payout.inviter_user_id
@@ -1985,7 +1995,7 @@ async fn inspect_payouts(
                       AND owner.status <> 'rejected'
                ))
             ORDER BY payout.id LIMIT $1
-            "#,
+            "#),
         )
         .await?;
 
@@ -1998,7 +2008,7 @@ async fn inspect_payouts(
                     severity: IssueSeverity::Blocking,
                     message: "A request-linked payout does not exactly match its immutable amount snapshot.",
                 },
-                r#"
+                &format!(r#"
                 SELECT payout.id::TEXT AS entity_id, COUNT(*) OVER ()::BIGINT AS total_count
                 FROM invitation_rebate_payouts payout
                 LEFT JOIN rebate_request_items item
@@ -2008,13 +2018,13 @@ async fn inspect_payouts(
                   AND (
                       item.request_id IS NULL
                       OR (payout.kind = 'payout'
-                          AND payout.quota_delta <> item.amount_quota_snapshot)
+                          AND {payout_quota} <> item.amount_quota_snapshot)
                       OR (payout.kind = 'reversal'
-                          AND payout.quota_delta::NUMERIC
+                          AND {payout_quota}
                               + item.amount_quota_snapshot::NUMERIC <> 0)
                   )
                 ORDER BY payout.id LIMIT $1
-                "#,
+                "#),
             )
             .await?;
         }

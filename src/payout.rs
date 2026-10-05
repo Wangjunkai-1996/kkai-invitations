@@ -1039,18 +1039,16 @@ fn quota_to_whole_cents(quota_delta: i64, quota_per_unit: i64) -> PayoutResult<i
             "quota delta must be positive: {quota_delta}"
         )));
     }
-    let cents_per_quota_unit = quota_per_unit / 100;
-    if cents_per_quota_unit <= 0 {
+    if quota_per_unit <= 0 {
         return Err(PayoutError::InvalidQuota(format!(
             "invalid quota unit: {quota_per_unit}"
         )));
     }
-    if quota_delta % cents_per_quota_unit != 0 {
-        return Err(PayoutError::InvalidQuota(format!(
-            "quota delta {quota_delta} is not representable as whole cents"
-        )));
-    }
-    Ok(quota_delta / cents_per_quota_unit)
+    // Cents are an audit/display amount. The original quota is sent unchanged;
+    // fractional cents must never prevent an exact wallet credit or reversal.
+    let cents = (i128::from(quota_delta) * 100 + i128::from(quota_per_unit) / 2)
+        / i128::from(quota_per_unit);
+    i64::try_from(cents).map_err(|_| PayoutError::InvalidQuota("amount exceeds i64".to_string()))
 }
 
 fn validate_record_id(record_id: i64) -> Result<()> {
@@ -1373,8 +1371,10 @@ mod tests {
     }
 
     #[test]
-    fn quota_to_whole_cents_rejects_fractional_cents() {
-        assert!(quota_to_whole_cents(5_001, 500_000).is_err());
+    fn quota_to_whole_cents_rounds_display_without_rejecting_fractional_credit() {
+        assert_eq!(quota_to_whole_cents(5_001, 500_000).unwrap(), 1);
+        assert_eq!(quota_to_whole_cents(375, 500_000).unwrap(), 0);
+        assert_eq!(quota_to_whole_cents(7_500, 500_000).unwrap(), 2);
     }
 
     #[test]
