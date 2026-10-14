@@ -17,7 +17,7 @@ use crate::invitation_signup::{
 };
 use crate::rebate_lifecycle::{
     finalize_ready_initializing_records, finalize_ready_topup_event_records,
-    INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+    order_rebate_effective_at, INITIALIZATION_SECONDS,
 };
 use crate::rebate_types::{
     INVITATION_SIGNUP_INVITEE_ORDER_TYPE, INVITATION_SIGNUP_INVITER_ORDER_TYPE,
@@ -1078,7 +1078,7 @@ async fn insert_rebate_record(
     };
     let scan_started_at = params.now;
     let initialization_ends_at = scan_started_at + INITIALIZATION_SECONDS;
-    let rebate_effective_at = order_time + REBATE_EFFECTIVE_DELAY_SECONDS;
+    let rebate_effective_at = order_rebate_effective_at(&state.pool, order_time).await?;
 
     let result = sqlx::query(
         r#"

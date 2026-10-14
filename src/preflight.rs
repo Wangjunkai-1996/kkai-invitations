@@ -6,6 +6,7 @@ use sqlx::{PgConnection, Row};
 const SAMPLE_LIMIT: i64 = 50;
 const DISPATCHER_SCHEMA_MIGRATION: i64 = 202607110006;
 const CANONICAL_EVENT_SCHEMA_MIGRATION: i64 = 202607170001;
+const SALES_SCHEMA_MIGRATION: i64 = 202610140001;
 const PAYOUT_ADJUSTMENT_REASON: &str = "invitation_reward";
 const REVERSAL_ADJUSTMENT_REASON: &str = "invitation_reward_reversal";
 pub const ROLLBACK_BOUNDARY: &str = "Schema changes are expand-only. Application rollback is allowed only while settlement remains disabled and no balance_operations rows exist; never down-migrate or roll back to a binary that writes NewAPI quota directly.";
@@ -96,6 +97,9 @@ pub async fn run(
         });
     }
     let known_tables = [
+        "sales_accounts",
+        "sales_account_events",
+        "sales_disbursements",
         "rebate_rules",
         "rebate_records",
         "rebate_source_event_receipts",
@@ -142,6 +146,7 @@ pub async fn run(
     inspect_payouts(connection, &mut report).await?;
     inspect_registrations(connection, &mut report).await?;
     inspect_normalized_state(connection, &mut report).await?;
+    inspect_sales_state(connection, &mut report).await?;
     inspect_balance_operations(connection, &mut report).await?;
     inspect_migration_history(connection, &mut report).await?;
     inspect_external_evidence(connection, external_connection, &mut report).await?;
@@ -171,6 +176,41 @@ const fn column(name: &'static str, udt_name: &'static str, nullable: bool) -> C
 }
 
 const LOCAL_TABLE_SHAPES: &[TableShape] = &[
+    TableShape {
+        name: "sales_accounts",
+        columns: &[
+            column("user_id", "int8", false),
+            column("active", "bool", false),
+            column("note", "text", false),
+            column("created_at", "int8", false),
+            column("updated_at", "int8", false),
+            column("updated_by", "int8", false),
+        ],
+    },
+    TableShape {
+        name: "sales_account_events",
+        columns: &[
+            column("id", "int8", false),
+            column("user_id", "int8", false),
+            column("active", "bool", false),
+            column("note", "text", false),
+            column("admin_id", "int8", false),
+            column("created_at", "int8", false),
+        ],
+    },
+    TableShape {
+        name: "sales_disbursements",
+        columns: &[
+            column("request_id", "int8", false),
+            column("user_id", "int8", false),
+            column("amount_quota", "int8", false),
+            column("credit_currency", "varchar", false),
+            column("record_amounts", "jsonb", false),
+            column("confirmed_by", "int8", false),
+            column("confirmed_at", "int8", false),
+            column("note", "text", false),
+        ],
+    },
     TableShape {
         name: "rebate_rules",
         columns: &[
@@ -246,6 +286,7 @@ const LOCAL_TABLE_SHAPES: &[TableShape] = &[
             column("created_at", "int8", false),
             column("updated_at", "int8", false),
             column("rejected_at", "int8", true),
+            column("request_kind", "varchar", false),
         ],
     },
     TableShape {
@@ -494,6 +535,7 @@ async fn inspect_schema_shapes(
         migration_applied(connection, DISPATCHER_SCHEMA_MIGRATION).await?;
     let canonical_event_schema_applied =
         migration_applied(connection, CANONICAL_EVENT_SCHEMA_MIGRATION).await?;
+    let sales_schema_applied = migration_applied(connection, SALES_SCHEMA_MIGRATION).await?;
     for shape in LOCAL_TABLE_SHAPES {
         if !table_exists(connection, shape.name).await? {
             continue;
@@ -502,6 +544,7 @@ async fn inspect_schema_shapes(
             *shape,
             dispatcher_schema_applied,
             canonical_event_schema_applied,
+            sales_schema_applied,
         );
         let mismatches = table_shape_mismatches(connection, shape).await?;
         if !mismatches.is_empty() {
@@ -542,7 +585,14 @@ fn migration_compatible_shape(
     shape: TableShape,
     dispatcher_schema_applied: bool,
     canonical_event_schema_applied: bool,
+    sales_schema_applied: bool,
 ) -> TableShape {
+    if !sales_schema_applied && shape.name == "rebate_requests" {
+        return TableShape {
+            name: shape.name,
+            columns: &shape.columns[..shape.columns.len() - 1],
+        };
+    }
     if !canonical_event_schema_applied {
         let legacy_column_count = match shape.name {
             "rebate_records" => 6,
@@ -760,6 +810,9 @@ fn expected_primary_key(table: &str) -> Option<&'static [&'static str]> {
         | "balance_operation_events"
         | "rebate_reconciliation_cases"
         | "rebate_background_jobs" => Some(&["id"]),
+        "sales_accounts" => Some(&["user_id"]),
+        "sales_account_events" => Some(&["id"]),
+        "sales_disbursements" => Some(&["request_id"]),
         "system_config" => Some(&["key"]),
         "rebate_request_items" => Some(&["request_id", "rebate_record_id"]),
         "rebate_record_settlements" | "rebate_calculation_snapshots" => Some(&["rebate_record_id"]),
@@ -2196,6 +2249,71 @@ async fn inspect_registrations(
         "#,
     )
     .await?;
+    Ok(())
+}
+
+async fn inspect_sales_state(
+    connection: &mut PgConnection,
+    report: &mut PreflightReport,
+) -> Result<(), sqlx::Error> {
+    if !table_exists(connection, "sales_disbursements").await? {
+        return Ok(());
+    }
+    add_query_issue(connection, report, IssueSpec {
+        code: "rebate_cooling_policy_invalid", severity: IssueSeverity::Blocking,
+        message: "The seven-day rebate policy cutover is missing or invalid.",
+    }, r#"
+        SELECT 'order_rebate_seven_day_cutover_at'::TEXT AS entity_id, 1::BIGINT AS total_count
+        WHERE NOT EXISTS(SELECT 1 FROM system_config WHERE key='order_rebate_seven_day_cutover_at'
+          AND CASE WHEN value ~ '^[0-9]+$' THEN value::NUMERIC BETWEEN 1 AND 9223372036854775807 ELSE FALSE END)
+        LIMIT $1
+    "#).await?;
+    add_query_issue(connection, report, IssueSpec {
+        code: "sales_disbursement_identity_mismatch", severity: IssueSeverity::Blocking,
+        message: "A sales confirmation disagrees with its approved request or immutable amount snapshot.",
+    }, r#"
+        SELECT issued.request_id::TEXT AS entity_id, COUNT(*) OVER()::BIGINT AS total_count
+        FROM sales_disbursements issued
+        LEFT JOIN rebate_requests request ON request.id=issued.request_id
+        WHERE request.id IS NULL OR request.request_kind<>'sales' OR request.status<>'approved'
+           OR request.user_id<>issued.user_id
+           OR (issued.credit_currency='usd_credit_v1' AND NOT EXISTS(
+               SELECT 1 FROM system_config WHERE key='kkai_usd_credit_migration' AND value::JSONB->>'state'='applied'))
+           OR issued.amount_quota<>(SELECT COALESCE(SUM(value::NUMERIC),0) FROM jsonb_each_text(issued.record_amounts))
+           OR request.total_amount<>(SELECT COALESCE(SUM(amount_quota_snapshot),0) FROM rebate_request_items
+                                    WHERE request_id=issued.request_id AND membership_state='active')
+           OR EXISTS (
+               SELECT 1 FROM (SELECT * FROM rebate_request_items WHERE request_id=issued.request_id AND membership_state='active') item
+               FULL JOIN jsonb_each_text(issued.record_amounts) original ON original.key=item.rebate_record_id::TEXT
+               WHERE (original.key IS NULL OR item.rebate_record_id IS NULL OR item.amount_quota_snapshot::NUMERIC<>
+                      CASE WHEN issued.credit_currency='legacy_075' AND EXISTS(
+                          SELECT 1 FROM system_config WHERE key='kkai_usd_credit_migration' AND value::JSONB->>'state'='applied')
+                      THEN ROUND(original.value::NUMERIC*3/40) ELSE original.value::NUMERIC END)
+           )
+           OR (SELECT COUNT(*) FROM jsonb_object_keys(issued.record_amounts))<>cardinality(request.rebate_record_ids)
+           OR EXISTS (
+               SELECT 1 FROM unnest(request.rebate_record_ids) AS item(record_id)
+               LEFT JOIN rebate_records record ON record.id=item.record_id
+               LEFT JOIN rebate_record_request_ownership owner ON owner.rebate_record_id=item.record_id AND owner.ownership_state='active'
+               WHERE record.id IS NULL OR record.status<>'approved' OR record.inviter_id<>issued.user_id
+                  OR owner.request_id IS DISTINCT FROM issued.request_id
+           )
+        ORDER BY issued.request_id LIMIT $1
+    "#).await?;
+    add_query_issue(connection, report, IssueSpec {
+        code: "sales_request_has_balance_settlement", severity: IssueSeverity::Blocking,
+        message: "A sales request has a conflicting balance payout or balance operation.",
+    }, r#"
+        SELECT request.id::TEXT AS entity_id, COUNT(*) OVER()::BIGINT AS total_count
+        FROM rebate_requests request
+        WHERE request.request_kind='sales' AND EXISTS (
+            SELECT 1 FROM rebate_record_request_ownership owner
+            WHERE owner.request_id=request.id AND owner.ownership_state='active'
+              AND (EXISTS(SELECT 1 FROM invitation_rebate_payouts WHERE rebate_record_id=owner.rebate_record_id)
+                   OR EXISTS(SELECT 1 FROM balance_operations WHERE rebate_record_id=owner.rebate_record_id))
+        )
+        ORDER BY request.id LIMIT $1
+    "#).await?;
     Ok(())
 }
 

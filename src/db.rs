@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::preflight::{self, PreflightMode, PreflightReport};
 
 const READONLY_CONNECTION_SETUP_SQL: &str = "SET default_transaction_read_only = on";
-const EXPECTED_MIGRATIONS: [i64; 7] = [
+const EXPECTED_MIGRATIONS: [i64; 8] = [
     202607110001,
     202607110002,
     202607110003,
@@ -17,6 +17,7 @@ const EXPECTED_MIGRATIONS: [i64; 7] = [
     202607110005,
     202607110006,
     202607170001,
+    202610140001,
 ];
 #[derive(Clone, Copy)]
 struct IndexSpec {
@@ -28,6 +29,20 @@ struct IndexSpec {
 }
 
 const CRITICAL_INDEXES: &[IndexSpec] = &[
+    IndexSpec {
+        name: "idx_sales_account_events_user",
+        table: "sales_account_events",
+        columns: &["user_id", "id"],
+        predicate: None,
+        unique: false,
+    },
+    IndexSpec {
+        name: "idx_rebate_requests_kind_status",
+        table: "rebate_requests",
+        columns: &["request_kind", "status", "created_at"],
+        predicate: None,
+        unique: false,
+    },
     IndexSpec {
         name: "uq_rebate_rules_group_type",
         table: "rebate_rules",
@@ -341,6 +356,24 @@ struct KeyConstraintSpec {
 
 const CRITICAL_KEY_CONSTRAINTS: &[KeyConstraintSpec] = &[
     KeyConstraintSpec {
+        name: "sales_accounts_pkey",
+        table: "sales_accounts",
+        constraint_type: 'p',
+        columns: &["user_id"],
+    },
+    KeyConstraintSpec {
+        name: "sales_account_events_pkey",
+        table: "sales_account_events",
+        constraint_type: 'p',
+        columns: &["id"],
+    },
+    KeyConstraintSpec {
+        name: "sales_disbursements_pkey",
+        table: "sales_disbursements",
+        constraint_type: 'p',
+        columns: &["request_id"],
+    },
+    KeyConstraintSpec {
         name: "rebate_rules_pkey",
         table: "rebate_rules",
         constraint_type: 'p',
@@ -512,6 +545,21 @@ struct CheckSpec {
 }
 
 const CRITICAL_CHECKS: &[CheckSpec] = &[
+    CheckSpec {
+        name: "ck_sales_accounts_identity",
+        table: "sales_accounts",
+        definition_md5: "8551bf445f7601b05c9aa55d6db915ab",
+    },
+    CheckSpec {
+        name: "ck_rebate_requests_kind",
+        table: "rebate_requests",
+        definition_md5: "191a0ba9b9b2252ff87c8ae1c330279d",
+    },
+    CheckSpec {
+        name: "ck_sales_disbursements_values",
+        table: "sales_disbursements",
+        definition_md5: "8ee2bfec1cc34994510b45ceca809eb3",
+    },
     CheckSpec {
         name: "ck_rebate_source_event_receipts_outcome",
         table: "rebate_source_event_receipts",
@@ -716,6 +764,22 @@ struct ForeignKeySpec {
 
 const CRITICAL_FOREIGN_KEYS: &[ForeignKeySpec] = &[
     ForeignKeySpec {
+        name: "fk_sales_account_events_account",
+        table: "sales_account_events",
+        columns: &["user_id"],
+        referenced_table: "sales_accounts",
+        referenced_columns: &["user_id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
+        name: "fk_sales_disbursements_request",
+        table: "sales_disbursements",
+        columns: &["request_id"],
+        referenced_table: "rebate_requests",
+        referenced_columns: &["id"],
+        delete_action: 'r',
+    },
+    ForeignKeySpec {
         name: "fk_invitation_rebate_payouts_record",
         table: "invitation_rebate_payouts",
         columns: &["rebate_record_id"],
@@ -913,6 +977,76 @@ struct TriggerSpec {
 
 const CRITICAL_TRIGGERS: &[TriggerSpec] = &[
     TriggerSpec {
+        name: "trg_sales_request_identity",
+        table: "rebate_requests",
+        trigger_type: 19,
+        update_columns: &[
+            "rebate_record_ids",
+            "request_kind",
+            "status",
+            "total_amount",
+            "user_id",
+        ],
+        function: "guard_sales_request_identity",
+        source_md5: "248d9702d1a16b18f79e2d0f237e56b9",
+    },
+    TriggerSpec {
+        name: "trg_sales_disbursement_insert",
+        table: "sales_disbursements",
+        trigger_type: 7,
+        update_columns: &[],
+        function: "guard_sales_disbursement",
+        source_md5: "d0a32a5dd27f80fd90179961c816dc3e",
+    },
+    TriggerSpec {
+        name: "trg_sales_disbursement_immutable",
+        table: "sales_disbursements",
+        trigger_type: 27,
+        update_columns: &[],
+        function: "forbid_sales_audit_mutation",
+        source_md5: "15708337e2cbaaa7ced35f3910aeed65",
+    },
+    TriggerSpec {
+        name: "trg_sales_disbursement_truncate",
+        table: "sales_disbursements",
+        trigger_type: 34,
+        update_columns: &[],
+        function: "forbid_sales_audit_mutation",
+        source_md5: "15708337e2cbaaa7ced35f3910aeed65",
+    },
+    TriggerSpec {
+        name: "trg_sales_account_event_immutable",
+        table: "sales_account_events",
+        trigger_type: 27,
+        update_columns: &[],
+        function: "forbid_sales_audit_mutation",
+        source_md5: "15708337e2cbaaa7ced35f3910aeed65",
+    },
+    TriggerSpec {
+        name: "trg_sales_account_event_truncate",
+        table: "sales_account_events",
+        trigger_type: 34,
+        update_columns: &[],
+        function: "forbid_sales_audit_mutation",
+        source_md5: "15708337e2cbaaa7ced35f3910aeed65",
+    },
+    TriggerSpec {
+        name: "trg_sales_balance_payout_guard",
+        table: "invitation_rebate_payouts",
+        trigger_type: 23,
+        update_columns: &["rebate_record_id"],
+        function: "forbid_sales_balance_payout",
+        source_md5: "571cb0341d6e6b1029605b54c44e08b8",
+    },
+    TriggerSpec {
+        name: "trg_sales_balance_operation_guard",
+        table: "balance_operations",
+        trigger_type: 23,
+        update_columns: &["rebate_record_id"],
+        function: "forbid_sales_balance_payout",
+        source_md5: "571cb0341d6e6b1029605b54c44e08b8",
+    },
+    TriggerSpec {
         name: "trg_rebate_record_supersession_guard",
         table: "rebate_records",
         trigger_type: 23,
@@ -1013,6 +1147,35 @@ const CRITICAL_TRIGGERS: &[TriggerSpec] = &[
 ];
 
 const REQUIRED_NOT_NULL_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "sales_accounts",
+        &[
+            "user_id",
+            "active",
+            "note",
+            "created_at",
+            "updated_at",
+            "updated_by",
+        ],
+    ),
+    (
+        "sales_account_events",
+        &["id", "user_id", "active", "note", "admin_id", "created_at"],
+    ),
+    (
+        "sales_disbursements",
+        &[
+            "request_id",
+            "user_id",
+            "amount_quota",
+            "credit_currency",
+            "record_amounts",
+            "confirmed_by",
+            "confirmed_at",
+            "note",
+        ],
+    ),
+    ("rebate_requests", &["request_kind"]),
     (
         "invitation_rebate_payouts",
         &[
@@ -1170,6 +1333,15 @@ pub(crate) static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
             MigrationType::Simple,
             Cow::Borrowed(include_str!(
                 "../migrations/202607170001_canonical_rebate_source_events.sql"
+            )),
+            false,
+        ),
+        Migration::new(
+            202610140001,
+            Cow::Borrowed("sales accounts and settlement"),
+            MigrationType::Simple,
+            Cow::Borrowed(include_str!(
+                "../migrations/202610140001_sales_accounts_and_settlement.sql"
             )),
             false,
         ),
@@ -1363,6 +1535,9 @@ async fn lock_maintenance_tables(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), DatabaseStartupError> {
     const TABLES: &[&str] = &[
+        "sales_accounts",
+        "sales_account_events",
+        "sales_disbursements",
         "balance_operation_events",
         "_sqlx_migrations",
         "balance_operation_outbox",
@@ -1422,6 +1597,9 @@ async fn verify_schema(connection: &mut PgConnection) -> Result<(), DatabaseStar
     }
 
     let required_tables = [
+        "sales_accounts",
+        "sales_account_events",
+        "sales_disbursements",
         "rebate_request_items",
         "rebate_record_request_ownership",
         "rebate_record_settlements",
@@ -2090,7 +2268,14 @@ mod tests {
         }
 
         async fn prepare(&self) -> Result<(), DatabaseStartupError> {
-            prepare_database(&self.pool, &self.external_pool).await
+            prepare_database(&self.pool, &self.external_pool).await?;
+            sqlx::query(
+                "UPDATE system_config SET value='1' WHERE key='order_rebate_seven_day_cutover_at'",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(DatabaseStartupError::Connect)?;
+            Ok(())
         }
 
         async fn verify(&self) -> Result<(), DatabaseStartupError> {
@@ -2221,7 +2406,7 @@ mod tests {
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
         database.cleanup().await;
     }
 
@@ -5569,6 +5754,445 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("settlement coverage"));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_requests_require_manual_approval_and_isolate_external_confirmation() {
+        use crate::error::AppError;
+        use crate::routes::{admin, user};
+        use crate::{payout, sales};
+        use axum::extract::{Path, Query, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::Json;
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::raw_sql("CREATE TABLE users(id BIGINT PRIMARY KEY, username TEXT, display_name TEXT, deleted_at TIMESTAMP, aff_code TEXT, inviter_id BIGINT); INSERT INTO users VALUES(11,'sales','Sales',NULL,'sales-code',NULL),(12,'client','Client',NULL,'client-code',11)")
+            .execute(&database.external_pool).await.unwrap();
+        sqlx::raw_sql("UPDATE system_config SET value='false' WHERE key IN ('rebate_to_balance_enabled','user_invitation_rebate_enabled','invitation_signup_reward_review_required'); UPDATE system_config SET value='true' WHERE key='invitation_signup_reward_enabled'; UPDATE system_config SET value='0' WHERE key IN ('min_rebate_request_amount','rebate_request_frequency_days');")
+            .execute(&database.pool).await.unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".into(),
+                base_path: String::new(),
+                database_url: String::new(),
+                newapi_database_url: String::new(),
+                session_secret: "test".into(),
+                rebate_event_ingest_secret: "test".into(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                topup_rebate_active_from_id: 1,
+                settlement_mode: SettlementMode::Enabled,
+                quota_per_unit: 500000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let seller = SessionUser {
+            id: 11,
+            username: "sales".into(),
+            role: 1,
+            status: 1,
+            group: "default".into(),
+        };
+        let operator = SessionUser {
+            id: 99,
+            username: "admin".into(),
+            role: 10,
+            status: 1,
+            group: "default".into(),
+        };
+        let _ = sales::update_account(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(11),
+            Json(sales::UpdateSalesAccount {
+                active: true,
+                note: "onboard".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(sales::profile(&state.pool, 11).await.unwrap().active);
+        sqlx::raw_sql("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,rebate_rate,status,scan_started_at,initialization_ends_at,created_at,updated_at) VALUES(901,11,12,'default','invite_inviter',901,0,1,1,2501,NULL,'pending',1,1,1,1),(902,11,12,'default','invite_inviter',902,0,1,1,2501,NULL,'pending',1,1,1,1)")
+            .execute(&state.pool).await.unwrap();
+        let available = user::available_rebates(State(state.clone()), seller.clone())
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert_eq!(available.amount, 1, "round the total once, not each item");
+        let request = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![901, 902],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(request.amount, available.amount);
+        let id = request.id;
+        let identity: (String, String) =
+            sqlx::query_as("SELECT request_kind,status FROM rebate_requests WHERE id=$1")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            identity,
+            ("sales".into(), "pending".into()),
+            "signup auto-approval never applies to sales"
+        );
+        assert!(
+            sqlx::query("UPDATE rebate_requests SET request_kind='ordinary' WHERE id=$1")
+                .bind(id)
+                .execute(&state.pool)
+                .await
+                .is_err()
+        );
+        let params = admin::RebateRequestListParams {
+            request_kind: Some("sales".into()),
+            status: None,
+            page: None,
+            page_size: None,
+        };
+        assert_eq!(
+            admin::get_rebate_requests(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Query(params)
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .total,
+            1
+        );
+        let params = admin::RebateRequestListParams {
+            request_kind: None,
+            status: None,
+            page: None,
+            page_size: None,
+        };
+        assert_eq!(
+            admin::get_rebate_requests(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Query(params)
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .total,
+            0
+        );
+        assert!(matches!(
+            sales::confirm_issued(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id),
+                Json(sales::ConfirmIssued {
+                    note: "not approved".into()
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        let _ = admin::approve_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(id),
+            Json(admin::ApproveRequest {
+                note: Some("reviewed".into()),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_static("sales-payout-test"),
+        );
+        assert!(matches!(
+            admin::approve_and_pay_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id),
+                headers.clone(),
+                Json(admin::ApproveAndPayRequest { note: None })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        let batch = admin::batch_approve_and_pay_rebate_requests(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            headers,
+            Json(admin::BatchApproveAndPayRequest {
+                request_ids: vec![id],
+                note: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(batch.failed_requests, 1);
+        assert!(matches!(
+            payout::pay_rebate_record(
+                &state,
+                payout::PayRecordInput {
+                    record_id: 901,
+                    request_id: "direct-sales-test".into(),
+                    admin: &AdminUser(operator.clone()),
+                    now: 1
+                }
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(
+            !payout::get_payout_status(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(901)
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .can_pay
+        );
+        let mut dry_run_headers = HeaderMap::new();
+        dry_run_headers.insert("idempotency-key", HeaderValue::from_static("sales-dry-run"));
+        dry_run_headers.insert("x-kkai-payout-action", HeaderValue::from_static("pay"));
+        assert!(matches!(
+            payout::pay_rebate_payout(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(901),
+                Query(payout::PayoutActionParams {
+                    dry_run: Some("true".into())
+                }),
+                dry_run_headers
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        let bypass = sqlx::query("INSERT INTO invitation_rebate_payouts(rebate_record_id,rebate_request_id,inviter_user_id,invitee_user_id,order_id,order_type,amount_cents,quota_delta,kind,status,request_id,created_at,updated_at) VALUES(901,$1,11,12,901,'invite_inviter',1,2501,'payout','pending','sales-direct-sql',1,1)")
+            .bind(id).execute(&state.pool).await.unwrap_err();
+        assert!(bypass
+            .to_string()
+            .contains("sales requests cannot use balance payouts"));
+        let mut maintenance = state.clone();
+        maintenance.config.settlement_mode = SettlementMode::ReadOnly;
+        let features = user::invitation_feature_status(State(maintenance.clone()))
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert!(!features.settlement_enabled);
+        assert_eq!(features.credit_currency, "legacy_075");
+        assert!(matches!(
+            sales::confirm_issued(
+                State(maintenance),
+                AdminUser(operator.clone()),
+                Path(id),
+                Json(sales::ConfirmIssued {
+                    note: "paid".into()
+                })
+            )
+            .await,
+            Err(AppError::FundsMaintenance)
+        ));
+        let (first, second) = tokio::join!(
+            sales::confirm_issued(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id),
+                Json(sales::ConfirmIssued {
+                    note: "bank reference one".into()
+                })
+            ),
+            sales::confirm_issued(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id),
+                Json(sales::ConfirmIssued {
+                    note: "concurrent retry".into()
+                })
+            )
+        );
+        let first = first.unwrap().0.data;
+        let second = second.unwrap().0.data;
+        assert_eq!(first.issued_at, second.issued_at);
+        assert_eq!(first.issue_note, second.issue_note);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sales_disbursements")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            admin::reject_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id),
+                Json(admin::ApproveRequest {
+                    note: Some("reject".into()),
+                    reason: None
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin::reset_rebate_request_review(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(id)
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin::revoke_signup_reward_rebate_record(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(901)
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(
+            sqlx::query("DELETE FROM sales_disbursements WHERE request_id=$1")
+                .bind(id)
+                .execute(&state.pool)
+                .await
+                .is_err()
+        );
+        let records = user::fetch_rebate_records(&state.pool, Some(11), None, false, None, 10, 0)
+            .await
+            .unwrap();
+        assert!(records
+            .iter()
+            .all(|r| r.display_status == "paid" && r.issued_at.is_some()));
+        let stats = user::my_code(State(state.clone()), seller.clone())
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert_eq!((stats.pending_rebate, stats.completed_rebate), (0, 1));
+        let admin_stats =
+            admin::get_rebate_stats(State(state.clone()), AdminUser(operator.clone()))
+                .await
+                .unwrap()
+                .0
+                .data;
+        assert_eq!(
+            (admin_stats.approved_rebate, admin_stats.completed_rebate),
+            (0, 1)
+        );
+        for (filter, requests_expected, records_expected) in
+            [("completed", 1, 2), ("approved", 0, 0)]
+        {
+            let listing = admin::get_rebate_requests(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Query(admin::RebateRequestListParams {
+                    request_kind: Some("sales".into()),
+                    status: Some(filter.into()),
+                    page: None,
+                    page_size: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .data;
+            assert_eq!(listing.total, requests_expected);
+            assert_eq!(listing.items.len() as i64, requests_expected);
+            let listing = user::my_rebate_requests(
+                State(state.clone()),
+                seller.clone(),
+                Query(user::PaginationParams {
+                    status: Some(filter.into()),
+                    page: None,
+                    page_size: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+            .data;
+            assert_eq!(listing.total, requests_expected);
+            assert_eq!(listing.items.len() as i64, requests_expected);
+            let count =
+                user::count_rebate_records(&state.pool, Some(11), Some(filter), false, None)
+                    .await
+                    .unwrap();
+            let records =
+                user::fetch_rebate_records(&state.pool, Some(11), Some(filter), false, None, 10, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(count, records_expected);
+            assert_eq!(records.len() as i64, records_expected);
+            assert!(records.iter().all(|r| r.credit_currency == "legacy_075"));
+        }
+        let _ = sales::update_account(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(11),
+            Json(sales::UpdateSalesAccount {
+                active: false,
+                note: "pause".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            user::request_rebate(
+                State(state.clone()),
+                seller.clone(),
+                Json(user::RebateRequest {
+                    amount: None,
+                    rebate_record_ids: vec![901]
+                })
+            )
+            .await,
+            Err(AppError::Forbidden)
+        ));
+        let requests = user::my_rebate_requests(
+            State(state.clone()),
+            seller,
+            Query(user::PaginationParams {
+                page: None,
+                page_size: None,
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(requests.items[0].request_kind, "sales");
+        assert!(requests.items[0].issued_at.is_some());
+        let report = database.preflight().await.unwrap();
+        assert!(report.safe_to_migrate, "{:?}", report.issues);
+        database.verify().await.unwrap();
         database.cleanup().await;
     }
 

@@ -23,8 +23,8 @@ use crate::middleware::AdminUser;
 use crate::payout::{pay_rebate_record, request_id_from_headers, PayRecordInput, PayResult};
 use crate::rebate_lifecycle::{
     finalize_initializing_records_by_ids, rebate_amount_for_cents,
-    rebate_amount_for_credited_quota, ALL_USER_GROUP, INITIALIZATION_SECONDS,
-    REBATE_EFFECTIVE_DELAY_SECONDS,
+    rebate_amount_for_credited_quota, rebate_effective_at_for_cutover, ALL_USER_GROUP,
+    INITIALIZATION_SECONDS,
 };
 use crate::rebate_types::{
     is_invitation_signup_reward_order_type, is_order_rebate_order_type,
@@ -193,6 +193,10 @@ pub struct RebateRequestDetail {
     pub rejected_at: Option<String>,
     pub review_note: Option<String>,
     pub reject_reason: Option<String>,
+    pub request_kind: String,
+    pub issued_at: Option<String>,
+    pub issue_note: Option<String>,
+    pub credit_currency: &'static str,
 }
 
 #[derive(Serialize)]
@@ -274,12 +278,20 @@ pub struct InvitationRegistrationRewardRevokeResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebateRequestListParams {
+    pub request_kind: Option<String>,
     pub status: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
 
 impl RebateRequestListParams {
+    fn request_kind(&self) -> Result<&str> {
+        match self.request_kind.as_deref().unwrap_or("ordinary") {
+            "ordinary" => Ok("ordinary"),
+            "sales" => Ok("sales"),
+            _ => Err(AppError::BadRequest("返利申请类别无效".into())),
+        }
+    }
     fn page(&self) -> i64 {
         self.page.unwrap_or(1).max(1)
     }
@@ -289,7 +301,7 @@ impl RebateRequestListParams {
     }
 
     fn offset(&self) -> i64 {
-        (self.page() - 1) * self.page_size()
+        (self.page() - 1).saturating_mul(self.page_size())
     }
 
     fn status_filter(&self) -> Option<&str> {
@@ -319,7 +331,7 @@ impl AdminRebateRecordListParams {
     }
 
     fn offset(&self) -> i64 {
-        (self.page() - 1) * self.page_size()
+        (self.page() - 1).saturating_mul(self.page_size())
     }
 
     fn status_filter(&self) -> Option<&str> {
@@ -364,7 +376,7 @@ impl RebateOrderRecordParams {
     }
 
     fn offset(&self) -> i64 {
-        (self.page() - 1) * self.page_size()
+        (self.page() - 1).saturating_mul(self.page_size())
     }
 
     fn order_type_filter(&self) -> Option<&str> {
@@ -394,7 +406,7 @@ impl InvitationRegistrationParams {
     }
 
     fn offset(&self) -> i64 {
-        (self.page() - 1) * self.page_size()
+        (self.page() - 1).saturating_mul(self.page_size())
     }
 }
 
@@ -807,7 +819,7 @@ pub async fn update_system_config(
     upsert_config_value(
         &state.pool,
         "min_rebate_request_amount",
-        &cents_to_quota(config.min_rebate_request_amount).to_string(),
+        &cents_to_quota(config.min_rebate_request_amount)?.to_string(),
         "最低返利申请金额（人民币分，API 层；数据库存 new-api 额度单位）",
         now,
     )
@@ -871,7 +883,7 @@ pub async fn update_system_config(
     upsert_config_value(
         &state.pool,
         INVITATION_SIGNUP_REWARD_AMOUNT_KEY,
-        &cents_to_quota(legacy_reward_amount).to_string(),
+        &cents_to_quota(legacy_reward_amount)?.to_string(),
         "邀请注册奖励金额兼容值（人民币分，API 层；数据库存 new-api 额度单位）",
         now,
     )
@@ -879,7 +891,7 @@ pub async fn update_system_config(
     upsert_config_value(
         &state.pool,
         INVITATION_SIGNUP_INVITER_REWARD_AMOUNT_KEY,
-        &cents_to_quota(inviter_reward_amount).to_string(),
+        &cents_to_quota(inviter_reward_amount)?.to_string(),
         "邀请人注册奖励金额（人民币分，API 层；数据库存 new-api 额度单位）",
         now,
     )
@@ -887,7 +899,7 @@ pub async fn update_system_config(
     upsert_config_value(
         &state.pool,
         INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
-        &cents_to_quota(invitee_reward_amount).to_string(),
+        &cents_to_quota(invitee_reward_amount)?.to_string(),
         "被邀请人注册奖励金额（人民币分，API 层；数据库存 new-api 额度单位）",
         now,
     )
@@ -948,14 +960,16 @@ pub async fn get_rebate_requests(
     _admin: AdminUser,
     Query(params): Query<RebateRequestListParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRequestDetail>>>> {
-    let total = count_rebate_requests(&state, params.status_filter()).await?;
+    let total =
+        count_rebate_requests(&state, params.status_filter(), params.request_kind()?).await?;
     let rebate_request_rows =
         fetch_rebate_requests(&state, params.status_filter(), &params).await?;
     let user_map = fetch_user_map(&state, &rebate_request_rows).await?;
 
+    let credit_currency = crate::credit_currency::current_epoch(&state.pool).await?;
     let result = rebate_request_rows
         .iter()
-        .map(|row| rebate_request_detail_from_row(row, &user_map))
+        .map(|row| rebate_request_detail_from_row(row, &user_map, credit_currency))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ok(PaginatedResponse {
@@ -1243,11 +1257,13 @@ pub async fn get_rebate_stats(
         r#"
         SELECT
             COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
-            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
+            COALESCE(SUM(CASE WHEN status = 'completed' OR issued.request_id IS NOT NULL THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
             COALESCE(SUM(CASE WHEN status = 'pending' THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending,
             COALESCE(SUM(CASE WHEN status = 'requested' THEN rebate_amount ELSE 0 END), 0)::BIGINT as requested,
-            COALESCE(SUM(CASE WHEN status = 'approved' THEN rebate_amount ELSE 0 END), 0)::BIGINT as approved
+            COALESCE(SUM(CASE WHEN status = 'approved' AND issued.request_id IS NULL THEN rebate_amount ELSE 0 END), 0)::BIGINT as approved
         FROM rebate_records
+        LEFT JOIN rebate_record_request_ownership owner ON owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active'
+        LEFT JOIN sales_disbursements issued ON issued.request_id=owner.request_id
         WHERE status NOT IN ('initializing', 'closed')
         "#,
     )
@@ -1424,16 +1440,30 @@ pub async fn get_rebate_order_records(
         "Local rebate record map loaded for admin order page"
     );
 
+    let cutover: String = sqlx::query_scalar(
+        "SELECT value FROM system_config WHERE key='order_rebate_seven_day_cutover_at'",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let cutover = cutover
+        .parse::<i64>()
+        .map_err(|_| AppError::Internal("返利冷却政策配置无效".into()))?;
     let records = orders
         .iter()
         .map(|order| {
-            admin_rebate_order_record_from_parts(
+            let local = local_record_map.get(&(order.order_type.clone(), order.order_id));
+            let effective_at = match local {
+                Some(record) => record.rebate_effective_at,
+                None => rebate_effective_at_for_cutover(order.order_time, cutover)?,
+            };
+            Ok(admin_rebate_order_record_from_parts(
                 order,
-                local_record_map.get(&(order.order_type.clone(), order.order_id)),
+                local,
                 now,
-            )
+                effective_at,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     tracing::info!(
         admin_id = admin.0.id,
@@ -2162,7 +2192,11 @@ async fn fetch_invitation_registration_reward_map(
 
     let rows = sqlx::query(
         r#"
-        SELECT id, order_type, order_id, rebate_amount, status
+        SELECT id, order_type, order_id, rebate_amount,
+               CASE WHEN EXISTS(SELECT 1 FROM sales_disbursements issued
+                   JOIN rebate_record_request_ownership owner ON owner.request_id=issued.request_id
+                   WHERE owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active')
+               THEN 'completed' ELSE status END AS status
         FROM rebate_records
         WHERE order_type IN ($1, $2)
           AND order_id = ANY($3)
@@ -2679,6 +2713,7 @@ fn admin_rebate_order_record_from_parts(
     order: &NewApiRebateOrder,
     local_record: Option<&LocalRebateRecord>,
     now: i64,
+    effective_at_fallback: i64,
 ) -> AdminRebateOrderRecord {
     let rule_missing = local_record
         .map(|record| record.rebate_ratio.is_none())
@@ -2699,7 +2734,7 @@ fn admin_rebate_order_record_from_parts(
         .unwrap_or(order.order_time);
     let rebate_effective_at = local_record
         .map(|record| record.rebate_effective_at)
-        .unwrap_or(order_time + REBATE_EFFECTIVE_DELAY_SECONDS);
+        .unwrap_or(effective_at_fallback);
     let scan_started_at = local_record
         .map(|record| record.scan_started_at)
         .unwrap_or(now);
@@ -2865,18 +2900,13 @@ fn resolve_signup_reward_amounts_for_update(config: &SystemConfig) -> (i64, i64)
     )
 }
 
-async fn count_rebate_requests(state: &AppState, status: Option<&str>) -> Result<i64> {
-    let total = if let Some(status) = status {
-        sqlx::query_scalar("SELECT COUNT(*) FROM rebate_requests WHERE status = $1")
-            .bind(status)
-            .fetch_one(&state.pool)
-            .await?
-    } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM rebate_requests")
-            .fetch_one(&state.pool)
-            .await?
-    };
-    Ok(total)
+async fn count_rebate_requests(
+    state: &AppState,
+    status: Option<&str>,
+    request_kind: &str,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM rebate_requests WHERE ($1::TEXT IS NULL OR (CASE WHEN EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) THEN 'completed' ELSE status END)=$1) AND request_kind=$2")
+        .bind(status).bind(request_kind).fetch_one(&state.pool).await?)
 }
 
 async fn fetch_rebate_requests(
@@ -2884,38 +2914,16 @@ async fn fetch_rebate_requests(
     status: Option<&str>,
     params: &RebateRequestListParams,
 ) -> Result<Vec<PgRow>> {
-    let rows = if let Some(status) = status {
-        sqlx::query(
-            r#"
-            SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
-                   approved_at, completed_at, rejected_at, admin_note
-            FROM rebate_requests
-            WHERE status = $1
-            ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(status)
-        .bind(params.page_size())
-        .bind(params.offset())
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
-                   approved_at, completed_at, rejected_at, admin_note
-            FROM rebate_requests
-            ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(params.page_size())
-        .bind(params.offset())
-        .fetch_all(&state.pool)
-        .await?
-    };
-    Ok(rows)
+    Ok(sqlx::query(r#"
+        SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
+               approved_at, completed_at, rejected_at, admin_note, request_kind,
+               (SELECT confirmed_at FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issued_at,
+               (SELECT note FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issue_note
+        FROM rebate_requests
+        WHERE ($1::TEXT IS NULL OR (CASE WHEN EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) THEN 'completed' ELSE status END)=$1) AND request_kind=$2
+        ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4
+    "#).bind(status).bind(params.request_kind()?).bind(params.page_size()).bind(params.offset())
+    .fetch_all(&state.pool).await?)
 }
 
 async fn approve_and_pay_request(
@@ -3076,6 +3084,11 @@ async fn prepare_approve_and_pay_request(
     let now = Utc::now().timestamp();
     let mut tx = state.pool.begin().await?;
     let row = lock_rebate_request_for_review(&mut tx, request_id).await?;
+    if row.try_get::<String, _>("request_kind")? == "sales" {
+        return Err(AppError::Conflict(
+            "销售申请必须人工确认发放，不能转入站内余额".into(),
+        ));
+    }
     let status: String = row.try_get("status")?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
@@ -3307,12 +3320,14 @@ async fn fetch_user_map(
 fn rebate_request_detail_from_row(
     row: &PgRow,
     user_map: &std::collections::HashMap<i64, String>,
+    credit_currency: &'static str,
 ) -> Result<RebateRequestDetail> {
     let user_id: i64 = row.try_get("user_id")?;
     let status: String = row.try_get("status")?;
     let admin_note: Option<String> = row.try_get("admin_note")?;
 
     Ok(RebateRequestDetail {
+        credit_currency,
         id: row.try_get("id")?,
         user_id,
         user_name: user_map.get(&user_id).cloned().unwrap_or_default(),
@@ -3325,6 +3340,9 @@ fn rebate_request_detail_from_row(
         completed_at: optional_timestamp_to_iso(row.try_get("completed_at")?),
         rejected_at: optional_timestamp_to_iso(row.try_get("rejected_at")?),
         review_note: admin_note.clone(),
+        request_kind: row.try_get("request_kind")?,
+        issued_at: optional_timestamp_to_iso(row.try_get("issued_at")?),
+        issue_note: row.try_get("issue_note")?,
         reject_reason: if status == "rejected" {
             admin_note
         } else {
@@ -3406,7 +3424,8 @@ async fn revoke_invitation_signup_reward_record_in_tx(
 
     let request_rows = sqlx::query(
         r#"
-        SELECT id, status, rebate_record_ids
+        SELECT id, status, rebate_record_ids, request_kind,
+               EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) AS externally_issued
         FROM rebate_requests
         WHERE $1 = ANY(rebate_record_ids)
         FOR UPDATE
@@ -3417,6 +3436,7 @@ async fn revoke_invitation_signup_reward_record_in_tx(
     .await?;
 
     for request_row in &request_rows {
+        ensure_rebate_request_not_completed(request_row)?;
         let request_status: String = request_row.try_get("status")?;
         if request_status == "completed" {
             return Err(AppError::BadRequest(
@@ -3475,7 +3495,8 @@ async fn lock_rebate_request_for_review(
 ) -> Result<PgRow> {
     sqlx::query(
         r#"
-        SELECT id, status, rebate_record_ids
+        SELECT id, status, rebate_record_ids, request_kind,
+               EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) AS externally_issued
         FROM rebate_requests
         WHERE id = $1
         FOR UPDATE
@@ -3488,6 +3509,9 @@ async fn lock_rebate_request_for_review(
 }
 
 fn ensure_rebate_request_not_completed(row: &PgRow) -> Result<()> {
+    if row.try_get::<bool, _>("externally_issued")? {
+        return Err(AppError::Conflict("已确认发放的销售申请不能修改".into()));
+    }
     let status: String = row.try_get("status")?;
     if status == "completed" {
         return Err(AppError::BadRequest("已完成的返利申请不能修改".to_string()));

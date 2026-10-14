@@ -49,6 +49,8 @@ impl RebateRecordSourceFilter {
 #[serde(rename_all = "camelCase")]
 pub struct InvitationStats {
     pub invitation_code: String,
+    pub is_sales: bool,
+    pub has_sales_account: bool,
     pub invited_count: i64,
     pub total_rebate: i64,
     pub completed_rebate: i64,
@@ -64,11 +66,14 @@ pub struct InvitationFeatureStatus {
     pub order_rebate_enabled: bool,
     pub invitation_signup_reward_enabled: bool,
     pub rebate_to_balance_enabled: bool,
+    pub settlement_enabled: bool,
+    pub credit_currency: &'static str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebateRecord {
+    pub credit_currency: &'static str,
     pub id: i64,
     pub ulid: Option<String>,
     pub inviter_id: i64,
@@ -79,6 +84,7 @@ pub struct RebateRecord {
     pub rebate_ratio: Option<f64>,
     pub status: String,
     pub display_status: String,
+    pub issued_at: Option<String>,
     pub unlock_required: bool,
     pub unlocked_at: Option<String>,
     pub effective_at: String,
@@ -108,11 +114,16 @@ pub struct RebateRequestResponse {
     pub completed_at: Option<String>,
     pub rejected_at: Option<String>,
     pub reject_reason: Option<String>,
+    pub request_kind: String,
+    pub issued_at: Option<String>,
+    pub issue_note: Option<String>,
+    pub credit_currency: &'static str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableRebates {
+    pub credit_currency: &'static str,
     pub amount: i64,
     pub record_ids: Vec<i64>,
 }
@@ -120,6 +131,8 @@ pub struct AvailableRebates {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebateRequestSubmitResponse {
+    pub request_kind: String,
+    pub credit_currency: &'static str,
     pub id: i64,
     pub request_id: i64,
     pub amount: i64,
@@ -146,7 +159,7 @@ impl PaginationParams {
     }
 
     pub fn offset(&self) -> i64 {
-        (self.page() - 1) * self.page_size()
+        (self.page() - 1).saturating_mul(self.page_size())
     }
 
     fn rebate_status_filter(&self) -> Option<&str> {
@@ -184,6 +197,8 @@ pub async fn invitation_feature_status(
         order_rebate_enabled,
         invitation_signup_reward_enabled,
         rebate_to_balance_enabled,
+        settlement_enabled: state.config.settlement_mode.is_enabled(),
+        credit_currency: crate::credit_currency::current_epoch(&state.pool).await?,
     }))
 }
 
@@ -192,7 +207,7 @@ pub async fn my_code(
     State(state): State<AppState>,
     user: SessionUser,
 ) -> Result<Json<ApiResponse<InvitationStats>>> {
-    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+    let sales_profile = ensure_invitation_access(&state.pool, user.id).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
 
     let user_info = sqlx::query("SELECT aff_code FROM users WHERE id = $1")
@@ -212,10 +227,12 @@ pub async fn my_code(
         r#"
         SELECT
             COALESCE(SUM(rebate_amount), 0)::BIGINT as total,
-            COALESCE(SUM(CASE WHEN status = 'completed' THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
-            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_rebate,
+            COALESCE(SUM(CASE WHEN status = 'completed' OR issued.request_id IS NOT NULL THEN rebate_amount ELSE 0 END), 0)::BIGINT as completed,
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'requested', 'approved') AND issued.request_id IS NULL THEN rebate_amount ELSE 0 END), 0)::BIGINT as pending_rebate,
             COALESCE(SUM(CASE WHEN status = 'initializing' THEN rebate_amount ELSE 0 END), 0)::BIGINT as confirming_rebate
         FROM rebate_records
+        LEFT JOIN rebate_record_request_ownership owner ON owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active'
+        LEFT JOIN sales_disbursements issued ON issued.request_id=owner.request_id
         WHERE inviter_id = $1 AND status <> 'closed'
           AND (
               ($2::BOOLEAN = TRUE AND order_type IN ('topup', 'subscription', 'redemption'))
@@ -233,6 +250,8 @@ pub async fn my_code(
 
     Ok(ok(InvitationStats {
         invitation_code: aff_code.unwrap_or_default(),
+        is_sales: sales_profile.active,
+        has_sales_account: sales_profile.registered,
         invited_count,
         total_rebate: quota_to_cents(stats.try_get("total")?),
         completed_rebate: quota_to_cents(stats.try_get("completed")?),
@@ -247,7 +266,7 @@ pub async fn rebate_records(
     user: SessionUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRecord>>>> {
-    ensure_user_invitation_rebate_enabled(&state.pool).await?;
+    ensure_invitation_access(&state.pool, user.id).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
     unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, Utc::now().timestamp())
         .await?;
@@ -285,8 +304,8 @@ pub async fn available_rebates(
     State(state): State<AppState>,
     user: SessionUser,
 ) -> Result<Json<ApiResponse<AvailableRebates>>> {
-    ensure_user_invitation_rebate_enabled(&state.pool).await?;
-    ensure_rebate_to_balance_enabled(&state.pool).await?;
+    let sales_profile = ensure_invitation_access(&state.pool, user.id).await?;
+    ensure_claim_access(&state.pool, &sales_profile).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
     let now = Utc::now().timestamp();
 
@@ -294,6 +313,7 @@ pub async fn available_rebates(
         return Ok(ok(AvailableRebates {
             amount: 0,
             record_ids: Vec::new(),
+            credit_currency: crate::credit_currency::current_epoch(&state.pool).await?,
         }));
     }
 
@@ -331,14 +351,20 @@ pub async fn available_rebates(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut amount = 0;
+    let mut amount: i64 = 0;
     let mut record_ids = Vec::with_capacity(rows.len());
     for row in rows {
         record_ids.push(row.try_get("id")?);
-        amount += quota_to_cents(row.try_get("rebate_amount")?);
+        amount = amount
+            .checked_add(row.try_get::<i64, _>("rebate_amount")?)
+            .ok_or_else(|| AppError::Internal("返利汇总金额超出范围".into()))?;
     }
 
-    Ok(ok(AvailableRebates { amount, record_ids }))
+    Ok(ok(AvailableRebates {
+        amount: quota_to_cents(amount),
+        record_ids,
+        credit_currency: crate::credit_currency::current_epoch(&state.pool).await?,
+    }))
 }
 
 // POST /api/invitations/rebate-requests
@@ -347,8 +373,8 @@ pub async fn request_rebate(
     user: SessionUser,
     Json(req): Json<RebateRequest>,
 ) -> Result<Json<ApiResponse<RebateRequestSubmitResponse>>> {
-    ensure_user_invitation_rebate_enabled(&state.pool).await?;
-    ensure_rebate_to_balance_enabled(&state.pool).await?;
+    let sales_profile = ensure_invitation_access(&state.pool, user.id).await?;
+    ensure_claim_access(&state.pool, &sales_profile).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
     let now = Utc::now().timestamp();
     unlock_paid_invitation_signup_rewards(&state.pool, &state.newapi_pool, now).await?;
@@ -365,6 +391,16 @@ pub async fn request_rebate(
     );
 
     let mut tx = state.pool.begin().await?;
+    let sales_active: Option<bool> =
+        sqlx::query_scalar("SELECT active FROM sales_accounts WHERE user_id=$1 FOR UPDATE")
+            .bind(user.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if sales_active == Some(false) {
+        return Err(AppError::Forbidden);
+    }
+    let is_sales = sales_active == Some(true);
+    let request_kind = if is_sales { "sales" } else { "ordinary" };
     let min_amount = get_config_value_tx(&mut tx, "min_rebate_request_amount").await?;
     let frequency_days = get_config_value_tx(&mut tx, "rebate_request_frequency_days").await?;
 
@@ -418,12 +454,11 @@ pub async fn request_rebate(
         }
     }
 
-    let total_amount: i64 = rows
-        .iter()
-        .map(|row| row.try_get::<i64, _>("rebate_amount"))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .iter()
-        .sum();
+    let total_amount = rows.iter().try_fold(0_i64, |total, row| -> Result<i64> {
+        total
+            .checked_add(row.try_get::<i64, _>("rebate_amount")?)
+            .ok_or_else(|| AppError::Internal("返利汇总金额超出范围".into()))
+    })?;
 
     if should_enforce_rebate_request_frequency(frequency_days, all_invitation_signup_rewards) {
         let last_request_time: Option<i64> = sqlx::query_scalar(
@@ -472,7 +507,8 @@ pub async fn request_rebate(
 
     let invitation_signup_reward_review_required =
         get_config_bool_value_tx(&mut tx, INVITATION_SIGNUP_REWARD_REVIEW_REQUIRED_KEY).await?;
-    let auto_approved = all_invitation_signup_rewards && !invitation_signup_reward_review_required;
+    let auto_approved =
+        !is_sales && all_invitation_signup_rewards && !invitation_signup_reward_review_required;
     let request_status = if auto_approved { "approved" } else { "pending" };
     let record_status = if auto_approved {
         "approved"
@@ -483,8 +519,8 @@ pub async fn request_rebate(
 
     let request_id: i64 = sqlx::query_scalar(
         r#"
-        INSERT INTO rebate_requests (user_id, rebate_record_ids, total_amount, status, created_at, updated_at, approved_at)
-        VALUES ($1, $2, $3, $4, $5, $5, $6)
+        INSERT INTO rebate_requests (user_id, rebate_record_ids, total_amount, status, created_at, updated_at, approved_at, request_kind)
+        VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
         RETURNING id
         "#,
     )
@@ -494,6 +530,7 @@ pub async fn request_rebate(
     .bind(request_status)
     .bind(now)
     .bind(approved_at)
+    .bind(request_kind)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -532,6 +569,8 @@ pub async fn request_rebate(
 
     Ok(message(
         RebateRequestSubmitResponse {
+            request_kind: request_kind.into(),
+            credit_currency: crate::credit_currency::current_epoch(&state.pool).await?,
             id: request_id,
             request_id,
             amount: quota_to_cents(total_amount),
@@ -547,8 +586,10 @@ pub async fn my_rebate_requests(
     user: SessionUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<RebateRequestResponse>>>> {
-    ensure_user_invitation_rebate_enabled(&state.pool).await?;
-    ensure_rebate_to_balance_enabled(&state.pool).await?;
+    let sales_profile = ensure_invitation_access(&state.pool, user.id).await?;
+    if !sales_profile.registered {
+        ensure_rebate_to_balance_enabled(&state.pool).await?;
+    }
 
     let status = params.rebate_request_status_filter();
     let total = count_user_rebate_requests(&state.pool, user.id, status).await?;
@@ -561,9 +602,10 @@ pub async fn my_rebate_requests(
     )
     .await?;
 
+    let credit_currency = crate::credit_currency::current_epoch(&state.pool).await?;
     let requests = rows
         .iter()
-        .map(rebate_request_response_from_row)
+        .map(|row| rebate_request_response_from_row(row, credit_currency))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ok(PaginatedResponse {
@@ -581,7 +623,7 @@ async fn count_user_rebate_requests(
 ) -> Result<i64> {
     let total = if let Some(status) = status {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM rebate_requests WHERE user_id = $1 AND status = $2",
+            "SELECT COUNT(*) FROM rebate_requests WHERE user_id = $1 AND (CASE WHEN EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) THEN 'completed' ELSE status END) = $2",
         )
         .bind(user_id)
         .bind(status)
@@ -608,9 +650,11 @@ async fn fetch_user_rebate_requests(
         sqlx::query(
             r#"
             SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
-                   approved_at, completed_at, rejected_at, admin_note
+                   approved_at, completed_at, rejected_at, admin_note, request_kind,
+                   (SELECT confirmed_at FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issued_at,
+                   (SELECT note FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issue_note
             FROM rebate_requests
-            WHERE user_id = $1 AND status = $2
+            WHERE user_id = $1 AND (CASE WHEN EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) THEN 'completed' ELSE status END) = $2
             ORDER BY created_at DESC
             LIMIT $3 OFFSET $4
             "#,
@@ -625,7 +669,9 @@ async fn fetch_user_rebate_requests(
         sqlx::query(
             r#"
             SELECT id, user_id, rebate_record_ids, total_amount, status, created_at, updated_at,
-                   approved_at, completed_at, rejected_at, admin_note
+                   approved_at, completed_at, rejected_at, admin_note, request_kind,
+                   (SELECT confirmed_at FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issued_at,
+                   (SELECT note FROM sales_disbursements WHERE request_id=rebate_requests.id) AS issue_note
             FROM rebate_requests
             WHERE user_id = $1
             ORDER BY created_at DESC
@@ -663,10 +709,16 @@ pub async fn fetch_rebate_records(
         r#"
         SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
                order_time, rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
-               unlock_required, unlocked_at, created_at, updated_at, status
+               unlock_required, unlocked_at, created_at, updated_at, status,
+               (SELECT issued.confirmed_at FROM sales_disbursements issued
+                JOIN rebate_record_request_ownership owner ON owner.request_id=issued.request_id
+                WHERE owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active') AS issued_at
         FROM rebate_records
         WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
-          AND ($2::TEXT IS NULL OR status = $2)
+          AND ($2::TEXT IS NULL OR (CASE WHEN EXISTS(
+              SELECT 1 FROM sales_disbursements issued JOIN rebate_record_request_ownership owner ON owner.request_id=issued.request_id
+              WHERE owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active'
+          ) THEN 'completed' ELSE status END) = $2)
           AND status <> 'closed'
           AND ($3::BOOLEAN = FALSE OR status <> 'initializing')
           AND (
@@ -692,8 +744,9 @@ pub async fn fetch_rebate_records(
     .await?;
 
     let now = Utc::now().timestamp();
+    let credit_currency = crate::credit_currency::current_epoch(pool).await?;
     rows.iter()
-        .map(|row| rebate_record_from_row(row, now))
+        .map(|row| rebate_record_from_row(row, now, credit_currency))
         .collect()
 }
 
@@ -717,7 +770,10 @@ pub async fn count_rebate_records(
         SELECT COUNT(*)
         FROM rebate_records
         WHERE ($1::BIGINT IS NULL OR inviter_id = $1)
-          AND ($2::TEXT IS NULL OR status = $2)
+          AND ($2::TEXT IS NULL OR (CASE WHEN EXISTS(
+              SELECT 1 FROM sales_disbursements issued JOIN rebate_record_request_ownership owner ON owner.request_id=issued.request_id
+              WHERE owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active'
+          ) THEN 'completed' ELSE status END) = $2)
           AND status <> 'closed'
           AND ($3::BOOLEAN = FALSE OR status <> 'initializing')
           AND (
@@ -751,7 +807,10 @@ pub async fn fetch_user_related_rebate_records(
         r#"
         SELECT id, ulid, inviter_id, order_type, order_amount::TEXT as order_amount,
                order_time, rebate_amount, rebate_rate::TEXT as rebate_rate, rebate_effective_at,
-               unlock_required, unlocked_at, created_at, updated_at, status
+               unlock_required, unlocked_at, created_at, updated_at, status,
+               (SELECT issued.confirmed_at FROM sales_disbursements issued
+                JOIN rebate_record_request_ownership owner ON owner.request_id=issued.request_id
+                WHERE owner.rebate_record_id=rebate_records.id AND owner.ownership_state='active') AS issued_at
         FROM rebate_records
         WHERE inviter_id = $1 OR invitee_id = $1
         ORDER BY created_at DESC
@@ -765,8 +824,9 @@ pub async fn fetch_user_related_rebate_records(
     .await?;
 
     let now = Utc::now().timestamp();
+    let credit_currency = crate::credit_currency::current_epoch(pool).await?;
     rows.iter()
-        .map(|row| rebate_record_from_row(row, now))
+        .map(|row| rebate_record_from_row(row, now, credit_currency))
         .collect()
 }
 
@@ -785,14 +845,26 @@ pub async fn count_user_related_rebate_records(pool: &PgPool, user_id: i64) -> R
 }
 
 pub fn quota_to_cents(amount: i64) -> i64 {
-    (amount * CENTS_PER_YUAN + QUOTA_UNITS_PER_YUAN / 2) / QUOTA_UNITS_PER_YUAN
+    // Dividing by 5,000 after multiplication keeps every i64 input within i64.
+    ((i128::from(amount) * i128::from(CENTS_PER_YUAN) + i128::from(QUOTA_UNITS_PER_YUAN / 2))
+        / i128::from(QUOTA_UNITS_PER_YUAN)) as i64
 }
 
-pub fn cents_to_quota(amount: i64) -> i64 {
-    (amount * QUOTA_UNITS_PER_YUAN + CENTS_PER_YUAN / 2) / CENTS_PER_YUAN
+pub fn cents_to_quota(amount: i64) -> Result<i64> {
+    if amount < 0 {
+        return Err(AppError::BadRequest("金额不能为负数".into()));
+    }
+    let quota = (i128::from(amount) * i128::from(QUOTA_UNITS_PER_YUAN)
+        + i128::from(CENTS_PER_YUAN / 2))
+        / i128::from(CENTS_PER_YUAN);
+    i64::try_from(quota).map_err(|_| AppError::BadRequest("金额超出支持范围".into()))
 }
 
-fn rebate_record_from_row(row: &PgRow, now: i64) -> Result<RebateRecord> {
+fn rebate_record_from_row(
+    row: &PgRow,
+    now: i64,
+    credit_currency: &'static str,
+) -> Result<RebateRecord> {
     let rebate_rate: Option<String> = row.try_get("rebate_rate")?;
     let rebate_effective_at: i64 = row.try_get("rebate_effective_at")?;
     let status: String = row.try_get("status")?;
@@ -802,16 +874,22 @@ fn rebate_record_from_row(row: &PgRow, now: i64) -> Result<RebateRecord> {
     let rule_missing =
         rebate_rate.is_none() && !is_invitation_signup_reward_order_type(&order_type);
     let waiting_unlock = unlock_required && unlocked_at.is_none();
-    let display_status = derive_rebate_display_status(
-        &status,
-        now,
-        rebate_effective_at,
-        rule_missing,
-        waiting_unlock,
-    )
+    let issued_at: Option<i64> = row.try_get("issued_at")?;
+    let display_status = if issued_at.is_some() {
+        "paid"
+    } else {
+        derive_rebate_display_status(
+            &status,
+            now,
+            rebate_effective_at,
+            rule_missing,
+            waiting_unlock,
+        )
+    }
     .to_string();
 
     Ok(RebateRecord {
+        credit_currency,
         id: row.try_get("id")?,
         ulid: row.try_get("ulid")?,
         inviter_id: row.try_get("inviter_id")?,
@@ -822,6 +900,7 @@ fn rebate_record_from_row(row: &PgRow, now: i64) -> Result<RebateRecord> {
         rebate_ratio: rebate_rate.map(text_to_f64),
         status,
         display_status,
+        issued_at: optional_timestamp_to_iso(issued_at),
         unlock_required,
         unlocked_at: optional_timestamp_to_iso(unlocked_at),
         effective_at: timestamp_to_iso(rebate_effective_at),
@@ -855,10 +934,14 @@ fn derive_rebate_display_status(
     }
 }
 
-fn rebate_request_response_from_row(row: &PgRow) -> Result<RebateRequestResponse> {
+fn rebate_request_response_from_row(
+    row: &PgRow,
+    credit_currency: &'static str,
+) -> Result<RebateRequestResponse> {
     let status: String = row.try_get("status")?;
     let admin_note: Option<String> = row.try_get("admin_note")?;
     Ok(RebateRequestResponse {
+        credit_currency,
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
         amount: quota_to_cents(row.try_get("total_amount")?),
@@ -869,6 +952,9 @@ fn rebate_request_response_from_row(row: &PgRow) -> Result<RebateRequestResponse
         approved_at: optional_timestamp_to_iso(row.try_get("approved_at")?),
         completed_at: optional_timestamp_to_iso(row.try_get("completed_at")?),
         rejected_at: optional_timestamp_to_iso(row.try_get("rejected_at")?),
+        request_kind: row.try_get("request_kind")?,
+        issued_at: optional_timestamp_to_iso(row.try_get("issued_at")?),
+        issue_note: row.try_get("issue_note")?,
         reject_reason: if status == "rejected" {
             admin_note
         } else {
@@ -911,6 +997,27 @@ async fn get_config_value_tx(
     value
         .parse::<i64>()
         .map_err(|_| AppError::Internal("配置值格式错误".to_string()))
+}
+
+async fn ensure_invitation_access(
+    pool: &PgPool,
+    user_id: i64,
+) -> Result<crate::sales::SalesProfile> {
+    let profile = crate::sales::profile(pool, user_id).await?;
+    if !profile.registered {
+        ensure_user_invitation_rebate_enabled(pool).await?;
+    }
+    Ok(profile)
+}
+
+async fn ensure_claim_access(pool: &PgPool, profile: &crate::sales::SalesProfile) -> Result<()> {
+    if profile.registered {
+        if !profile.active {
+            return Err(AppError::Forbidden);
+        }
+        return Ok(());
+    }
+    ensure_rebate_to_balance_enabled(pool).await
 }
 
 async fn ensure_user_invitation_rebate_enabled(pool: &PgPool) -> Result<()> {
@@ -979,8 +1086,11 @@ mod tests {
     fn converts_quota_units_to_cents() {
         assert_eq!(quota_to_cents(500_000), 100);
         assert_eq!(quota_to_cents(2_500_000), 500);
-        assert_eq!(cents_to_quota(100), 500_000);
-        assert_eq!(cents_to_quota(500), 2_500_000);
+        assert_eq!(cents_to_quota(100).unwrap(), 500_000);
+        assert_eq!(cents_to_quota(500).unwrap(), 2_500_000);
+        assert_eq!(quota_to_cents(i64::MAX), 1_844_674_407_370_955);
+        assert!(cents_to_quota(-1).is_err());
+        assert!(cents_to_quota(i64::MAX).is_err());
     }
 
     #[test]
@@ -1074,6 +1184,8 @@ mod tests {
     fn serializes_confirming_rebate_in_invitation_stats() {
         let stats = InvitationStats {
             invitation_code: "invite".to_string(),
+            is_sales: false,
+            has_sales_account: false,
             invited_count: 2,
             total_rebate: 1_500,
             completed_rebate: 500,

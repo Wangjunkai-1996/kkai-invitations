@@ -11,8 +11,8 @@ use subtle::ConstantTimeEq;
 
 use crate::error::{AppError, Result};
 use crate::rebate_lifecycle::{
-    matches_supported_rebate_schedule, ALL_USER_GROUP, INITIALIZATION_SECONDS,
-    REBATE_EFFECTIVE_DELAY_SECONDS,
+    matches_supported_rebate_schedule, order_rebate_effective_at, ALL_USER_GROUP,
+    INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
 use crate::AppState;
@@ -692,6 +692,18 @@ async fn ingest_existing_record(
         credited_quota,
     )?;
     let rate_text = rule.rule_id.map(|_| rule.rate.to_string());
+    let (initialization_ends_at, rebate_effective_at) = if matches_supported_rebate_schedule(
+        event.completed_at,
+        record.initialization_ends_at,
+        record.rebate_effective_at,
+    ) {
+        (record.initialization_ends_at, record.rebate_effective_at)
+    } else {
+        (
+            event.completed_at + INITIALIZATION_SECONDS,
+            order_rebate_effective_at(&mut **transaction, event.completed_at).await?,
+        )
+    };
     let updated = sqlx::query(
         r#"
         UPDATE rebate_records
@@ -718,8 +730,8 @@ async fn ingest_existing_record(
     .bind(credited_quota)
     .bind(&event.inviter_group)
     .bind(event.completed_at)
-    .bind(event.completed_at + INITIALIZATION_SECONDS)
-    .bind(event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
+    .bind(initialization_ends_at)
+    .bind(rebate_effective_at)
     .bind(rate_text)
     .bind(rebate_quota)
     .bind(chrono::Utc::now().timestamp())
@@ -953,6 +965,8 @@ async fn insert_rebate_record(
     rebate_quota: i64,
     credited_quota: i64,
 ) -> std::result::Result<i64, IngestError> {
+    let rebate_effective_at =
+        order_rebate_effective_at(&mut **transaction, event.completed_at).await?;
     let now = chrono::Utc::now().timestamp();
     let rate_text = rule.rule_id.map(|_| rule.rate.to_string());
     let record_id = sqlx::query_scalar(
@@ -979,7 +993,7 @@ async fn insert_rebate_record(
     .bind(rebate_record_order_id(event))
     .bind(event.rebate_base_amount_cents)
     .bind(event.completed_at)
-    .bind(event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS)
+    .bind(rebate_effective_at)
     .bind(rebate_quota)
     .bind(rate_text)
     .bind(event.completed_at + INITIALIZATION_SECONDS)
@@ -1298,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_online_ingest_accepts_the_previous_complete_schedule() {
+    fn strict_online_ingest_accepts_frozen_current_and_historical_schedules() {
         let event = validate_event(event()).unwrap();
         let rule = RebateRuleSnapshot {
             rule_id: Some(1),
@@ -1311,23 +1325,15 @@ mod tests {
         record.rebate_amount = 1_875_000;
         record.rebate_rate = Some("0.05".to_string());
         record.order_time = event.completed_at;
-        record.initialization_ends_at = event.completed_at + 2 * 24 * 60 * 60;
-        record.rebate_effective_at = event.completed_at + 7 * 24 * 60 * 60;
-
-        assert!(validate_existing_record_for_policy(
-            &event,
-            1001,
-            &record,
-            ExistingRecordPolicy::StrictOnline,
-            &rule,
-            1_875_000,
-            37_500_000,
-        )
-        .is_ok());
-
-        record.rebate_effective_at = event.completed_at + REBATE_EFFECTIVE_DELAY_SECONDS;
-        assert!(matches!(
-            validate_existing_record_for_policy(
+        for (confirmation_delay, effective_delay, accepted) in [
+            (172_800, 604_800, true),
+            (300, 86_400, true),
+            (300, 604_800, true),
+            (172_800, 86_400, false),
+        ] {
+            record.initialization_ends_at = event.completed_at + confirmation_delay;
+            record.rebate_effective_at = event.completed_at + effective_delay;
+            let result = validate_existing_record_for_policy(
                 &event,
                 1001,
                 &record,
@@ -1335,9 +1341,9 @@ mod tests {
                 &rule,
                 1_875_000,
                 37_500_000,
-            ),
-            Err(IngestError::Conflict(_))
-        ));
+            );
+            assert_eq!(result.is_ok(), accepted);
+        }
     }
 
     #[test]

@@ -5,12 +5,51 @@ use sqlx::{PgPool, Row};
 use crate::error::{AppError, Result};
 
 pub const INITIALIZATION_SECONDS: i64 = 5 * 60;
-pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 24 * 60 * 60;
+pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const ALL_USER_GROUP: &str = "__all__";
 
+const PREVIOUS_REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 24 * 60 * 60;
 const LEGACY_INITIALIZATION_SECONDS: i64 = 2 * 24 * 60 * 60;
 const LEGACY_REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
 const QUOTA_UNITS_PER_YUAN: i64 = 500_000;
+
+pub(crate) async fn order_rebate_effective_at<'e, E>(
+    executor: E,
+    order_time: i64,
+) -> std::result::Result<i64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let cutover: String = sqlx::query_scalar(
+        "SELECT value FROM system_config WHERE key = 'order_rebate_seven_day_cutover_at'",
+    )
+    .fetch_one(executor)
+    .await?;
+    let cutover = cutover
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| sqlx::Error::Protocol("返利七天冷却切换时间无效".into()))?;
+    rebate_effective_at_for_cutover(order_time, cutover)
+}
+
+pub(crate) fn rebate_effective_at_for_cutover(
+    order_time: i64,
+    cutover: i64,
+) -> std::result::Result<i64, sqlx::Error> {
+    if order_time <= 0 || cutover <= 0 {
+        return Err(sqlx::Error::Protocol("返利订单或冷却切换时间无效".into()));
+    }
+    // The migration boundary, not delivery time, determines delayed orders' policy.
+    let delay = if order_time < cutover {
+        PREVIOUS_REBATE_EFFECTIVE_DELAY_SECONDS
+    } else {
+        REBATE_EFFECTIVE_DELAY_SECONDS
+    };
+    order_time
+        .checked_add(delay)
+        .ok_or_else(|| sqlx::Error::Protocol("返利生效时间超出范围".into()))
+}
 
 pub(crate) fn matches_supported_rebate_schedule(
     order_time: i64,
@@ -23,6 +62,12 @@ pub(crate) fn matches_supported_rebate_schedule(
         rebate_effective_at,
         INITIALIZATION_SECONDS,
         REBATE_EFFECTIVE_DELAY_SECONDS,
+    ) || matches_rebate_schedule(
+        order_time,
+        initialization_ends_at,
+        rebate_effective_at,
+        INITIALIZATION_SECONDS,
+        PREVIOUS_REBATE_EFFECTIVE_DELAY_SECONDS,
     ) || matches_rebate_schedule(
         order_time,
         initialization_ends_at,
@@ -350,9 +395,68 @@ mod tests {
     }
 
     #[test]
-    fn uses_short_confirmation_and_one_day_effective_windows() {
-        assert_eq!(INITIALIZATION_SECONDS, 5 * 60);
-        assert_eq!(REBATE_EFFECTIVE_DELAY_SECONDS, 24 * 60 * 60);
+    fn assigns_cooldown_from_payment_time_across_the_persisted_cutover() {
+        let cutover = 1_800_000_000;
+        for (order_time, expected_effective_at) in [
+            (cutover - 1, cutover - 1 + 86_400),
+            (cutover, cutover + 604_800),
+            (cutover + 1, cutover + 1 + 604_800),
+        ] {
+            assert_eq!(
+                rebate_effective_at_for_cutover(order_time, cutover).unwrap(),
+                expected_effective_at
+            );
+        }
+        assert!(rebate_effective_at_for_cutover(0, cutover).is_err());
+        assert!(rebate_effective_at_for_cutover(cutover, 0).is_err());
+        assert!(rebate_effective_at_for_cutover(i64::MAX, cutover).is_err());
+    }
+
+    #[tokio::test]
+    async fn cooldown_uses_the_stored_boundary_and_rejects_missing_or_invalid_configuration() {
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped cooldown database check: TEST_DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL) ON COMMIT DROP")
+            .execute(&mut *transaction).await.unwrap();
+        assert!(matches!(
+            order_rebate_effective_at(&mut *transaction, 1_800_000_000).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+        sqlx::query(
+            "INSERT INTO system_config VALUES ('order_rebate_seven_day_cutover_at', '1800000000')",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(
+            order_rebate_effective_at(&mut *transaction, 1_799_999_999)
+                .await
+                .unwrap(),
+            1_800_086_399
+        );
+        assert_eq!(
+            order_rebate_effective_at(&mut *transaction, 1_800_000_000)
+                .await
+                .unwrap(),
+            1_800_604_800
+        );
+        for invalid in ["0", "-1", "not-a-timestamp"] {
+            sqlx::query("UPDATE system_config SET value = $1")
+                .bind(invalid)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            assert!(matches!(
+                order_rebate_effective_at(&mut *transaction, 1_800_000_000).await,
+                Err(sqlx::Error::Protocol(_))
+            ));
+        }
+        transaction.rollback().await.unwrap();
+        pool.close().await;
     }
 
     #[test]
@@ -360,8 +464,13 @@ mod tests {
         let order_time = 1_000;
         assert!(matches_supported_rebate_schedule(
             order_time,
-            order_time + INITIALIZATION_SECONDS,
-            order_time + REBATE_EFFECTIVE_DELAY_SECONDS,
+            order_time + 300,
+            order_time + 604_800,
+        ));
+        assert!(matches_supported_rebate_schedule(
+            order_time,
+            order_time + 300,
+            order_time + 86_400,
         ));
         assert!(matches_supported_rebate_schedule(
             order_time,
@@ -371,7 +480,13 @@ mod tests {
         assert!(!matches_supported_rebate_schedule(
             order_time,
             order_time + LEGACY_INITIALIZATION_SECONDS,
-            order_time + REBATE_EFFECTIVE_DELAY_SECONDS,
+            order_time + PREVIOUS_REBATE_EFFECTIVE_DELAY_SECONDS,
         ));
+        assert!(!matches_supported_rebate_schedule(
+            order_time,
+            order_time + 300,
+            order_time + 604_799,
+        ));
+        assert!(!matches_supported_rebate_schedule(i64::MAX, 0, 0));
     }
 }

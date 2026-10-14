@@ -85,6 +85,14 @@ struct Receipt {
     newapi_plan_hash: String,
 }
 
+pub async fn current_epoch(pool: &PgPool) -> Result<&'static str, sqlx::Error> {
+    Ok(if boundary(pool).await?.is_some() {
+        USD
+    } else {
+        LEGACY
+    })
+}
+
 pub fn convert(value: i64) -> i64 {
     let n = i128::from(value);
     let rounded = (n.abs() * 3 + 20) / 40;
@@ -377,6 +385,20 @@ async fn write_snapshot(
     Ok(())
 }
 
+async fn ensure_sales_currency_restore_safe(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), Error> {
+    let usd_issued: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sales_disbursements WHERE credit_currency='usd_credit_v1')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if usd_issued {
+        return Err("sales issuance occurred in USD credits; currency restore is unsafe".into());
+    }
+    Ok(())
+}
+
 // The existing maintenance operator owns service shutdown and backup receipt.
 // This command owns one PostgreSQL transaction, exact drift checks and receipts.
 // Plan/verify are read-only. Only the immutable projection trigger is toggled transactionally; NewAPI remains read-only.
@@ -444,7 +466,7 @@ pub async fn run(args: &[String]) -> Result<String, Error> {
         sqlx::query("SELECT pg_advisory_xact_lock(1263358281,20260711)")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("LOCK TABLE rebate_records,rebate_requests,rebate_calculation_snapshots,rebate_request_money_snapshots,rebate_request_items,system_config,balance_operations,balance_operation_outbox,invitation_rebate_payouts IN EXCLUSIVE MODE").execute(&mut *tx).await?;
+        sqlx::query("LOCK TABLE rebate_records,rebate_requests,rebate_calculation_snapshots,rebate_request_money_snapshots,rebate_request_items,system_config,balance_operations,balance_operation_outbox,invitation_rebate_payouts,sales_disbursements IN EXCLUSIVE MODE").execute(&mut *tx).await?;
         let pending: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM balance_operation_outbox WHERE dispatched_at IS NULL",
         )
@@ -453,6 +475,9 @@ pub async fn run(args: &[String]) -> Result<String, Error> {
         if pending != 0 {
             return Err("undrained balance outbox; do not migrate ambiguous credits".into());
         }
+    }
+    if command == "restore" {
+        ensure_sales_currency_restore_safe(&mut tx).await?;
     }
     let current = snapshot(&mut tx).await?;
     let stored: Option<String> = sqlx::query_scalar("SELECT value FROM system_config WHERE key=$1")
@@ -677,10 +702,25 @@ mod tests {
             VALUES(301,101,201,11,12,501,'topup',1000,5000000,'payout','completed','credit-test',401,1700000001,1700000001,1700000001);")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO kkai_invitation_rebate_balance_marks(id,kind,rebate_record_id,payout_id,user_id,quota_delta,amount_cents,request_id,created_at) VALUES(401,'payout',101,301,11,5000000,1000,'credit-test',1700000001)").execute(&external).await.unwrap();
+        sqlx::raw_sql("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,status,scan_started_at,initialization_ends_at,created_at,updated_at) VALUES(901,11,12,'default','invite_inviter',901,0,1,1,7,'approved',1,1,1,1),(902,11,12,'default','invite_inviter',902,0,1,1,7,'approved',1,1,1,1),(903,11,12,'default','invite_inviter',903,0,1,1,5000,'approved',1,1,1,1);
+            INSERT INTO rebate_requests(id,user_id,rebate_record_ids,total_amount,status,request_kind,created_at,updated_at,approved_at) VALUES(901,11,ARRAY[901,902]::BIGINT[],14,'approved','sales',1,1,1),(902,11,ARRAY[903]::BIGINT[],5000,'approved','sales',1,1,1);
+            INSERT INTO sales_disbursements(request_id,user_id,amount_quota,credit_currency,record_amounts,confirmed_by,confirmed_at,note) VALUES(901,11,14,'legacy_075','{\"901\":7,\"902\":7}',99,1,'legacy paid');")
+            .execute(&pool).await.unwrap();
+        let original_issued: serde_json::Value = sqlx::query_scalar("SELECT row_to_json(issued)::JSONB FROM sales_disbursements issued WHERE request_id=901")
+            .fetch_one(&pool).await.unwrap();
         let mut tx = pool.begin().await.unwrap();
         let before = snapshot(&mut tx).await.unwrap();
         let after = convert_snapshot(&before).unwrap();
         assert_eq!(after.items[0].amount_quota_snapshot, 375000);
+        assert_eq!(
+            after.tables["rebate_requests"]
+                .iter()
+                .find(|r| r.id == 901)
+                .unwrap()
+                .values["total_amount"],
+            Some(2),
+            "sum converted item amounts instead of rounding the aggregate"
+        );
         write_snapshot(&mut tx, &after).await.unwrap();
         assert_eq!(snapshot(&mut tx).await.unwrap(), after);
         tx.rollback().await.unwrap();
@@ -744,9 +784,33 @@ mod tests {
         assert!(report.safe_to_migrate, "{report:?}");
         drop(local_connection);
         drop(external_connection);
+        let converted_issued: serde_json::Value = sqlx::query_scalar("SELECT row_to_json(issued)::JSONB FROM sales_disbursements issued WHERE request_id=901")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            converted_issued, original_issued,
+            "sales issuance evidence is never rewritten during conversion"
+        );
+        let mut tx = pool.begin().await.unwrap();
+        ensure_sales_currency_restore_safe(&mut tx).await.unwrap();
+        sqlx::query("INSERT INTO sales_disbursements(request_id,user_id,amount_quota,credit_currency,record_amounts,confirmed_by,confirmed_at,note) VALUES(902,11,375,'usd_credit_v1','{\"903\":375}',99,1700000003,'USD paid')")
+            .execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            snapshot(&mut tx).await.unwrap(),
+            after,
+            "external issuance changes audit facts even without changing money projections"
+        );
+        assert!(ensure_sales_currency_restore_safe(&mut tx)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("currency restore is unsafe"));
+        tx.rollback().await.unwrap();
         let mut tx = pool.begin().await.unwrap();
         write_snapshot(&mut tx, &before).await.unwrap();
         assert_eq!(snapshot(&mut tx).await.unwrap(), before);
+        let restored_issued: serde_json::Value = sqlx::query_scalar("SELECT row_to_json(issued)::JSONB FROM sales_disbursements issued WHERE request_id=901")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(restored_issued, original_issued);
         tx.commit().await.unwrap();
         assert!(sqlx::query(
             "UPDATE rebate_request_items SET amount_quota_snapshot=1 WHERE request_id=201"

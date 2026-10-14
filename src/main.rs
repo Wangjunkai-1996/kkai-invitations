@@ -13,6 +13,8 @@ mod rebate_types;
 mod reconciliation_cli;
 mod response;
 mod routes;
+mod sales;
+mod sales_customers;
 mod session;
 mod sync_scheduler;
 mod system_config;
@@ -161,6 +163,30 @@ async fn main() {
     let b = &base_path;
     let mut app = Router::new()
         // 用户 API
+        .route(
+            &format!("{b}/api/invitations/sales-profile"),
+            get(sales::my_profile),
+        )
+        .route(
+            &format!("{b}/api/invitations/sales-customers"),
+            get(sales_customers::customers),
+        )
+        .route(
+            &format!("{b}/api/invitations/sales-customers/{{userId}}/recharges"),
+            get(sales_customers::recharges),
+        )
+        .route(
+            &format!("{b}/api/admin/sales-accounts"),
+            get(sales::list_accounts),
+        )
+        .route(
+            &format!("{b}/api/admin/sales-accounts/{{userId}}"),
+            put(sales::update_account),
+        )
+        .route(
+            &format!("{b}/api/admin/rebate-requests/{{id}}/confirm-issued"),
+            post(sales::confirm_issued),
+        )
         .route(
             &format!("{b}/api/invitations/status"),
             get(routes::user::invitation_feature_status),

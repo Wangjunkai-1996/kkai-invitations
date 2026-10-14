@@ -28,6 +28,8 @@ enum PayoutError {
     NotFound,
     #[error("rebate record is not approved")]
     NotApproved,
+    #[error("sales requests cannot use balance payouts")]
+    SalesRequest,
     #[error("completed rebate record has no payout ledger")]
     HistoricalComplete,
     #[error("quota conversion failed: {0}")]
@@ -118,6 +120,7 @@ struct RebateRecord {
     order_type: String,
     rebate_quota: i64,
     status: String,
+    sales_request: bool,
     amount_cents: i64,
 }
 
@@ -315,6 +318,9 @@ async fn preview_pay(
 async fn preview_pay_record(state: &AppState, record_id: i64) -> PayoutResult<RebateRecord> {
     let mut tx = state.pool.begin().await?;
     let record = read_rebate_record(&mut tx, record_id, false, state.config.quota_per_unit).await?;
+    if record.sales_request {
+        return Err(PayoutError::SalesRequest);
+    }
     if record.status == "completed" {
         match read_payout_by_record(&mut tx, record_id, false).await {
             Ok(_) => {}
@@ -414,7 +420,7 @@ async fn read_payout_status(state: &AppState, record_id: i64) -> Result<PayoutSt
         quota_delta: None,
         newapi_log_id: None,
         newapi_mark_id: None,
-        can_pay: record.status == "approved",
+        can_pay: record.status == "approved" && !record.sales_request,
         can_reverse: false,
         needs_review: false,
         message: None,
@@ -487,6 +493,10 @@ async fn reserve_payout(
 ) -> PayoutResult<ReservePayoutResult> {
     let mut tx = state.pool.begin().await?;
     let record = read_rebate_record(&mut tx, record_id, true, state.config.quota_per_unit).await?;
+
+    if record.sales_request {
+        return Err(PayoutError::SalesRequest);
+    }
 
     match read_payout_by_record(&mut tx, record_id, false).await {
         Ok(existing) if existing.status == "completed" => {
@@ -628,12 +638,16 @@ async fn read_rebate_record(
         r#"
         SELECT record.id,
                (
-                   SELECT request.id
-                   FROM rebate_requests request
-                   WHERE record.id = ANY(request.rebate_record_ids)
-                   ORDER BY request.id DESC
-                   LIMIT 1
+                   SELECT owner.request_id
+                   FROM rebate_record_request_ownership owner
+                   WHERE owner.rebate_record_id = record.id AND owner.ownership_state = 'active'
                ) AS request_id,
+               EXISTS(
+                   SELECT 1 FROM rebate_record_request_ownership owner
+                   JOIN rebate_requests request ON request.id=owner.request_id
+                   WHERE owner.rebate_record_id=record.id AND owner.ownership_state='active'
+                     AND request.request_kind='sales'
+               ) AS sales_request,
                record.inviter_id,
                record.invitee_id,
                record.order_id,
@@ -662,6 +676,7 @@ async fn read_rebate_record(
         order_type: row.try_get("order_type")?,
         rebate_quota,
         status: row.try_get("status")?,
+        sales_request: row.try_get("sales_request")?,
         amount_cents,
     })
 }
@@ -903,6 +918,11 @@ fn pay_error_response(err: PayoutError) -> (&'static str, i32, AppError) {
             404,
             AppError::NotFound("返利记录不存在".to_string()),
         ),
+        PayoutError::SalesRequest => (
+            "sales_manual_settlement_required",
+            409,
+            AppError::Conflict("销售申请必须人工确认发放，不能转入站内余额".into()),
+        ),
         PayoutError::NotApproved => (
             "not_approved",
             409,
@@ -1005,7 +1025,7 @@ fn pay_result_from_payout(
     }
 }
 
-fn require_settlement_writes_enabled(mode: SettlementMode) -> Result<()> {
+pub(crate) fn require_settlement_writes_enabled(mode: SettlementMode) -> Result<()> {
     if mode.is_enabled() {
         return Ok(());
     }
@@ -1020,7 +1040,9 @@ fn settlement_write_route(method: &Method, path: &str) -> Option<SettlementWrite
     let payout_action = path.contains("/api/admin/rebate-payouts/")
         && (path.ends_with("/pay") || path.ends_with("/reverse"));
     let request_payout = path.contains("/api/admin/rebate-requests/")
-        && (path.ends_with("/approve-and-pay") || path.ends_with("/approve-and-pay-batch"));
+        && (path.ends_with("/approve-and-pay")
+            || path.ends_with("/approve-and-pay-batch")
+            || path.ends_with("/confirm-issued"));
     let legacy_completion = path.contains("/api/admin/rebate-requests/")
         && (path.ends_with("/complete") || path.ends_with("/undo-complete"));
 
@@ -1110,6 +1132,7 @@ mod tests {
         "/api/admin/rebate-payouts/1/pay",
         "/api/admin/rebate-payouts/1/reverse",
         "/api/admin/rebate-requests/1/approve-and-pay",
+        "/api/admin/rebate-requests/1/confirm-issued",
         "/api/admin/rebate-requests/approve-and-pay-batch",
     ];
     const LEGACY_COMPLETION_PATHS: &[&str] = &[
@@ -1188,6 +1211,10 @@ mod tests {
             )
             .route(
                 "/api/admin/rebate-requests/{id}/approve-and-pay",
+                post(counted_handler),
+            )
+            .route(
+                "/api/admin/rebate-requests/{id}/confirm-issued",
                 post(counted_handler),
             )
             .route(
@@ -1337,6 +1364,7 @@ mod tests {
             "/api/admin/rebate-payouts/1/pay",
             "/api/admin/rebate-payouts/1/reverse",
             "/api/admin/rebate-requests/1/approve-and-pay",
+            "/api/admin/rebate-requests/1/confirm-issued",
             "/api/admin/rebate-requests/approve-and-pay-batch",
             "/invitations/api/admin/rebate-requests/1/approve-and-pay",
         ] {
