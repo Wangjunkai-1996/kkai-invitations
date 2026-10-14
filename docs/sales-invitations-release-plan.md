@@ -1,12 +1,12 @@
 # 销售邀请：Invitations 第八次迁移维护发布方案
 
-本文是待审查的实施方案，不是已执行记录。目标是交付销售身份、独立人工审批、客户金额看板和新订单七天冷却，同时保留全部既有账本、支付事件和人工发放证据。本次只升级 Invitations 数据库；不迁移 NewAPI schema、不执行 `credit-migrate`、不改变币制或补发历史款项。
+本文是待执行的维护发布方案，不是生产执行记录。目标是交付销售身份、独立人工审批、客户金额看板和新订单七天冷却，同时保留全部既有账本、支付事件和人工发放证据。本次只升级 Invitations 数据库；不迁移 NewAPI schema、不执行 `credit-migrate`、不改变币制或补发历史款项。
 
 ## 结论与范围
 
 现有 Invitations 发布机制是单实例 Compose/systemd 替换，不是 NewAPI 的蓝绿控制器。该服务的新程序会在监听 HTTP 之前自动安装第八条 SQLx 迁移，因此不能以“普通蓝绿上线”名义直接执行现有 `make invitations`。
 
-推荐路径为：在 Mac 完成精确产物与隔离演练；取得下述维护范围授权；短暂停止 Invitations，取得新鲜专库备份并验证恢复；启动隔离的新服务完成事务迁移；通过限定的只读验收后恢复事件接收，再开放正常业务。NewAPI 的模型请求、登录和充值服务继续运行，Invitations 页面及其接口在窗口内暂不可用。两者共用 PostgreSQL 资源，仍须设置备份负载和查询超时门禁，不能承诺完全没有资源影响。
+推荐路径为：在 Mac 完成精确产物与隔离演练；短暂停止 Invitations，取得新鲜专库备份并验证恢复；运行新镜像的 `migrate-only` 完成事务迁移；通过限定的只读验收后恢复事件接收，再开放正常业务。NewAPI 的模型请求、登录和充值服务继续运行，Invitations 页面及其接口在窗口内暂不可用。两者共用 PostgreSQL 资源，仍须设置备份负载和查询超时门禁，不能承诺完全没有资源影响。
 
 2026-10-14 06:10 UTC，主执行者提供的本次只读现场证据为：NewAPI `HEALTHY`，当时 release 为 `/srv/kkai/newapi-releases/kkai-prod-20261013.1791890951-fb2cc6221`、blue、rollback ready；Invitations healthy、settlement enabled、pending/dead/cases 均为 0。本文作者未再次访问生产。该时间点不证明未来窗口健康、当前迁移清单或备份可用；进入窗口前必须重新取证，不硬编码颜色、版本或容器地址。
 
@@ -27,21 +27,21 @@
 | --- | --- |
 | infra `roles/invitations/tasks/prerequisites.yml` 强制 `invitations_required_migration_count == 7`；defaults、policy test 和 runbook 也固定为 7。新版 `src/db.rs` 要求八个精确版本，新增 `202610140001`。 | 不能仅覆盖 inventory 为 8，更不能删掉校验。发布契约、校验、测试和文档需一起支持本次明确的 7→8 升级。 |
 | `roles/invitations/tasks/deploy.yml` 的 rescue 不检查数据库版本，恢复旧 symlink/unit 后直接重启旧服务。 | 新迁移若已经提交，SQLx 0.8.6 的旧 migrator 不认识 `202610140001`，默认 `ignore_missing=false` 会报 `VersionMissing`。必须依据提交后的真实迁移清单决定恢复路径；禁止无条件启动旧二进制。 |
-| `src/main.rs` 正常启动调用 `db::init_pool` / `prepare_database`，在 HTTP、定时任务启动前执行 migration；`--preflight` 仅只读报告，没有 migrate-only CLI。 | 不应编造 `--migrate-only` 命令或绕开 SQLx 手工执行 migration SQL。最小方案是在网络隔离、后台任务关闭的真实新服务启动中完成原生事务迁移。 |
+| `src/main.rs` 已有独立的 `migrate-only` 命令：要求 `SETTLEMENT_MODE=read_only`，复用 `db::init_pool` 的维护锁、预检、SQLx 迁移和 schema 校验，再核对币制凭据后退出；不启动 HTTP 或后台任务。 | 维护流程应通过精确新镜像执行 `invitations migrate-only`，成功退出后核对实际迁移清单，再启动隔离新服务验收；不能绕开 SQLx 手工执行 migration SQL。 |
 | `SETTLEMENT_MODE=read_only` 只阻止余额结算和销售确认发放；它不是全局写入冻结。 | 仍需隔离用户、管理员、内部 ingest、手动 sync 及所有旧消费者。仅修改 settlement 配置不能作为停写证据。 |
 | `AUTO_SYNC_INTERVAL_SECONDS=0` 不停止 topup reconciliation；当前 `run_topup_reconciliation` 会 finalize 账本。某些 GET 也会解锁奖励。 | 隔离验收同时设置 `TOPUP_RECONCILIATION_INTERVAL_SECONDS=0`；只调用明确无副作用的读取接口，不能把所有 GET 当作只读。 |
 | infra 备份 runbook 的 NewAPI 核心 DR 只保护 `newapi` 数据库。 | 它不是 `invitations` 的恢复点，不能替代本次专库备份与真实恢复演练。 |
 
-## 需要单独明确的维护授权
+## 已确认的维护授权范围
 
-已获提交、推送和正常上线授权，不重复索要同一授权。但上述数据库升级、单实例短暂停服和旧版本失去直接回退能力属于新发现的范围变化。生产维护前应一次性确认以下具体范围：
+用户已确认数据库升级、单实例短暂停服及迁移提交后旧版本不可直接回退的维护范围；以下是执行边界：
 
 1. 安装经过验证的 Invitations 发布保护改动，包括数据库版本门禁、隔离启动、迁移后禁止旧程序自动回退；相关 infra 提交、推送与安装范围单独列明，不把应用仓库推送授权扩展到 infra。
 2. 在约定窗口暂时停止 Invitations 的所有入站和后台消费者；NewAPI 保持服务。停机预算由真实备份/恢复演练耗时、剩余重试预算和退出余量决定，不先承诺固定“几分钟”。
 3. 取得并加密保管本次 `invitations` 专库备份，在隔离 PostgreSQL 恢复校验；执行唯一新增迁移 `202610140001`，随后按验收门禁恢复业务。
 4. 默认恢复策略为事务提交前恢复旧服务、提交后保留第八次 schema 向前修复或切换经过验证的 schema-8 兼容程序。生产数据库 restore、重置 outbox、真实付款或人造充值不在该授权内，发生时需要另行提出具体恢复/财务操作。
 
-窗口执行者通过既定验收后可连续推进，不再以每个阶段为由重复确认。未取得这一维护范围授权前，只准备本地代码、产物、隔离演练和可审查的执行材料。
+窗口执行者通过既定验收后可连续推进，不再以每个阶段为由重复确认。仍须先完成产物、隔离演练和可审查的执行材料，并满足进入窗口的门禁。
 
 ## 阶段 A：本地完成产物与发布保护
 
@@ -60,7 +60,7 @@
    以上是已有接口，参数须替换为本次确认值。冻结 manifest SHA256 后才上传；不得从收到的远端副本反算“预期”哈希。保留 Linux amd64、UID 10009、source/image ID/DiffIDs、SBOM、漏洞及 secret scan 证据。镜像构建中的强制测试仍按正式 build/runbook 执行，不用开发阶段的定向测试替代。
 3. 在隔离数据库实测：旧七迁移库升级到八；已存在历史账本时计数/额度不变；事务失败回滚仍为七；迁移提交后健康失败时保持维护并禁止重启旧 binary；新程序在八迁移库重复启动幂等。若选择兼容恢复镜像，必须用它通过实际八迁移库验收，不能仅修改 `ignore_missing`。
 4. 按 infra `AGENTS.md` 完成行为改动的 `make policy`、Ansible 改动的 `make check` 及正式安装/self-test 门禁。执行前按本次审批规则说明确切命令和预计时长；本文编写阶段不运行这些广域检查。相关 infra 变更必须是干净精确提交，不能把本地源码能力冒充已安装能力。若触及已安装 manual-controller pin，按其正式安装和 app contract 对齐规则处理；不因此迁移 NewAPI schema。
-5. 上线前把最终命令、精确产物与镜像 ID、infra SHA、备份位置、隔离验收入口、恢复程序、窗口上限和阶段退出条件汇成一份执行清单。下面描述的维护分支是待实现能力，当前 `make invitations` 不能直接执行它。
+5. 上线前把最终命令、精确产物与镜像 ID、infra SHA、备份位置、隔离验收入口、恢复程序、窗口上限和阶段退出条件汇成一份执行清单。服务端 `migrate-only` 已实现；基础设施维护分支仍须以其独立实现与演练证据确认，当前普通 `make invitations` 不能直接代替它。
 
 ## 阶段 B：窗口前证据与 outbox 预算
 
@@ -91,7 +91,7 @@ NewAPI outbox 有有限重试，不会永远保持 pending：`service/kkai_outbo
 
 1. 对已经停止写入的生产 Invitations 数据库及 NewAPI 只读连接，运行精确新镜像的已有 `--preflight`。必须保留 JSON、退出码和 release identity；任何 blocking issue 或无法确认的币制一致性都停止。只读 preflight 的 `safe_to_migrate` 不是迁移已执行，也不替代启动时维护锁下的再次预检。
 2. 新服务临时配置为 `SETTLEMENT_MODE=read_only`、`AUTO_SYNC_INTERVAL_SECONDS=0`、`TOPUP_RECONCILIATION_INTERVAL_SECONDS=0`，并使用容器内 `LISTEN_ADDR=127.0.0.1:6212`。保持没有 host port。loopback 阻止前端网络和 data 网络的任意调用者直接访问，数据库连接仍正常；通过受审的容器网络命名空间探针做验收。现有 entrypoint healthcheck 支持按 LISTEN_ADDR 检查。
-3. 在旧服务确定停止后，由受审维护发布路径启动唯一新实例。不要同时启动新旧消费者，也不要直接执行裸 migration SQL。当前 `prepare_database` 会在事务内取得 advisory/表锁、运行 preflight、执行 SQLx migrator、验证 schema，然后提交；只有完成这些步骤才启动 HTTP/后台任务。
+3. 在旧服务确定停止后，由受审维护发布路径运行新镜像的 `migrate-only`。不要同时启动新旧消费者，也不要直接执行裸 migration SQL。`prepare_database` 会在事务内取得 advisory/表锁、运行 preflight、执行 SQLx migrator、验证 schema，然后提交；独立命令随后核对币制凭据并退出，不启动 HTTP/后台任务。核对实际迁移结果后，再启动隔离新服务。
 4. 观察锁等待与 `lock_timeout=15s`、`statement_timeout=5min`。超时即失败，不移除超时或扩大权限绕过。根据数据库实际 `_sqlx_migrations` 确认提交结果；网络断开或 healthcheck 失败不等于事务回滚。
 5. 提交后核对恰好八条成功迁移、无 failed migration、旧七条 checksum 不变、新表/字段/触发器完整、普通历史申请仍为 ordinary、旧金额和到期时间不变，以及非零且稳定的 `order_rebate_seven_day_cutover_at`。不要把设置的时间改成重启时间。
 
@@ -142,4 +142,4 @@ NewAPI outbox 有有限重试，不会永远保持 pending：`service/kkai_outbo
 
 ## 本文验证与限制
 
-只读核对了上述两个仓库的实际接口、SQLx 迁移启动次序、infra 计数与 rescue、服务环境变量、支付事件重试和既有备份范围。本文只新增方案文档；未运行生产命令、构建、迁移、数据库 restore、提交或推送。文档检查使用 `git diff --check -- docs/sales-invitations-release-plan.md`；未运行全量测试。实际停机耗时、专库备份可恢复性及新维护入口必须由后续演练和执行证据证明。
+已核对上述两个仓库的实际接口、SQLx 迁移启动次序、infra 计数与 rescue、服务环境变量、支付事件重试和既有备份范围。服务端 `migrate-only` 已在隔离 PostgreSQL 验证七迁移库升级、重复执行幂等及不启动 HTTP；本文不代表生产命令、构建、迁移或数据库 restore 已执行。实际停机耗时、专库备份可恢复性及基础设施维护入口必须由后续演练和执行证据证明。
