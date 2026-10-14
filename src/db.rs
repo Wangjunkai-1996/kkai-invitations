@@ -19,6 +19,10 @@ const EXPECTED_MIGRATIONS: [i64; 8] = [
     202607170001,
     202610140001,
 ];
+
+pub fn latest_schema_version() -> i64 {
+    EXPECTED_MIGRATIONS[EXPECTED_MIGRATIONS.len() - 1]
+}
 #[derive(Clone, Copy)]
 struct IndexSpec {
     name: &'static str,

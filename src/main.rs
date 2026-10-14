@@ -80,6 +80,55 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    if args.get(1).map(String::as_str) == Some("migrate-only") {
+        if !matches!(
+            config::settlement_mode_from_env(),
+            Ok(config::SettlementMode::ReadOnly)
+        ) {
+            eprintln!("migrate-only requires SETTLEMENT_MODE=read_only");
+            std::process::exit(2);
+        }
+        let database_url = config::invitations_database_url_from_env().unwrap_or_else(|error| {
+            eprintln!("invalid invitations database configuration: {error}");
+            std::process::exit(2);
+        });
+        let newapi_database_url = config::newapi_database_url_from_env().unwrap_or_else(|error| {
+            eprintln!("invalid NewAPI database configuration: {error}");
+            std::process::exit(2);
+        });
+        let newapi_pool = db::init_readonly_pool(&newapi_database_url)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("failed to connect to NewAPI readonly database: {error}");
+                std::process::exit(2);
+            });
+        let pool = match db::init_pool(&database_url, &newapi_pool).await {
+            Ok(pool) => pool,
+            Err(error) => {
+                if let Some(report) = error.preflight_report() {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(report)
+                            .expect("serialize blocked preflight report")
+                    );
+                }
+                eprintln!("invitations migration failed: {error}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = credit_currency::verify_runtime(&pool, &newapi_pool).await {
+            eprintln!("currency cutover receipts must match after migration: {error}");
+            std::process::exit(2);
+        }
+        pool.close().await;
+        newapi_pool.close().await;
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "schemaVersion": db::latest_schema_version()})
+        );
+        return;
+    }
+
     if args.get(1).map(String::as_str) == Some("--preflight") {
         let database_url = match config::invitations_database_url_from_env() {
             Ok(value) => value,
