@@ -35,12 +35,36 @@
 | `GET /api/invitations/sales-profile` | 本人的 active/registered 能力 |
 | `GET /api/invitations/sales-customers?page=1&pageSize=20` | 自己的客户分页与全局统计 |
 | `GET /api/invitations/sales-customers/{userId}/recharges` | 自己客户的充值分页 |
-| `GET /api/admin/sales-accounts` | 销售账号分页 |
+| `GET /api/admin/sales-accounts?page=1&pageSize=20` | 销售账号分页、各销售业绩及全部销售汇总 |
 | `PUT /api/admin/sales-accounts/{userId}` | 登记/启停销售身份 `{active,note}` |
 | `GET /api/admin/rebate-requests?requestKind=sales` | 销售审批；省略类别默认 ordinary |
 | `POST /api/admin/rebate-requests/{id}/confirm-issued` | 全额人工确认 `{note}` |
 
 审批、拒绝和重置复用原接口。申请响应新增 `requestKind`、`issuedAt`、`issueNote` 和币制信息。外部确认仍保留基础 `approved` 状态，由凭据派生已发放；不能将其当作站内余额付款的 `completed`。
+
+### 管理员销售业绩
+
+`GET /api/admin/sales-accounts` 继续要求管理员权限，保留 `items`、`total`、`page`、`pageSize`，新增 `creditCurrency`、`summary`，以及每个 `items[]` 的 `performance`。`summary` 与 `performance` 结构相同：
+
+| 字段 | 含义 |
+| --- | --- |
+| `invitedCount` | 历史邀请注册人数 |
+| `effectiveInvitedCount` | 至少一次合格钱包充值的邀请人数 |
+| `rechargeAmount` | 已核实的累计到账充值额度，整数分值 |
+| `unverifiedRechargeCount` | 缺少可信到账快照的合格订单数 |
+| `rebates.cooling` / `available` | 冷却中 / 可申请返利 |
+| `rebates.pendingApproval` / `approved` | 待审批 / 已批准待发放返利 |
+| `rebates.issued` / `locked` / `closed` | 已确认发放 / 锁定 / 关闭返利 |
+| `rebates.pendingCalculationCount` | 待计算返利记录数，非金额 |
+
+- `summary` 汇总**所有已登记销售账号**，包括停用账号、当前页以外的账号及销售登记前已经归属该销售的历史客户；翻页不改变统计范围。非销售邀请人不纳入汇总。
+- 人数、合格充值、历史快照、币制转换和返利分类复用销售「受邀客户」口径，每位销售的 `performance` 与其客户页 `summary` 一致。销售自己的被邀请奖励和已被替代的返利记录不纳入。
+- 每位销售先按原有口径转换为整数分值，全局汇总再将各销售分值相加，保证与全部销售行合计一致。前端显示金额除以 `100`，使用 `creditCurrency` 指定币制，不能当作人民币支付金额。原始额度和实际结算规则不改变。
+- 无业绩返回完整零值结构；销售的 NewAPI 用户不存在时仍保留登记及历史业绩，`userName` 为空。缺少历史到账快照时返回已核实金额和待核对订单数，不猜测未知金额；币制未对齐返回显式错误。
+- 默认每页 `20`，最小 `1`、最大 `100`；页码小于 `1` 归一为 `1`，offset 溢出返回 `400`。超出末页保留请求页码、正确 `total` 和全局汇总，`items` 为空。按 `updated_at DESC, user_id DESC` 稳定排序。
+- 销售范围和账号页使用同一只读快照；邀请人数与充值按销售 ID 集合批量聚合，返利单次批量聚合，不随销售行数产生逐行查询。跨数据库仍存在同步延迟，不承诺跨库原子快照。
+
+此业绩扩展无需新数据库迁移、索引或依赖。服务与前端需配套更新；未升级的接口缺少统计字段时，前端应提示统计不可用，不能显示为真实零业绩。
 
 ## 迁移与交付
 

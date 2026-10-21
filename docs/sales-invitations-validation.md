@@ -70,3 +70,22 @@ git diff --check
 - 旧订单缺少实际到账快照时明确显示待核对，不把未知金额当作已确认收入。跨服务事件同步仍有延迟。
 - 新订单按迁移边界恢复七天冷却；历史已落账到期时间和注册奖励的原有生效规则不重写。
 - 生产交付须按 [实施说明](sales-invitations.md) 和既有发布手册另行执行，不能只把后端切回不识别新销售 schema 的旧版本。
+
+## 2026-10-22 销售账号业绩扩展
+
+独立工作树 `/Users/tokk/.codex/worktrees/sales-account-performance/kkai-invitations`，分支 `codex/sales-account-performance`，起点 `4ce8749f02b6d25afb694058b098b46271a8bcce`。本次只扩展只读查询和响应，不新增迁移、依赖或财务写入。
+
+使用本次新建的隔离 PostgreSQL 容器 `kkai-sales-performance-test-20261022`（既有本地 `postgres:18.4-bookworm` 镜像，`--pull never`），两个独立连接各使用 TEMP 表；未连接生产数据库。
+
+```sh
+CARGO_TARGET_DIR=/Users/tokk/Documents/Codex/2026-08-05/li/work/invitations-current-src/target \
+TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:56203/postgres \
+cargo test --offline --locked sales_customers::tests -- --include-ignored --nocapture
+
+rustfmt --edition 2021 --check src/sales_customers.rs src/sales.rs
+git diff --check
+```
+
+定向测试 **3 项全部通过**（包含 2 项真实数据库测试），原有客户/充值统计回归通过。新增覆盖 41 名销售的 `20/20/1/0` 分页、全局汇总不随页面变化、停用销售保留统计、零业绩结构、已不存在的销售用户名回退、全局与各销售金额舍入一致、客户页与管理员业绩一致、全部返利分类、空账号列表及页码溢出。定向测试首次使用缓存编译约 11 秒，数据库用例约 0.2 秒。
+
+未运行全量测试、生产构建、迁移或部署；本记录不证明生产版本、认证联调或生产查询性能。现有管理员提取器和权限规则未修改；新接口复用其访问保护。

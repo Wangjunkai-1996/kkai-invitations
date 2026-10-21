@@ -8,8 +8,8 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{AppError, Result};
 use crate::middleware::AdminUser;
-use crate::response::{message, ok, ApiResponse, PaginatedResponse};
-use crate::routes::user::PaginationParams;
+use crate::response::{message, ok, ApiResponse};
+use crate::sales_customers::{account_performance, CustomerSummary, SalesPagination};
 use crate::session::SessionUser;
 use crate::AppState;
 
@@ -48,6 +48,18 @@ pub struct SalesAccount {
     pub note: String,
     pub created_at: String,
     pub updated_at: String,
+    pub performance: CustomerSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesAccounts {
+    pub items: Vec<SalesAccount>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+    pub summary: CustomerSummary,
+    pub credit_currency: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -61,13 +73,21 @@ pub struct UpdateSalesAccount {
 pub async fn list_accounts(
     State(state): State<AppState>,
     _admin: AdminUser,
-    Query(params): Query<PaginationParams>,
-) -> Result<Json<ApiResponse<PaginatedResponse<SalesAccount>>>> {
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sales_accounts")
-        .fetch_one(&state.pool)
+    Query(params): Query<SalesPagination>,
+) -> Result<Json<ApiResponse<SalesAccounts>>> {
+    let (page, page_size, offset) = params.values()?;
+    // Keep the paginated rows and the all-salesperson scope in one snapshot.
+    let mut ledger = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *ledger)
         .await?;
+    let seller_ids: Vec<i64> = sqlx::query_scalar("SELECT user_id FROM sales_accounts")
+        .fetch_all(&mut *ledger)
+        .await?;
+    let total = seller_ids.len() as i64;
     let rows = sqlx::query("SELECT user_id, active, note, created_at, updated_at FROM sales_accounts ORDER BY updated_at DESC, user_id DESC LIMIT $1 OFFSET $2")
-        .bind(params.page_size()).bind(params.offset()).fetch_all(&state.pool).await?;
+        .bind(page_size).bind(offset).fetch_all(&mut *ledger).await?;
+    ledger.commit().await?;
     let ids = rows
         .iter()
         .map(|row| row.try_get::<i64, _>("user_id"))
@@ -76,6 +96,8 @@ pub async fn list_accounts(
         .bind(&ids).fetch_all(&state.newapi_pool).await?.iter()
         .map(|row| Ok((row.try_get("id")?, row.try_get("name")?)))
         .collect::<std::result::Result<_, sqlx::Error>>()?;
+    let (mut performance, summary, credit_currency) =
+        account_performance(&state, &seller_ids).await?;
     let items = rows
         .iter()
         .map(|row| {
@@ -87,14 +109,17 @@ pub async fn list_accounts(
                 note: row.try_get("note")?,
                 created_at: timestamp(row.try_get("created_at")?),
                 updated_at: timestamp(row.try_get("updated_at")?),
+                performance: performance.remove(&user_id).unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(ok(PaginatedResponse {
+    Ok(ok(SalesAccounts {
         items,
         total,
-        page: params.page(),
-        page_size: params.page_size(),
+        page,
+        page_size,
+        summary,
+        credit_currency,
     }))
 }
 
