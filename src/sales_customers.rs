@@ -84,7 +84,8 @@ impl SalesPagination {
 // or the existence of a rebate. Subscription mirrors and wallet-funded orders
 // are not genuine wallet recharges. Deleted accounts remain in historical counts.
 const QUALIFIED_ORDERS: &str = r#"
-    SELECT t.*, u.inviter_id, COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS paid_at
+    SELECT t.id, t.user_id, t.money, t.payment_provider, t.payment_method, u.inviter_id,
+           COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS paid_at
     FROM top_ups t JOIN users u ON u.id = t.user_id
     WHERE u.inviter_id = ANY($1) AND t.status = 'success' AND t.amount > 0 AND t.money > 0
       AND COALESCE(t.payment_provider, '') NOT IN ('balance', 'redemption')
@@ -554,16 +555,18 @@ mod tests {
             .connect(&url)
             .await
             .unwrap();
+        // Native wallet credit deliberately differs from the immutable event snapshot.
         sqlx::raw_sql(r#"
             CREATE TEMP TABLE users(id BIGINT,username TEXT,display_name TEXT,created_at BIGINT,inviter_id BIGINT,quota BIGINT);
             CREATE TEMP TABLE options(key TEXT,value TEXT);
             CREATE TEMP TABLE top_ups(id BIGINT,user_id BIGINT,amount BIGINT,money NUMERIC,trade_no TEXT,status TEXT,
-                complete_time BIGINT,create_time BIGINT,payment_provider TEXT,payment_method TEXT);
+                complete_time BIGINT,create_time BIGINT,payment_provider TEXT,payment_method TEXT,
+                credited_quota BIGINT NOT NULL DEFAULT 9000000);
             CREATE TEMP TABLE subscription_orders(trade_no TEXT);
             CREATE TEMP TABLE kkai_outbox(event_key TEXT,payload TEXT);
             INSERT INTO users VALUES (11,'seller','Seller',1,0,0),(12,'spent','Spent',2,11,0),
                 (13,'gift','Gift',3,11,500000),(14,'someone_else','Someone else',4,99,0),(15,'old','Old',5,11,0);
-            INSERT INTO top_ups VALUES
+            INSERT INTO top_ups(id,user_id,amount,money,trade_no,status,complete_time,create_time,payment_provider,payment_method) VALUES
                 (1,12,1,1,'one','success',1000000001,1000000000,'epay','alipay'),
                 (2,12,2,2,'two','success',1000000002,1000000001,'epay','alipay'),
                 (3,13,1,1,'subscription','success',1000000003,1000000002,'epay','alipay'),
