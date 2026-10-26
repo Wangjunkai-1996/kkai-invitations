@@ -15,6 +15,7 @@ mod response;
 mod routes;
 mod sales;
 mod sales_customers;
+mod sales_reprice;
 mod session;
 mod sync_scheduler;
 mod system_config;
@@ -70,6 +71,16 @@ async fn main() {
                         }
                     })
                 );
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("sales-reprice") {
+        match sales_reprice::run(&args[2..]).await {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("sales reprice failed: {error}");
                 std::process::exit(2);
             }
         }

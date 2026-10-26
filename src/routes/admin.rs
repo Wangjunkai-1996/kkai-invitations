@@ -37,6 +37,7 @@ use crate::routes::user::{
     fetch_user_related_rebate_records, quota_to_cents, PaginationParams, RebateRecord,
     RebateRecordSourceFilter,
 };
+use crate::sales_reprice::load_verified_receipt_in_transaction;
 use crate::system_config::{
     get_config_bool, get_config_i64, get_config_i64_or_fallback,
     INVITATION_SIGNUP_INVITEE_REWARD_AMOUNT_KEY,
@@ -1555,6 +1556,18 @@ pub async fn update_rebate_order_records(
     .await?;
 
     validate_operation_rows(&rows, &record_ids, is_rebate_record_mutable)?;
+
+    let reprice_receipt = load_verified_receipt_in_transaction(&mut tx)
+        .await
+        .map_err(|error| AppError::Conflict(format!("销售返利更正回执无效: {error}")))?;
+    if reprice_receipt
+        .as_ref()
+        .is_some_and(|receipt| record_ids.iter().any(|id| receipt.entry(*id).is_some()))
+    {
+        return Err(AppError::Conflict(
+            "历史销售返利更正记录不能再次调整".into(),
+        ));
+    }
 
     let currency_boundary = crate::credit_currency::boundary(&mut *tx).await?;
 

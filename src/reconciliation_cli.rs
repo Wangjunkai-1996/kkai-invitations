@@ -15,6 +15,10 @@ use crate::rebate_source_events::{
     payload_hash_for_event, IngestError, IngestOutcome, RebateSourceEvent,
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
+use crate::sales_reprice::{
+    load_verified_receipt, load_verified_receipt_in_transaction, Entry as SalesRepriceEntry,
+    SalesRepriceError,
+};
 
 const MANIFEST_VERSION: i32 = 3;
 const SOURCE_NAMESPACE: &str = "newapi";
@@ -526,13 +530,13 @@ async fn verify_order(
     let expected_payload_hash = payload_hash_for_event(manifest_event(order))?;
     let rows = sqlx::query(
         r#"
-        SELECT record.inviter_id, record.invitee_id, record.user_group,
+        SELECT record.id AS record_id, record.order_id, record.inviter_id, record.invitee_id, record.user_group,
                record.order_amount_cents, record.credited_quota, record.order_time,
                record.initialization_ends_at, record.rebate_effective_at,
                record.rebate_amount, record.rebate_rate::TEXT AS record_rate,
                record.admin_adjusted,
                record.source_payload_sha256, record.source_schema_version,
-               snapshot.inviter_group AS snapshot_group,
+               snapshot.rule_id AS snapshot_rule_id, snapshot.inviter_group AS snapshot_group,
                snapshot.rebate_rate::TEXT AS snapshot_rate,
                snapshot.order_amount_minor, snapshot.credited_quota AS snapshot_credited_quota,
                snapshot.rebate_quota,
@@ -551,12 +555,25 @@ async fn verify_order(
             rows.len()
         )));
     }
+    let record_id: i64 = rows[0].try_get("record_id")?;
+    let receipt = load_verified_receipt(pool)
+        .await
+        .map_err(|error| match error {
+            SalesRepriceError::Database(error) => ReconciliationCliError::Database(error),
+            error => ReconciliationCliError::Verification(format!(
+                "sales reprice receipt invalid: {error}"
+            )),
+        })?;
+    let entry = receipt
+        .as_ref()
+        .and_then(|receipt| receipt.entry(record_id));
     verify_applied_order_row(
         &rows[0],
         order,
         quota_per_unit,
         &event_key,
         &expected_payload_hash,
+        entry,
     )
 }
 
@@ -566,6 +583,7 @@ fn verify_applied_order_row(
     quota_per_unit: i64,
     event_key: &str,
     expected_payload_hash: &str,
+    reprice_entry: Option<&SalesRepriceEntry>,
 ) -> Result<(), ReconciliationCliError> {
     let snapshot_rate = row
         .try_get::<String, _>("snapshot_rate")?
@@ -584,6 +602,32 @@ fn verify_applied_order_row(
             })
         })
         .transpose()?;
+    let record_amount: i64 = row.try_get("rebate_amount")?;
+    let record_id: i64 = row.try_get("record_id")?;
+    let record_order_id: i64 = row.try_get("order_id")?;
+    let snapshot_amount: i64 = row.try_get("rebate_quota")?;
+    let snapshot_rule_id: Option<i64> = row.try_get("snapshot_rule_id")?;
+    let admin_adjusted: bool = row.try_get("admin_adjusted")?;
+    let financial_identity_matches = if let Some(entry) = reprice_entry {
+        matches_reconciled_sales_reprice(
+            entry,
+            order,
+            admin_adjusted,
+            record_id,
+            record_order_id,
+            snapshot_rule_id,
+            snapshot_rate,
+            snapshot_amount,
+            record_rate,
+            record_amount,
+            expected_payload_hash,
+        )
+    } else if admin_adjusted {
+        false
+    } else {
+        record_amount == order.expected_rebate_quota
+            && record_rate_matches(record_rate, manifest_rate)
+    };
     let matches = row.try_get::<i64, _>("inviter_id")? == order.inviter_id
         && row.try_get::<i64, _>("invitee_id")? == order.invitee_id
         && row.try_get::<String, _>("user_group")? == order.inviter_group
@@ -595,9 +639,7 @@ fn verify_applied_order_row(
             row.try_get("initialization_ends_at")?,
             row.try_get("rebate_effective_at")?,
         )
-        && row.try_get::<i64, _>("rebate_amount")? == order.expected_rebate_quota
-        && record_rate_matches(record_rate, manifest_rate)
-        && !row.try_get::<bool, _>("admin_adjusted")?
+        && financial_identity_matches
         && row
             .try_get::<Option<String>, _>("source_payload_sha256")?
             .as_deref()
@@ -607,7 +649,7 @@ fn verify_applied_order_row(
         && snapshot_rate == manifest_rate
         && row.try_get::<i64, _>("order_amount_minor")? == order.order_amount_cents.unwrap_or(0)
         && row.try_get::<Option<i64>, _>("snapshot_credited_quota")? == Some(order.credited_quota)
-        && row.try_get::<i64, _>("rebate_quota")? == order.expected_rebate_quota
+        && snapshot_amount == order.expected_rebate_quota
         && row.try_get::<i64, _>("quota_per_unit")? == quota_per_unit;
     if !matches {
         return Err(ReconciliationCliError::Verification(format!(
@@ -615,6 +657,41 @@ fn verify_applied_order_row(
         )));
     }
     Ok(())
+}
+
+fn matches_reconciled_sales_reprice(
+    entry: &SalesRepriceEntry,
+    order: &ManifestOrder,
+    admin_adjusted: bool,
+    record_id: i64,
+    record_order_id: i64,
+    snapshot_rule_id: Option<i64>,
+    snapshot_rate: Decimal,
+    snapshot_amount: i64,
+    record_rate: Option<Decimal>,
+    record_amount: i64,
+    expected_payload_hash: &str,
+) -> bool {
+    let target_rate = entry.target_rate.parse::<Decimal>().ok();
+    admin_adjusted
+        && entry.record_id == record_id
+        && entry.order_id == record_order_id
+        && entry.order_id == order.source_order_id
+        && entry.canonical_event_key == format!("newapi:topup:{}", order.source_order_id)
+        && entry.source_payload_sha256 == expected_payload_hash
+        && entry.inviter_id == order.inviter_id
+        && entry.invitee_id == order.invitee_id
+        && entry.order_time == order.completed_at
+        && entry.credited_quota == order.credited_quota
+        && entry.snapshot_rule_id == snapshot_rule_id
+        && entry.old_rate.parse::<Decimal>().ok() == Some(snapshot_rate)
+        && entry.old_amount == snapshot_amount
+        && target_rate == record_rate
+        && entry.target_amount == record_amount
+        && target_rate.is_some_and(|rate| {
+            calculate_rebate_from_credited_quota(order.credited_quota, rate).ok()
+                == Some(entry.target_amount)
+        })
 }
 
 fn record_rate_matches(record_rate: Option<Decimal>, expected_rate: Decimal) -> bool {
@@ -830,13 +907,13 @@ async fn verify_applied_order_in_transaction(
     let expected_payload_hash = payload_hash_for_event(manifest_event(order))?;
     let rows = sqlx::query(
         r#"
-        SELECT record.inviter_id, record.invitee_id, record.user_group,
+        SELECT record.id AS record_id, record.order_id, record.inviter_id, record.invitee_id, record.user_group,
                record.order_amount_cents, record.credited_quota, record.order_time,
                record.initialization_ends_at, record.rebate_effective_at,
                record.rebate_amount, record.rebate_rate::TEXT AS record_rate,
                record.admin_adjusted,
                record.source_payload_sha256, record.source_schema_version,
-               snapshot.inviter_group AS snapshot_group,
+               snapshot.rule_id AS snapshot_rule_id, snapshot.inviter_group AS snapshot_group,
                snapshot.rebate_rate::TEXT AS snapshot_rate,
                snapshot.order_amount_minor, snapshot.credited_quota AS snapshot_credited_quota,
                snapshot.rebate_quota,
@@ -856,12 +933,25 @@ async fn verify_applied_order_in_transaction(
             rows.len()
         )));
     }
+    let record_id: i64 = rows[0].try_get("record_id")?;
+    let receipt = load_verified_receipt_in_transaction(transaction)
+        .await
+        .map_err(|error| match error {
+            SalesRepriceError::Database(error) => ReconciliationCliError::Database(error),
+            error => ReconciliationCliError::SourceChanged(format!(
+                "sales reprice receipt invalid: {error}"
+            )),
+        })?;
+    let entry = receipt
+        .as_ref()
+        .and_then(|receipt| receipt.entry(record_id));
     verify_applied_order_row(
         &rows[0],
         order,
         quota_per_unit,
         &event_key,
         &expected_payload_hash,
+        entry,
     )
     .map_err(|error| ReconciliationCliError::SourceChanged(error.to_string()))
 }
@@ -1407,6 +1497,70 @@ mod tests {
         };
 
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn reconciliation_accepts_only_the_matching_historical_sales_adjustment() {
+        let order = ManifestOrder {
+            source_order_id: 10_950,
+            invitee_id: 3418,
+            inviter_id: 1001,
+            inviter_group: "default".into(),
+            order_amount_cents: None,
+            credited_quota: 37_500_000,
+            credited_quota_source_field: "credited_quota".into(),
+            credited_quota_source_value: "37500000".into(),
+            completed_at: 1_792_308_724,
+            payment_provider: "stripe".into(),
+            source_row_sha256: "b".repeat(64),
+            existing_record: None,
+            rebate_rate: "0.05".into(),
+            expected_rebate_quota: 1_875_000,
+        };
+        let entry = SalesRepriceEntry {
+            record_id: 5000,
+            order_id: order.source_order_id,
+            canonical_event_key: "newapi:topup:10950".into(),
+            source_payload_sha256: "a".repeat(64),
+            inviter_id: order.inviter_id,
+            invitee_id: order.invitee_id,
+            order_time: order.completed_at,
+            credited_quota: order.credited_quota,
+            old_rate: "0.0500".into(),
+            old_amount: order.expected_rebate_quota,
+            snapshot_rule_id: Some(7),
+            target_rate: "0.1500".into(),
+            target_amount: 5_625_000,
+        };
+        let matches = |entry: &SalesRepriceEntry, adjusted: bool, amount: i64| {
+            matches_reconciled_sales_reprice(
+                entry,
+                &order,
+                adjusted,
+                5000,
+                order.source_order_id,
+                Some(7),
+                "0.05".parse().unwrap(),
+                order.expected_rebate_quota,
+                Some("0.15".parse().unwrap()),
+                amount,
+                &"a".repeat(64),
+            )
+        };
+        assert!(matches(&entry, true, 5_625_000));
+        for mutate in [
+            |entry: &mut SalesRepriceEntry| entry.order_id += 1,
+            |entry: &mut SalesRepriceEntry| entry.inviter_id += 1,
+            |entry: &mut SalesRepriceEntry| entry.order_time += 1,
+            |entry: &mut SalesRepriceEntry| entry.snapshot_rule_id = None,
+            |entry: &mut SalesRepriceEntry| entry.old_rate = "0.15".into(),
+            |entry: &mut SalesRepriceEntry| entry.target_amount += 1,
+        ] {
+            let mut changed = entry.clone();
+            mutate(&mut changed);
+            assert!(!matches(&changed, true, 5_625_000));
+        }
+        assert!(!matches(&entry, false, 1_875_000));
     }
 
     #[test]

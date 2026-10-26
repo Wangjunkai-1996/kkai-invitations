@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
@@ -654,10 +655,25 @@ async fn load_rebate_source_receipt_audits(
     // Validate the receipt before using its retained pre-conversion values to
     // audit exact rounding. New events continue to use their current quota.
     crate::credit_currency::boundary(&state.pool).await?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let repricing = crate::sales_reprice::load_verified_receipt_in_transaction(&mut tx)
+        .await
+        .map_err(|error| AppError::Internal(format!("销售返利更正回执无效: {error}")))?;
     let rows = sqlx::query(
         r#"
         SELECT receipt.event_key, receipt.outcome,
                canonical.id IS NOT NULL AS canonical_exists,
+               linked.id AS record_id,
+               linked.inviter_id, linked.invitee_id, linked.order_id, linked.order_time,
+               linked.credited_quota, linked.source_payload_sha256,
+               linked.rebate_rate::TEXT AS record_rate, linked.rebate_amount AS record_amount,
+               linked.admin_adjusted,
+               snapshot.rule_id AS snapshot_rule_id,
+               snapshot.rebate_rate::TEXT AS snapshot_rate,
+               snapshot.rebate_quota AS snapshot_amount,
                CASE receipt.outcome
                    WHEN 'created' THEN
                        receipt.event_type = 'topup.completed'
@@ -676,7 +692,6 @@ async fn load_rebate_source_receipt_audits(
                        AND snapshot.order_amount_minor = COALESCE(linked.order_amount_cents, 0)
                        AND snapshot.credited_quota = linked.credited_quota
                        AND linked.credited_quota IS NOT NULL
-                       AND snapshot.rebate_quota = linked.rebate_amount
                        AND CASE WHEN legacy.original IS NOT NULL THEN
                            snapshot.rebate_quota = ROUND((legacy.original->'values'->>'rebate_quota')::NUMERIC*3/40)
                            AND snapshot.credited_quota = ROUND((legacy.original->'values'->>'credited_quota')::NUMERIC*3/40)
@@ -690,10 +705,6 @@ async fn load_rebate_source_receipt_audits(
                            WHEN 1 THEN 'rebate-source-event:v1'
                            WHEN 2 THEN 'rebate-source-event:v2'
                        END
-                       AND (
-                           linked.rebate_rate = snapshot.rebate_rate
-                           OR (linked.rebate_rate IS NULL AND snapshot.rebate_rate = 0)
-                       )
                    WHEN 'ignored_no_inviter' THEN
                        receipt.event_type = 'topup.completed'
                        AND receipt.source_schema_version IN (1, 2)
@@ -701,7 +712,7 @@ async fn load_rebate_source_receipt_audits(
                        AND receipt.rebate_record_id IS NULL
                        AND canonical.id IS NULL
                    ELSE FALSE
-               END AS integrity_valid
+               END AS source_integrity_valid
         FROM rebate_source_event_receipts receipt
         LEFT JOIN rebate_records linked ON linked.id = receipt.rebate_record_id
         LEFT JOIN rebate_records canonical
@@ -719,8 +730,9 @@ async fn load_rebate_source_receipt_audits(
     )
     .bind(event_keys)
     .bind(crate::credit_currency::RECEIPT_KEY)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut outcomes = HashMap::with_capacity(rows.len());
     for row in rows {
         let event_key: String = row.try_get("event_key")?;
@@ -733,12 +745,68 @@ async fn load_rebate_source_receipt_audits(
                 )))
             }
         };
+        let source_integrity = row
+            .try_get::<Option<bool>, _>("source_integrity_valid")?
+            .unwrap_or(false);
         outcomes.insert(
-            event_key,
+            event_key.clone(),
             RebateSourceReceiptAudit {
                 outcome,
                 canonical_exists: row.try_get("canonical_exists")?,
-                integrity_valid: row.try_get("integrity_valid")?,
+                integrity_valid: if outcome == RebateSourceReceiptOutcome::Created {
+                    let record_id: Option<i64> = row.try_get("record_id")?;
+                    let record_rate: Option<String> = row.try_get("record_rate")?;
+                    let record_amount: Option<i64> = row.try_get("record_amount")?;
+                    let snapshot_rate: Option<String> = row.try_get("snapshot_rate")?;
+                    let snapshot_amount: Option<i64> = row.try_get("snapshot_amount")?;
+                    let record_rate_value = record_rate
+                        .as_deref()
+                        .and_then(|rate| rate.parse::<Decimal>().ok());
+                    let snapshot_rate_value = snapshot_rate
+                        .as_deref()
+                        .and_then(|rate| rate.parse::<Decimal>().ok());
+                    let original = record_amount == snapshot_amount
+                        && (record_rate_value == snapshot_rate_value
+                            || (record_rate.is_none()
+                                && snapshot_rate_value == Some(Decimal::ZERO)));
+                    let corrected = record_id
+                        .and_then(|id| repricing.as_ref()?.entry(id))
+                        .is_some_and(|entry| {
+                            row.try_get::<bool, _>("admin_adjusted").ok() == Some(true)
+                                && row.try_get::<i64, _>("order_id").ok() == Some(entry.order_id)
+                                && row.try_get::<i64, _>("inviter_id").ok()
+                                    == Some(entry.inviter_id)
+                                && row.try_get::<i64, _>("invitee_id").ok()
+                                    == Some(entry.invitee_id)
+                                && row.try_get::<i64, _>("order_time").ok()
+                                    == Some(entry.order_time)
+                                && row.try_get::<i64, _>("credited_quota").ok()
+                                    == Some(entry.credited_quota)
+                                && row
+                                    .try_get::<String, _>("source_payload_sha256")
+                                    .ok()
+                                    .as_deref()
+                                    == Some(entry.source_payload_sha256.as_str())
+                                && row.try_get::<Option<i64>, _>("snapshot_rule_id").ok()
+                                    == Some(entry.snapshot_rule_id)
+                                && snapshot_rate_value == entry.old_rate.parse::<Decimal>().ok()
+                                && snapshot_amount == Some(entry.old_amount)
+                                && record_rate_value == entry.target_rate.parse::<Decimal>().ok()
+                                && record_amount == Some(entry.target_amount)
+                                && entry.canonical_event_key == event_key
+                        });
+                    source_integrity
+                        && if record_id
+                            .and_then(|id| repricing.as_ref()?.entry(id))
+                            .is_some()
+                        {
+                            corrected
+                        } else {
+                            original
+                        }
+                } else {
+                    source_integrity
+                },
             },
         );
     }

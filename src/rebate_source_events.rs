@@ -15,6 +15,9 @@ use crate::rebate_lifecycle::{
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
+use crate::sales_reprice::{
+    load_verified_receipt_in_transaction, Entry as SalesRepriceEntry, SalesRepriceError,
+};
 use crate::AppState;
 
 const LEGACY_SCHEMA_VERSION: i32 = 1;
@@ -858,7 +861,6 @@ async fn validate_canonical_record_and_snapshot(
             record.initialization_ends_at,
             record.rebate_effective_at,
         )
-        || record.admin_adjusted
     {
         return Err(IngestError::Conflict(
             "已有 canonical 返利记录与源事件不一致".to_string(),
@@ -867,7 +869,7 @@ async fn validate_canonical_record_and_snapshot(
 
     let row = sqlx::query(
         r#"
-        SELECT inviter_group, rule_type, rebate_rate::TEXT AS rebate_rate,
+        SELECT inviter_group, rule_id, rule_type, rebate_rate::TEXT AS rebate_rate,
                quota_per_unit, order_amount_minor, credited_quota, rebate_quota,
                source_revision, snapshotted_at
         FROM rebate_calculation_snapshots
@@ -897,6 +899,7 @@ async fn validate_canonical_record_and_snapshot(
         })
         .transpose()?;
     let snapshot_quota_per_unit: i64 = row.try_get("quota_per_unit")?;
+    let snapshot_rule_id: Option<i64> = row.try_get("rule_id")?;
     let snapshot_credited_quota: Option<i64> = row.try_get("credited_quota")?;
     let expected_credited_quota = if let Some(credited_quota) = event.credited_quota {
         credited_quota
@@ -908,8 +911,35 @@ async fn validate_canonical_record_and_snapshot(
     };
     let calculated_quota =
         calculate_rebate_from_credited_quota(expected_credited_quota, snapshot_rate)?;
-    let record_rate_matches =
-        record_rate == Some(snapshot_rate) || (record_rate.is_none() && snapshot_rate.is_zero());
+    let snapshot_amount: i64 = row.try_get("rebate_quota")?;
+    let receipt = load_verified_receipt_in_transaction(transaction)
+        .await
+        .map_err(|error| match error {
+            SalesRepriceError::Database(error) => IngestError::Database(error),
+            error => IngestError::Conflict(format!("销售返利更正回执无效: {error}")),
+        })?;
+    let financial_identity_matches = if let Some(entry) = receipt
+        .as_ref()
+        .and_then(|receipt| receipt.entry(record.id))
+    {
+        matches_canonical_sales_reprice(
+            entry,
+            record,
+            event,
+            inviter_id,
+            expected_credited_quota,
+            snapshot_rule_id,
+            snapshot_rate,
+            snapshot_amount,
+        )
+    } else if record.admin_adjusted {
+        false
+    } else {
+        snapshot_amount == record.rebate_amount
+            && record.rebate_amount == calculated_quota
+            && (record_rate == Some(snapshot_rate)
+                || (record_rate.is_none() && snapshot_rate.is_zero()))
+    };
     if row.try_get::<String, _>("inviter_group")? == event.inviter_group
         && row.try_get::<String, _>("rule_type")? == TOPUP_ORDER_TYPE
         && snapshot_quota_per_unit > 0
@@ -918,9 +948,8 @@ async fn validate_canonical_record_and_snapshot(
             == event.rebate_base_amount_cents.unwrap_or(0)
         && snapshot_credited_quota == Some(expected_credited_quota)
         && record.credited_quota == Some(expected_credited_quota)
-        && row.try_get::<i64, _>("rebate_quota")? == record.rebate_amount
-        && record.rebate_amount == calculated_quota
-        && record_rate_matches
+        && snapshot_amount == calculated_quota
+        && financial_identity_matches
         && row.try_get::<String, _>("source_revision")? == source_revision(event)
         && row.try_get::<i64, _>("snapshotted_at")? > 0
     {
@@ -929,6 +958,41 @@ async fn validate_canonical_record_and_snapshot(
     Err(IngestError::Conflict(
         "已有 canonical 返利记录与冻结规则快照不一致".to_string(),
     ))
+}
+
+fn matches_canonical_sales_reprice(
+    entry: &SalesRepriceEntry,
+    record: &ExistingRecord,
+    event: &ValidatedEvent,
+    inviter_id: i64,
+    credited_quota: i64,
+    snapshot_rule_id: Option<i64>,
+    snapshot_rate: Decimal,
+    snapshot_amount: i64,
+) -> bool {
+    let target_rate = entry.target_rate.parse::<Decimal>().ok();
+    record.admin_adjusted
+        && entry.record_id == record.id
+        && entry.order_id == record.order_id
+        && entry.canonical_event_key == event.event_key
+        && record.source_payload_sha256.as_deref() == Some(entry.source_payload_sha256.as_str())
+        && entry.inviter_id == inviter_id
+        && entry.invitee_id == event.invitee_id
+        && entry.order_time == event.completed_at
+        && entry.credited_quota == credited_quota
+        && entry.snapshot_rule_id == snapshot_rule_id
+        && entry.old_rate.parse::<Decimal>().ok() == Some(snapshot_rate)
+        && entry.old_amount == snapshot_amount
+        && target_rate
+            == record
+                .rebate_rate
+                .as_deref()
+                .and_then(|rate| rate.parse::<Decimal>().ok())
+        && entry.target_amount == record.rebate_amount
+        && target_rate.is_some_and(|rate| {
+            calculate_rebate_from_credited_quota(credited_quota, rate).ok()
+                == Some(entry.target_amount)
+        })
 }
 
 async fn load_rebate_rule(
@@ -1241,6 +1305,65 @@ mod tests {
             calculate_rebate_from_credited_quota(10, "0.05".parse().unwrap()).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn canonical_replay_accepts_only_the_matching_sales_reprice_receipt_entry() {
+        let mut input = event();
+        input.schema_version = 2;
+        input.rebate_base_amount_cents = None;
+        input.credited_quota = Some(37_500_000);
+        let event = validate_event(input).unwrap();
+        let mut record = pristine_legacy_placeholder();
+        record.canonical_event_key = Some(event.event_key.clone());
+        record.source_payload_sha256 = Some("a".repeat(64));
+        record.rebate_rate = Some("0.1500".into());
+        record.rebate_amount = 5_625_000;
+        record.admin_adjusted = true;
+        let entry = SalesRepriceEntry {
+            record_id: record.id,
+            order_id: record.order_id,
+            canonical_event_key: event.event_key.clone(),
+            source_payload_sha256: "a".repeat(64),
+            inviter_id: record.inviter_id,
+            invitee_id: record.invitee_id,
+            order_time: event.completed_at,
+            credited_quota: 37_500_000,
+            old_rate: "0.0500".into(),
+            old_amount: 1_875_000,
+            snapshot_rule_id: Some(7),
+            target_rate: "0.1500".into(),
+            target_amount: 5_625_000,
+        };
+        let matches = |entry: &SalesRepriceEntry, record: &ExistingRecord| {
+            matches_canonical_sales_reprice(
+                entry,
+                record,
+                &event,
+                record.inviter_id,
+                37_500_000,
+                Some(7),
+                "0.05".parse().unwrap(),
+                1_875_000,
+            )
+        };
+        assert!(matches(&entry, &record));
+        for mutate in [
+            |entry: &mut SalesRepriceEntry| entry.source_payload_sha256 = "b".repeat(64),
+            |entry: &mut SalesRepriceEntry| entry.invitee_id += 1,
+            |entry: &mut SalesRepriceEntry| entry.credited_quota += 1,
+            |entry: &mut SalesRepriceEntry| entry.snapshot_rule_id = Some(8),
+            |entry: &mut SalesRepriceEntry| entry.old_amount += 1,
+            |entry: &mut SalesRepriceEntry| entry.target_amount += 1,
+        ] {
+            let mut changed = entry.clone();
+            mutate(&mut changed);
+            assert!(!matches(&changed, &record));
+        }
+        record.admin_adjusted = false;
+        record.rebate_rate = Some("0.0500".into());
+        record.rebate_amount = 1_875_000;
+        assert!(!matches(&entry, &record));
     }
 
     #[test]
