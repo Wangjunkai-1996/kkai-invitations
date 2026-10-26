@@ -487,10 +487,22 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
             .last_time
             .saturating_sub(TOPUP_RECONCILIATION_LOOKBACK_SECONDS)
     };
-    let orders = sqlx::query(
+    // Legacy NewAPI schemas have only platform orders and no tenant column.
+    let has_tenant_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='top_ups'::regclass AND attname='tenant_id' AND attnum>0 AND NOT attisdropped)",
+    )
+    .fetch_one(&state.newapi_pool)
+    .await?;
+    let tenant_scope = if has_tenant_scope {
+        "COALESCE(t.tenant_id, 0)"
+    } else {
+        "0::BIGINT"
+    };
+    let orders = sqlx::query(&format!(
         r#"
         SELECT
             t.id,
+            {tenant_scope} AS tenant_id,
             COALESCE(NULLIF(t.complete_time, 0), NULLIF(t.create_time, 0), 0) AS order_time,
             outbox.status AS outbox_status
         FROM top_ups t
@@ -510,7 +522,7 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
           )
         ORDER BY order_time, t.id
         "#,
-    )
+    ))
     .bind(lookback_start)
     .bind(TOPUP_COMPLETED_TOPIC)
     .bind(&open_case_order_ids)
@@ -546,6 +558,55 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
         let elapsed = now.saturating_sub(order_time);
         let receipt_audit = receipt_audits.get(&event_key).copied();
         let receipt_outcome = receipt_audit.map(|audit| audit.outcome);
+
+        let processed = SyncCursor {
+            last_time: order_time,
+            last_id: order_id,
+        };
+        if sync_cursor_advanced(processed, max_processed) {
+            max_processed = processed;
+        }
+
+        // NewAPI settles tenant recharges in the reseller ledger without an
+        // Invitations event. Keep unexpected event/ledger evidence for review.
+        if order.try_get::<i64, _>("tenant_id")? > 0
+            && outbox_status.is_none()
+            && receipt_audit.is_none()
+        {
+            if open_case_order_ids.contains(&order_id) {
+                for issue_code in ["topup_outbox_missing", "topup_event_receipt_missing"] {
+                    let evidence_sha256 = hex::encode(Sha256::digest(
+                        format!("topup-reconciliation:v1:{issue_code}:{event_key}").as_bytes(),
+                    ));
+                    sqlx::query(
+                        r#"
+                        UPDATE rebate_reconciliation_cases
+                        SET case_state='resolved', resolved_at=$5, updated_at=$5
+                        WHERE issue_code=$1 AND evidence_sha256=$2
+                          AND source_event_key=$3 AND source_order_id=$4
+                          AND case_state IN ('open','approved')
+                          AND rebate_record_id IS NULL AND rebate_request_id IS NULL
+                          AND operation_id IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM rebate_source_event_receipts WHERE event_key=$3
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM rebate_records
+                              WHERE canonical_event_key=$3 OR (order_type='topup' AND order_id=$4)
+                          )
+                        "#,
+                    )
+                    .bind(issue_code)
+                    .bind(evidence_sha256)
+                    .bind(&event_key)
+                    .bind(order_id)
+                    .bind(now)
+                    .execute(&state.pool)
+                    .await?;
+                }
+            }
+            continue;
+        }
 
         created_cases += reconcile_topup_issue(
             state,
@@ -608,14 +669,6 @@ async fn sync_topup_orders(state: &AppState, now: i64) -> Result<i64> {
             now,
         )
         .await?;
-
-        let processed = SyncCursor {
-            last_time: order_time,
-            last_id: order_id,
-        };
-        if sync_cursor_advanced(processed, max_processed) {
-            max_processed = processed;
-        }
     }
 
     update_topup_reconciliation_checkpoint(state, max_processed, now).await?;

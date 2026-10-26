@@ -1027,6 +1027,7 @@ pub async fn approve_rebate_request(
 
     let row = lock_rebate_request_for_review(&mut tx, id).await?;
     ensure_rebate_request_not_completed(&row)?;
+    lock_and_validate_request_records(&mut tx, &row, true, false).await?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
     sqlx::query(
@@ -1167,6 +1168,11 @@ pub async fn reject_rebate_request(
     let mut tx = state.pool.begin().await?;
     let row = lock_rebate_request_for_review(&mut tx, id).await?;
     ensure_rebate_request_not_completed(&row)?;
+    if row.try_get::<String, _>("status")? == "rejected" {
+        tx.commit().await?;
+        return Ok(message(serde_json::json!({ "id": id }), "返利申请已拒绝"));
+    }
+    lock_and_validate_request_records(&mut tx, &row, false, false).await?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
     sqlx::query(
@@ -1225,6 +1231,7 @@ pub async fn reset_rebate_request_review(
 
     let row = lock_rebate_request_for_review(&mut tx, id).await?;
     ensure_rebate_request_not_completed(&row)?;
+    lock_and_validate_request_records(&mut tx, &row, true, false).await?;
     let rebate_record_ids: Vec<i64> = row.try_get("rebate_record_ids")?;
 
     sqlx::query(
@@ -1372,7 +1379,6 @@ pub async fn revoke_signup_reward_rebate_record(
         SELECT id, order_type, status
         FROM rebate_records
         WHERE id = $1
-        FOR UPDATE
         "#,
     )
     .bind(id)
@@ -1388,9 +1394,8 @@ pub async fn revoke_signup_reward_rebate_record(
         ));
     }
 
-    let status: String = row.try_get("status")?;
     let linked_request_count =
-        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, &status, now).await?;
+        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, now).await?;
 
     tx.commit().await?;
 
@@ -2089,7 +2094,6 @@ async fn revoke_invitation_registration_reward(
           AND order_id = $2
           AND invitee_id = $2
           AND inviter_id = $3
-        FOR UPDATE
         "#,
     )
     .bind(order_type)
@@ -2110,9 +2114,8 @@ async fn revoke_invitation_registration_reward(
     };
 
     let record_id: i64 = row.try_get("id")?;
-    let status: String = row.try_get("status")?;
     let linked_request_count =
-        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, &status, now).await?;
+        revoke_invitation_signup_reward_record_in_tx(&mut tx, record_id, now).await?;
 
     tx.commit().await?;
 
@@ -3153,6 +3156,7 @@ async fn prepare_approve_and_pay_request(
             })
         }
         "pending" | "approved" => {
+            lock_and_validate_request_records(&mut tx, &row, true, true).await?;
             sqlx::query(
                 r#"
                 UPDATE rebate_requests
@@ -3444,6 +3448,32 @@ async fn lock_rebate_records(
     .map_err(AppError::from)
 }
 
+async fn lock_rebate_records_for_review(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record_ids: &[i64],
+) -> Result<Vec<PgRow>> {
+    // A dispatcher may hold a record before updating its request. Do not wait
+    // on that record while a review/revocation holds the request lock.
+    sqlx::query(
+        r#"
+        SELECT id, order_type, order_id, status, superseded_by_record_id
+        FROM rebate_records
+        WHERE id = ANY($1)
+        ORDER BY id
+        FOR UPDATE NOWAIT
+        "#,
+    )
+    .bind(record_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03") => {
+            AppError::Conflict("返利记录正在处理，请稍后重试".into())
+        }
+        _ => AppError::from(error),
+    })
+}
+
 async fn rebate_records_total_amount(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record_ids: &[i64],
@@ -3464,80 +3494,141 @@ async fn rebate_records_total_amount(
 async fn revoke_invitation_signup_reward_record_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record_id: i64,
-    status: &str,
     now: i64,
 ) -> Result<usize> {
-    if status == "completed" {
-        return Err(AppError::BadRequest(
-            "已完成的邀请注册奖励不能撤回，请先撤回返利完成状态".to_string(),
-        ));
-    }
-
+    // Match review/confirmation lock order. A new request created before the
+    // record lock is acquired is detected by the ownership check below.
     let request_rows = sqlx::query(
         r#"
         SELECT id, status, rebate_record_ids, request_kind,
                EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) AS externally_issued
         FROM rebate_requests
         WHERE $1 = ANY(rebate_record_ids)
-        FOR UPDATE
+        ORDER BY id
+        FOR NO KEY UPDATE
         "#,
     )
     .bind(record_id)
     .fetch_all(&mut **tx)
     .await?;
-
-    for request_row in &request_rows {
-        ensure_rebate_request_not_completed(request_row)?;
-        let request_status: String = request_row.try_get("status")?;
-        if request_status == "completed" {
-            return Err(AppError::BadRequest(
-                "该奖励关联的返利申请已完成，请先撤回完成状态".to_string(),
-            ));
+    let mut affected_ids = vec![record_id];
+    let mut request_ids = Vec::new();
+    for request in &request_rows {
+        ensure_rebate_request_not_completed(request)?;
+        request_ids.push(request.try_get::<i64, _>("id")?);
+        if request.try_get::<String, _>("status")? != "rejected" {
+            affected_ids.extend(request.try_get::<Vec<i64>, _>("rebate_record_ids")?);
         }
     }
-
-    let linked_request_count = request_rows.len();
-    for request_row in &request_rows {
-        let request_id: i64 = request_row.try_get("id")?;
-        let rebate_record_ids: Vec<i64> = request_row.try_get("rebate_record_ids")?;
-        let remaining_ids = without_rebate_record_id(&rebate_record_ids, record_id);
-
+    affected_ids.sort_unstable();
+    affected_ids.dedup();
+    let records = lock_rebate_records_for_review(tx, &affected_ids).await?;
+    let record = records
+        .iter()
+        .find(|row| row.try_get::<i64, _>("id").ok() == Some(record_id))
+        .ok_or_else(|| AppError::NotFound("返利记录不存在".into()))?;
+    if record.try_get::<String, _>("status")? == "completed" {
+        return Err(AppError::Conflict("已完成的邀请注册奖励不能撤回".into()));
+    }
+    let unsafe_settlement: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(SELECT 1 FROM invitation_rebate_payouts WHERE rebate_record_id=ANY($1))
+            OR EXISTS(SELECT 1 FROM balance_operations WHERE rebate_record_id=ANY($1))
+            OR EXISTS(SELECT 1 FROM rebate_record_request_ownership
+                      WHERE rebate_record_id=$2 AND ownership_state='active'
+                        AND NOT (request_id=ANY($3)))
+        "#,
+    )
+    .bind(&affected_ids)
+    .bind(record_id)
+    .bind(&request_ids)
+    .fetch_one(&mut **tx)
+    .await?;
+    if unsafe_settlement {
+        return Err(AppError::Conflict(
+            "奖励已有结算记录或申请归属已变化，不能撤回".into(),
+        ));
+    }
+    for request in &request_rows {
+        if request.try_get::<String, _>("status")? == "rejected" {
+            continue;
+        }
+        let request_id: i64 = request.try_get("id")?;
+        let remaining_ids = without_rebate_record_id(
+            &request.try_get::<Vec<i64>, _>("rebate_record_ids")?,
+            record_id,
+        );
         if remaining_ids.is_empty() {
-            sqlx::query("DELETE FROM rebate_requests WHERE id = $1")
-                .bind(request_id)
-                .execute(&mut **tx)
-                .await?;
+            // Keep the rejected request and its immutable item snapshots as evidence.
+            sqlx::query("UPDATE rebate_requests SET status='rejected',approved_at=NULL,rejected_at=$2,updated_at=$2 WHERE id=$1")
+                .bind(request_id).bind(now).execute(&mut **tx).await?;
         } else {
-            let total_amount = rebate_records_total_amount(tx, &remaining_ids).await?;
             sqlx::query(
                 r#"
                 UPDATE rebate_requests
-                SET rebate_record_ids = $1,
-                    total_amount = $2,
-                    updated_at = $3
-                WHERE id = $4
+                SET rebate_record_ids=$1,
+                    total_amount=(SELECT SUM(amount_quota_snapshot)::BIGINT FROM rebate_request_items
+                                  WHERE request_id=$2 AND membership_state='active' AND rebate_record_id=ANY($1)),
+                    updated_at=$3
+                WHERE id=$2
                 "#,
             )
-            .bind(&remaining_ids)
-            .bind(total_amount)
-            .bind(now)
-            .bind(request_id)
-            .execute(&mut **tx)
-            .await?;
+            .bind(&remaining_ids).bind(request_id).bind(now).execute(&mut **tx).await?;
         }
     }
-
-    let deleted = sqlx::query("DELETE FROM rebate_records WHERE id = $1")
+    sqlx::query("UPDATE rebate_records SET status='closed',closed_at=$2,updated_at=$2 WHERE id=$1")
         .bind(record_id)
+        .bind(now)
         .execute(&mut **tx)
-        .await?
-        .rows_affected();
+        .await?;
+    Ok(request_rows.len())
+}
 
-    if deleted == 0 {
-        return Err(AppError::NotFound("返利记录不存在".to_string()));
+async fn lock_and_validate_request_records(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &PgRow,
+    check_amounts: bool,
+    allow_settlement_retry: bool,
+) -> Result<()> {
+    let request_id: i64 = request.try_get("id")?;
+    let ids: Vec<i64> = request.try_get("rebate_record_ids")?;
+    let records = lock_rebate_records_for_review(tx, &ids).await?;
+    if ids.is_empty() || records.len() != ids.len() {
+        return Err(AppError::Conflict("申请记录缺失，请重新申请".into()));
     }
-
-    Ok(linked_request_count)
+    let rejected = request.try_get::<String, _>("status")? == "rejected";
+    let invalid: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM rebate_records record
+            LEFT JOIN rebate_request_items item ON item.request_id=$1
+                AND item.rebate_record_id=record.id AND item.membership_state='active'
+            LEFT JOIN rebate_record_request_ownership owner ON owner.rebate_record_id=record.id
+                AND owner.ownership_state='active'
+            WHERE record.id=ANY($2) AND (
+                record.inviter_id<>$3 OR (record.status NOT IN ('pending','requested','approved','rejected') AND NOT ($7 AND record.status='completed'))
+                OR item.rebate_record_id IS NULL
+                OR CASE WHEN $4 THEN owner.request_id IS NOT NULL ELSE owner.request_id IS DISTINCT FROM $1 END
+                OR ($5 AND record.rebate_amount<>item.amount_quota_snapshot)
+            )
+        ) OR ($5 AND $6<>(SELECT COALESCE(SUM(amount_quota_snapshot),0)::BIGINT
+                         FROM rebate_request_items WHERE request_id=$1 AND membership_state='active'))
+          OR (NOT $7 AND (
+              EXISTS(SELECT 1 FROM invitation_rebate_payouts WHERE rebate_record_id=ANY($2))
+              OR EXISTS(SELECT 1 FROM balance_operations WHERE rebate_record_id=ANY($2))
+          ))
+        "#,
+    )
+    .bind(request_id).bind(&ids).bind(request.try_get::<i64, _>("user_id")?)
+    .bind(rejected).bind(check_amounts).bind(request.try_get::<i64, _>("total_amount")?)
+    .bind(allow_settlement_retry)
+    .fetch_one(&mut **tx).await?;
+    if invalid {
+        return Err(AppError::Conflict(
+            "返利记录归属、金额或结算状态已变化，请重新申请或核对".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn lock_rebate_request_for_review(
@@ -3546,11 +3637,11 @@ async fn lock_rebate_request_for_review(
 ) -> Result<PgRow> {
     sqlx::query(
         r#"
-        SELECT id, status, rebate_record_ids, request_kind,
+        SELECT id, user_id, total_amount, status, rebate_record_ids, request_kind,
                EXISTS(SELECT 1 FROM sales_disbursements WHERE request_id=rebate_requests.id) AS externally_issued
         FROM rebate_requests
         WHERE id = $1
-        FOR UPDATE
+        FOR NO KEY UPDATE
         "#,
     )
     .bind(id)

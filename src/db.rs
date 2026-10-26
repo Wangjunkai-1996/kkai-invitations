@@ -4284,6 +4284,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
     async fn topup_reconciliation_uses_receipt_outcomes_not_current_inviter_relationships() {
+        use sha2::Digest;
+
         let database = TestDatabase::create().await;
         database.prepare().await.unwrap();
         sqlx::query(
@@ -4555,6 +4557,107 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unresolved, 0);
+
+        // The earlier assertions cover legacy NewAPI schemas without tenant_id.
+        // Only platform topups produce Invitations events after tenant support.
+        sqlx::raw_sql("ALTER TABLE top_ups ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 0")
+            .execute(&database.external_pool)
+            .await
+            .unwrap();
+        for (order_id, tenant_id) in [
+            (9101_i64, 0_i64),
+            (9102, 42),
+            (9103, 42),
+            (9104, 42),
+            (9105, 42),
+            (9106, 42),
+        ] {
+            sqlx::query("INSERT INTO top_ups(id,user_id,complete_time,create_time,trade_no,status,tenant_id) VALUES($1,3420,$2,$2,$3,'success',$4)")
+                .bind(order_id)
+                .bind(if order_id == 9102 { completed_at - 2 * 86400 } else { completed_at })
+                .bind(format!("trade-{order_id}"))
+                .bind(tenant_id)
+                .execute(&database.external_pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO kkai_outbox(event_key,topic,status) VALUES('newapi:topup:9104','kkai.billing.topup.completed','dead')")
+            .execute(&database.external_pool).await.unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_records (
+                inviter_id, invitee_id, user_group, order_type, order_id,
+                order_amount, order_time, rebate_effective_at, rebate_amount,
+                status, scan_started_at, initialization_ends_at, created_at, updated_at
+            ) VALUES (
+                1001, 3420, 'default', 'topup', 9105, 75.00, $1, $2, 0,
+                'initializing', $1, $2, $1, $1
+            )
+            "#,
+        )
+        .bind(completed_at)
+        .bind(completed_at + INITIALIZATION_SECONDS)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        for order_id in [9102, 9105, 9106] {
+            for issue_code in ["topup_outbox_missing", "topup_event_receipt_missing"] {
+                let event_key = format!("newapi:topup:{order_id}");
+                let evidence = if order_id == 9106 {
+                    "f".repeat(64)
+                } else {
+                    hex::encode(sha2::Sha256::digest(
+                        format!("topup-reconciliation:v1:{issue_code}:{event_key}").as_bytes(),
+                    ))
+                };
+                sqlx::query("INSERT INTO rebate_reconciliation_cases(issue_code,case_state,evidence_sha256,source_event_key,source_order_id,created_at,updated_at) VALUES($1,'open',$2,$3,$4,$5,$5)")
+                    .bind(issue_code).bind(evidence).bind(event_key).bind(order_id).bind(completed_at)
+                    .execute(&database.pool).await.unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO rebate_reconciliation_cases(issue_code,case_state,evidence_sha256,source_event_key,source_order_id,created_at,updated_at) VALUES('topup_receipt_integrity_drift','open',$1,'newapi:topup:9102',9102,$2,$2)")
+            .bind("e".repeat(64)).bind(completed_at).execute(&database.pool).await.unwrap();
+
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            4
+        );
+        let tenant_cases: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT source_order_id,issue_code,case_state FROM rebate_reconciliation_cases WHERE source_order_id BETWEEN 9101 AND 9106 ORDER BY source_order_id,issue_code",
+        )
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tenant_cases,
+            vec![
+                (9101, "topup_event_receipt_missing".into(), "open".into()),
+                (9101, "topup_outbox_missing".into(), "open".into()),
+                (
+                    9102,
+                    "topup_event_receipt_missing".into(),
+                    "resolved".into()
+                ),
+                (9102, "topup_outbox_missing".into(), "resolved".into()),
+                (9102, "topup_receipt_integrity_drift".into(), "open".into()),
+                (9104, "topup_event_receipt_missing".into(), "open".into()),
+                (9104, "topup_outbox_dead".into(), "open".into()),
+                (9105, "topup_event_receipt_missing".into(), "open".into()),
+                (9105, "topup_outbox_missing".into(), "open".into()),
+                (9106, "topup_event_receipt_missing".into(), "open".into()),
+                (9106, "topup_outbox_missing".into(), "open".into()),
+            ]
+        );
+        assert_eq!(
+            run_topup_reconciliation(&state)
+                .await
+                .unwrap()
+                .created_cases,
+            0
+        );
         database.cleanup().await;
     }
 
@@ -6092,6 +6195,554 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("settlement coverage"));
+        database.cleanup().await;
+    }
+
+    async fn sales_ledger_test_fixture() -> (TestDatabase, AppState, SessionUser, SessionUser) {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::raw_sql("CREATE TABLE users(id BIGINT PRIMARY KEY, username TEXT, display_name TEXT, deleted_at TIMESTAMP, aff_code TEXT, inviter_id BIGINT); INSERT INTO users VALUES(11,'sales','Sales',NULL,'sales-code',NULL)")
+            .execute(&database.external_pool).await.unwrap();
+        // The external user identity and Invitations settings live in separate schemas.
+        sqlx::raw_sql("UPDATE system_config SET value='0' WHERE key IN ('min_rebate_request_amount','rebate_request_frequency_days'); UPDATE system_config SET value='true' WHERE key='invitation_signup_reward_enabled'; INSERT INTO sales_accounts(user_id,active,note,created_at,updated_at,updated_by) VALUES(11,TRUE,'',1,1,99); INSERT INTO sales_account_events(user_id,active,note,admin_id,created_at) VALUES(11,TRUE,'',99,1);")
+            .execute(&database.pool).await.unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".into(),
+                base_path: String::new(),
+                database_url: String::new(),
+                newapi_database_url: String::new(),
+                session_secret: "test".into(),
+                rebate_event_ingest_secret: "test".into(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                topup_rebate_active_from_id: 1,
+                settlement_mode: SettlementMode::Enabled,
+                quota_per_unit: 500000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let seller = SessionUser {
+            id: 11,
+            username: "sales".into(),
+            role: 1,
+            status: 1,
+            group: "default".into(),
+        };
+        let operator = SessionUser {
+            id: 99,
+            username: "admin".into(),
+            role: 10,
+            status: 1,
+            group: "default".into(),
+        };
+        (database, state, seller, operator)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_ledger_review_retries_preserve_ownership_and_amount_snapshots() {
+        use crate::error::AppError;
+        use crate::routes::{admin, user};
+        use crate::sales;
+        use axum::extract::{Path, State};
+        use axum::Json;
+        let (database, state, seller, operator) = sales_ledger_test_fixture().await;
+        sqlx::raw_sql("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,rebate_rate,status,scan_started_at,initialization_ends_at,finalized_at,created_at,updated_at) SELECT n,11,12,'default','topup',n,100,1,1,7500000,0.15,'pending',1,1,1,1,1 FROM generate_series(901,903) n")
+            .execute(&state.pool).await.unwrap();
+        let old = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![901],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::reject_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(old),
+            Json(admin::ApproveRequest {
+                note: Some("retry later".into()),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let current = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![901],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::approve_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(current),
+            Json(admin::ApproveRequest {
+                note: None,
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = sales::confirm_issued(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(current),
+            Json(sales::ConfirmIssued {
+                note: "paid current request".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = admin::reject_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(old),
+            Json(admin::ApproveRequest {
+                note: Some("stale retry".into()),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let identity: (String, i64, i64) = sqlx::query_as("SELECT r.status,o.request_id,d.amount_quota FROM rebate_records r JOIN rebate_record_request_ownership o ON o.rebate_record_id=r.id AND o.ownership_state='active' JOIN sales_disbursements d ON d.request_id=o.request_id WHERE r.id=901")
+            .fetch_one(&state.pool).await.unwrap();
+        assert_eq!(identity, ("approved".into(), current, 7_500_000));
+        assert!(matches!(
+            admin::approve_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(old),
+                Json(admin::ApproveRequest {
+                    note: None,
+                    reason: None
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin::reset_rebate_request_review(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(old)
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+
+        let stale_amount = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![902],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::reject_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(stale_amount),
+            Json(admin::ApproveRequest {
+                note: Some("adjust amount".into()),
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = admin::update_rebate_order_records(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Json(admin::UpdateRebateOrderRecordsRequest {
+                record_ids: vec![902],
+                rebate_amount: None,
+                rebate_ratio: Some(0.10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            admin::approve_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(stale_amount),
+                Json(admin::ApproveRequest {
+                    note: None,
+                    reason: None
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin::reset_rebate_request_review(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(stale_amount)
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        let fresh = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![902],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::approve_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(fresh),
+            Json(admin::ApproveRequest {
+                note: None,
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = sales::confirm_issued(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(fresh),
+            Json(sales::ConfirmIssued {
+                note: "paid adjusted request".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let amounts: (i64, i64, i64) = sqlx::query_as("SELECT r.rebate_amount,q.total_amount,d.amount_quota FROM rebate_records r JOIN rebate_record_request_ownership o ON o.rebate_record_id=r.id AND o.ownership_state='active' JOIN rebate_requests q ON q.id=o.request_id JOIN sales_disbursements d ON d.request_id=q.id WHERE r.id=902")
+            .fetch_one(&state.pool).await.unwrap();
+        assert_eq!(amounts, (5_000_000, 5_000_000, 5_000_000));
+        let original: i64 = sqlx::query_scalar("SELECT amount_quota_snapshot FROM rebate_request_items WHERE request_id=$1 AND rebate_record_id=902")
+            .bind(stale_amount).fetch_one(&state.pool).await.unwrap();
+        assert_eq!(original, 7_500_000);
+
+        let drifted = user::request_rebate(
+            State(state.clone()),
+            seller,
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![903],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::approve_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(drifted),
+            Json(admin::ApproveRequest {
+                note: None,
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE rebate_records SET rebate_amount=5000000 WHERE id=903")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            sales::confirm_issued(
+                State(state.clone()),
+                AdminUser(operator),
+                Path(drifted),
+                Json(sales::ConfirmIssued {
+                    note: "must reject drift".into()
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_ledger_reward_revocation_preserves_audit_and_blocks_settlement() {
+        use crate::error::AppError;
+        use crate::routes::{admin, user};
+        use crate::sales;
+        use axum::extract::{Path, State};
+        use axum::Json;
+        let (database, state, seller, operator) = sales_ledger_test_fixture().await;
+        sqlx::raw_sql("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,rebate_rate,status,scan_started_at,initialization_ends_at,finalized_at,created_at,updated_at) SELECT n,11,n,'default','invite_inviter',n,0,1,1,5000000,NULL,'pending',1,1,1,1,1 FROM generate_series(901,905) n")
+            .execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO invitation_registrations(id,inviter_id,invitee_id,user_group,invited_at,created_at,updated_at) VALUES(1,11,901,'default',1,1,1)")
+            .execute(&state.pool).await.unwrap();
+        let _ = admin::revoke_invitation_registration_inviter_reward(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(1),
+        )
+        .await
+        .unwrap();
+        let _ = admin::revoke_signup_reward_rebate_record(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(901),
+        )
+        .await
+        .unwrap();
+        let preserved: (String, i64) = sqlx::query_as("SELECT r.status,s.rebate_record_id FROM rebate_records r JOIN rebate_record_settlements s ON s.rebate_record_id=r.id WHERE r.id=901")
+            .fetch_one(&state.pool).await.unwrap();
+        assert_eq!(preserved, ("closed".into(), 901));
+        let sole = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![902],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::revoke_signup_reward_rebate_record(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(902),
+        )
+        .await
+        .unwrap();
+        let sole_state: (String, Vec<i64>, i64, String) = sqlx::query_as("SELECT q.status,q.rebate_record_ids,item.amount_quota_snapshot,o.ownership_state FROM rebate_requests q JOIN rebate_request_items item ON item.request_id=q.id JOIN rebate_record_request_ownership o ON o.request_id=q.id AND o.rebate_record_id=item.rebate_record_id WHERE q.id=$1")
+            .bind(sole).fetch_one(&state.pool).await.unwrap();
+        assert_eq!(
+            sole_state,
+            ("rejected".into(), vec![902], 5_000_000, "released".into())
+        );
+        assert!(matches!(
+            admin::approve_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(sole),
+                Json(admin::ApproveRequest {
+                    note: None,
+                    reason: None
+                })
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        let partial = user::request_rebate(
+            State(state.clone()),
+            seller.clone(),
+            Json(user::RebateRequest {
+                amount: None,
+                rebate_record_ids: vec![903, 904],
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .data
+        .id;
+        let _ = admin::revoke_signup_reward_rebate_record(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(903),
+        )
+        .await
+        .unwrap();
+        let remaining: (Vec<i64>, i64) = sqlx::query_as(
+            "SELECT rebate_record_ids,total_amount FROM rebate_requests WHERE id=$1",
+        )
+        .bind(partial)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (vec![904], 5_000_000));
+        let removed: (String, i64) = sqlx::query_as("SELECT membership_state,amount_quota_snapshot FROM rebate_request_items WHERE request_id=$1 AND rebate_record_id=903")
+            .bind(partial).fetch_one(&state.pool).await.unwrap();
+        assert_eq!(removed, ("removed".into(), 5_000_000));
+        let _ = admin::approve_rebate_request(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(partial),
+            Json(admin::ApproveRequest {
+                note: None,
+                reason: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = sales::confirm_issued(
+            State(state.clone()),
+            AdminUser(operator.clone()),
+            Path(partial),
+            Json(sales::ConfirmIssued {
+                note: "paid remaining reward".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            admin::revoke_signup_reward_rebate_record(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(904)
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        sqlx::query("INSERT INTO invitation_rebate_payouts(rebate_record_id,inviter_user_id,invitee_user_id,order_id,order_type,amount_cents,quota_delta,kind,status,request_id,created_at,updated_at) VALUES(905,11,905,905,'invite_inviter',1000,5000000,'payout','pending','revocation-settlement-guard',1,1)")
+            .execute(&state.pool).await.unwrap();
+        assert!(matches!(
+            admin::revoke_signup_reward_rebate_record(State(state), AdminUser(operator), Path(905))
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_ledger_identity_events_remain_ordered_when_clock_moves_back() {
+        use crate::sales;
+        use axum::extract::{Path, State};
+        use axum::Json;
+        let (database, state, _, operator) = sales_ledger_test_fixture().await;
+        let future = chrono::Utc::now().timestamp() + 60;
+        sqlx::query("INSERT INTO sales_account_events(user_id,active,note,admin_id,created_at) VALUES(11,TRUE,'earlier update with later clock',99,$1)")
+            .bind(future).execute(&state.pool).await.unwrap();
+        let _ = sales::update_account(
+            State(state.clone()),
+            AdminUser(operator),
+            Path(11),
+            Json(sales::UpdateSalesAccount {
+                active: false,
+                note: "disabled after clock regression".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let profile = sales::profile(&state.pool, 11).await.unwrap();
+        let latest: (bool, i64) = sqlx::query_as("SELECT active,created_at FROM sales_account_events WHERE user_id=11 ORDER BY created_at DESC,id DESC LIMIT 1")
+            .fetch_one(&state.pool).await.unwrap();
+        assert!(!profile.active);
+        assert_eq!(latest, (false, future));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_ledger_guards_preserve_ordinary_partial_payout_retries() {
+        use crate::routes::admin;
+        use axum::extract::{Path, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::Json;
+        let (database, state, _, operator) = sales_ledger_test_fixture().await;
+        sqlx::raw_sql("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,rebate_rate,status,scan_started_at,initialization_ends_at,created_at,updated_at) VALUES(901,12,13,'default','topup',901,100,1,1,5000000,0.10,'completed',1,1,1,1),(902,12,13,'default','topup',902,100,1,1,5000000,0.10,'approved',1,1,1,1); INSERT INTO rebate_requests(id,user_id,rebate_record_ids,total_amount,status,request_kind,created_at,updated_at,approved_at) VALUES(1001,12,ARRAY[901,902]::BIGINT[],10000000,'approved','ordinary',1,1,1); INSERT INTO invitation_rebate_payouts(rebate_record_id,rebate_request_id,inviter_user_id,invitee_user_id,order_id,order_type,amount_cents,quota_delta,kind,status,request_id,created_at,updated_at,completed_at) VALUES(901,1001,12,13,901,'topup',1000,5000000,'payout','completed','already-issued-item',1,1,1);")
+            .execute(&state.pool).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_static("ordinary-partial-retry"),
+        );
+        for _ in 0..2 {
+            let result = admin::approve_and_pay_rebate_request(
+                State(state.clone()),
+                AdminUser(operator.clone()),
+                Path(1001),
+                headers.clone(),
+                Json(admin::ApproveAndPayRequest { note: None }),
+            )
+            .await
+            .unwrap()
+            .0
+            .data;
+            assert_eq!(result.status, "approved");
+            assert_eq!(
+                (
+                    result.already_paid_count,
+                    result.pending_count,
+                    result.failed_count
+                ),
+                (1, 1, 0)
+            );
+        }
+        let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM invitation_rebate_payouts),(SELECT COUNT(*) FROM balance_operations),(SELECT COUNT(*) FROM balance_operation_outbox)")
+            .fetch_one(&state.pool).await.unwrap();
+        assert_eq!(counts, (2, 1, 1));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_ledger_revocation_yields_to_concurrent_claim_without_mutating_it() {
+        use crate::error::AppError;
+        use crate::routes::admin;
+        use axum::extract::{Path, State};
+        let (database, state, _, operator) = sales_ledger_test_fixture().await;
+        sqlx::query("INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,status,scan_started_at,initialization_ends_at,created_at,updated_at) VALUES(901,11,12,'default','invite_inviter',12,0,1,1,5000000,'pending',1,1,1,1)")
+            .execute(&state.pool).await.unwrap();
+        let mut claimant = state.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM rebate_records WHERE id=901 FOR UPDATE")
+            .fetch_one(&mut *claimant)
+            .await
+            .unwrap();
+        let revoke_state = state.clone();
+        let revocation = tokio::spawn(async move {
+            admin::revoke_signup_reward_rebate_record(
+                State(revoke_state),
+                AdminUser(operator),
+                Path(901),
+            )
+            .await
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), revocation)
+            .await
+            .expect("revocation must not wait while holding request locks")
+            .unwrap();
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        sqlx::query("INSERT INTO rebate_requests(id,user_id,rebate_record_ids,total_amount,status,request_kind,created_at,updated_at) VALUES(1001,11,ARRAY[901]::BIGINT[],5000000,'pending','sales',1,1)")
+            .execute(&mut *claimant).await.unwrap();
+        sqlx::query("UPDATE rebate_records SET status='requested' WHERE id=901")
+            .execute(&mut *claimant)
+            .await
+            .unwrap();
+        claimant.commit().await.unwrap();
+        let identity: (String,i64) = sqlx::query_as("SELECT r.status,o.request_id FROM rebate_records r JOIN rebate_record_request_ownership o ON o.rebate_record_id=r.id AND o.ownership_state='active' WHERE r.id=901")
+            .fetch_one(&state.pool).await.unwrap();
+        assert_eq!(identity, ("requested".into(), 1001));
         database.cleanup().await;
     }
 

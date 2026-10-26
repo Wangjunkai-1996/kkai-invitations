@@ -141,8 +141,19 @@ pub async fn update_account(
     if !user_exists {
         return Err(AppError::NotFound("用户不存在".into()));
     }
-    let now = Utc::now().timestamp();
     let mut tx = state.pool.begin().await?;
+    // Serialize first registration too: an absent row cannot be row-locked.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("sales-account:{user_id}"))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT user_id FROM sales_accounts WHERE user_id=$1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let now: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT,COALESCE(MAX(created_at),0)) FROM sales_account_events WHERE user_id=$1",
+    ).bind(user_id).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO sales_accounts(user_id, active, note, created_at, updated_at, updated_by) VALUES ($1,$2,$3,$4,$4,$5) ON CONFLICT(user_id) DO UPDATE SET active=EXCLUDED.active,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by")
         .bind(user_id).bind(input.active).bind(input.note.trim()).bind(now).bind(admin.0.id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO sales_account_events(user_id,active,note,admin_id,created_at) VALUES($1,$2,$3,$4,$5)")
@@ -213,16 +224,33 @@ pub async fn confirm_issued(
         }));
     }
     let ids: Vec<i64> = request.try_get("rebate_record_ids")?;
-    sqlx::query("SELECT id FROM rebate_records WHERE id=ANY($1) ORDER BY id FOR UPDATE")
+    sqlx::query("SELECT id FROM rebate_records WHERE id=ANY($1) ORDER BY id FOR UPDATE NOWAIT")
         .bind(&ids)
         .fetch_all(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| match &error {
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03") => {
+                AppError::Conflict("返利记录正在处理，请稍后重试".into())
+            }
+            _ => AppError::from(error),
+        })?;
     let amount: i64 = request.try_get("total_amount")?;
-    let conflict: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM invitation_rebate_payouts WHERE rebate_record_id=ANY($1)) OR EXISTS(SELECT 1 FROM balance_operations WHERE rebate_record_id=ANY($1))")
-        .bind(&ids).fetch_one(&mut *tx).await?;
+    let conflict: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(SELECT 1 FROM invitation_rebate_payouts WHERE rebate_record_id=ANY($1))
+            OR EXISTS(SELECT 1 FROM balance_operations WHERE rebate_record_id=ANY($1))
+            OR EXISTS(
+                SELECT 1 FROM rebate_records record
+                LEFT JOIN rebate_request_items item ON item.request_id=$2
+                    AND item.rebate_record_id=record.id AND item.membership_state='active'
+                WHERE record.id=ANY($1)
+                  AND (item.rebate_record_id IS NULL OR record.rebate_amount<>item.amount_quota_snapshot)
+            )
+        "#,
+    ).bind(&ids).bind(id).fetch_one(&mut *tx).await?;
     if conflict || amount <= 0 {
         return Err(AppError::Conflict(
-            "返利已有余额发放记录或金额无效，不能确认外部发放".into(),
+            "返利已有余额发放记录或金额与申请不一致，不能确认外部发放".into(),
         ));
     }
     let now = Utc::now().timestamp();
