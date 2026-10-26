@@ -7,6 +7,7 @@ use crate::error::{AppError, Result};
 pub const INITIALIZATION_SECONDS: i64 = 5 * 60;
 pub const REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const ALL_USER_GROUP: &str = "__all__";
+pub const SALES_USER_GROUP: &str = "__sales__";
 
 const PREVIOUS_REBATE_EFFECTIVE_DELAY_SECONDS: i64 = 24 * 60 * 60;
 const LEGACY_INITIALIZATION_SECONDS: i64 = 2 * 24 * 60 * 60;
@@ -90,8 +91,10 @@ fn matches_rebate_schedule(
 
 struct InitializingRebateRecord {
     id: i64,
+    inviter_id: i64,
     user_group: String,
     order_type: String,
+    order_time: i64,
     order_amount_cents: i64,
     admin_adjusted: bool,
     snapshot_rate: Option<Decimal>,
@@ -101,7 +104,7 @@ struct InitializingRebateRecord {
 pub async fn finalize_ready_initializing_records(pool: &PgPool, now: i64) -> Result<i64> {
     let rows = sqlx::query(
         r#"
-        SELECT record.id, record.user_group, record.order_type,
+        SELECT record.id, record.inviter_id, record.user_group, record.order_type, record.order_time,
                COALESCE(record.order_amount_cents, ROUND(record.order_amount * 100)::BIGINT)
                    AS order_amount_cents,
                record.admin_adjusted,
@@ -125,7 +128,7 @@ pub async fn finalize_ready_initializing_records(pool: &PgPool, now: i64) -> Res
 pub async fn finalize_ready_topup_event_records(pool: &PgPool, now: i64) -> Result<i64> {
     let rows = sqlx::query(
         r#"
-        SELECT record.id, record.user_group, record.order_type,
+        SELECT record.id, record.inviter_id, record.user_group, record.order_type, record.order_time,
                COALESCE(record.order_amount_cents, ROUND(record.order_amount * 100)::BIGINT)
                    AS order_amount_cents,
                record.admin_adjusted,
@@ -159,7 +162,7 @@ pub async fn finalize_initializing_records_by_ids(
 ) -> Result<i64> {
     let rows = sqlx::query(
         r#"
-        SELECT record.id, record.user_group, record.order_type,
+        SELECT record.id, record.inviter_id, record.user_group, record.order_type, record.order_time,
                COALESCE(record.order_amount_cents, ROUND(record.order_amount * 100)::BIGINT)
                    AS order_amount_cents,
                record.admin_adjusted,
@@ -183,16 +186,44 @@ pub async fn current_rebate_rate(
     pool: &PgPool,
     user_group: &str,
     order_type: &str,
+    inviter_id: i64,
+    order_time: i64,
 ) -> Result<Option<Decimal>> {
+    selected_rebate_rule(pool, user_group, order_type, inviter_id, order_time)
+        .await?
+        .map(|(_, rate)| {
+            rate.parse::<Decimal>()
+                .map_err(|_| AppError::Internal("返利规则格式错误".to_string()))
+        })
+        .transpose()
+}
+
+pub(crate) async fn selected_rebate_rule<'e, E>(
+    executor: E,
+    user_group: &str,
+    order_type: &str,
+    inviter_id: i64,
+    order_time: i64,
+) -> std::result::Result<Option<(i64, String)>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row = sqlx::query(
         r#"
-        SELECT rebate_rate::TEXT AS rebate_rate
+        SELECT id, rebate_rate::TEXT AS rebate_rate
         FROM rebate_rules
         WHERE rule_type = $2
-          AND user_group IN ($1, $3)
+          AND (
+              (user_group = $3 AND $2 = 'topup' AND effective_time < $5
+               AND (SELECT active FROM sales_account_events
+                    WHERE user_id = $4 AND created_at < $5
+                    ORDER BY created_at DESC, id DESC LIMIT 1) = TRUE)
+              OR (user_group = $1 AND user_group <> $3)
+              OR user_group = $6
+          )
         ORDER BY CASE
-            WHEN user_group = $1 THEN 0
-            WHEN user_group = $3 THEN 1
+            WHEN user_group = $3 THEN 0
+            WHEN user_group = $1 THEN 1
             ELSE 2
         END
         LIMIT 1
@@ -200,17 +231,14 @@ pub async fn current_rebate_rate(
     )
     .bind(user_group)
     .bind(order_type)
+    .bind(SALES_USER_GROUP)
+    .bind(inviter_id)
+    .bind(order_time)
     .bind(ALL_USER_GROUP)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
-
-    row.map(|row| {
-        let rebate_rate: String = row.try_get("rebate_rate")?;
-        rebate_rate
-            .parse::<Decimal>()
-            .map_err(|_| AppError::Internal("返利规则格式错误".to_string()))
-    })
-    .transpose()
+    row.map(|row| Ok((row.try_get("id")?, row.try_get("rebate_rate")?)))
+        .transpose()
 }
 
 pub fn rebate_amount_for_cents(
@@ -257,8 +285,10 @@ fn rows_to_initializing_records(
                 .transpose()?;
             Ok(InitializingRebateRecord {
                 id: row.try_get("id")?,
+                inviter_id: row.try_get("inviter_id")?,
                 user_group: row.try_get("user_group")?,
                 order_type: row.try_get("order_type")?,
+                order_time: row.try_get("order_time")?,
                 order_amount_cents: row.try_get("order_amount_cents")?,
                 admin_adjusted: row.try_get("admin_adjusted")?,
                 snapshot_rate,
@@ -311,8 +341,14 @@ async fn finalize_rows(
             .execute(pool)
             .await?
             .rows_affected()
-        } else if let Some(rebate_rate) =
-            current_rebate_rate(pool, &record.user_group, &record.order_type).await?
+        } else if let Some(rebate_rate) = current_rebate_rate(
+            pool,
+            &record.user_group,
+            &record.order_type,
+            record.inviter_id,
+            record.order_time,
+        )
+        .await?
         {
             let rebate_amount = rebate_amount_for_cents(
                 record.order_amount_cents,

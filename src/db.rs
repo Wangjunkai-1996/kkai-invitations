@@ -2149,7 +2149,8 @@ mod tests {
     use crate::config::{Config, SettlementMode};
     use crate::middleware::AdminUser;
     use crate::rebate_lifecycle::{
-        finalize_ready_topup_event_records, INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
+        finalize_ready_initializing_records, finalize_ready_topup_event_records,
+        INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
     };
     use crate::rebate_source_events::{
         ingest_rebate_source_event, receive_rebate_source_event, IngestError, IngestOutcome,
@@ -2157,9 +2158,10 @@ mod tests {
     };
     use crate::reconciliation_cli::{apply_for_test, plan, verify_for_test};
     use crate::routes::admin::{
-        fetch_local_rebate_record_id_for_test, fetch_newapi_topup_rebate_order_ids_for_test,
-        reopen_rebate_order_records, update_rebate_order_records, RebateOrderRecordIdsRequest,
-        UpdateRebateOrderRecordsRequest,
+        create_rebate_rule, delete_rebate_rule, fetch_local_rebate_record_id_for_test,
+        fetch_newapi_topup_rebate_order_ids_for_test, reopen_rebate_order_records,
+        update_rebate_order_records, update_rebate_rule, RebateOrderRecordIdsRequest,
+        RebateRuleRequest, UpdateRebateOrderRecordsRequest,
     };
     use crate::routes::system::run_topup_reconciliation;
     use crate::routes::user::{count_rebate_records, fetch_rebate_records};
@@ -2931,6 +2933,280 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_rebate_rule_cannot_be_rewritten_through_admin_api() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        let state = AppState {
+            config: Config {
+                listen_addr: "127.0.0.1:0".to_string(),
+                base_path: String::new(),
+                database_url: "postgresql://test/invitations".to_string(),
+                newapi_database_url: "postgresql://test/newapi".to_string(),
+                session_secret: "test-session-secret".to_string(),
+                rebate_event_ingest_secret: "test-rebate-event-ingest-secret".to_string(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 0,
+                auto_sync_initial_delay_seconds: 0,
+                topup_reconciliation_interval_seconds: 0,
+                topup_reconciliation_initial_delay_seconds: 0,
+                topup_rebate_active_from_id: 1,
+                settlement_mode: SettlementMode::ReadOnly,
+                quota_per_unit: 500_000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1_000,
+            },
+            pool: database.pool.clone(),
+            newapi_pool: database.external_pool.clone(),
+            balance_client: None,
+        };
+        let admin = || {
+            AdminUser(SessionUser {
+                id: 1,
+                username: "admin".to_string(),
+                role: 10,
+                status: 1,
+                group: "default".to_string(),
+            })
+        };
+        let request = |group: &str, rate: &str| RebateRuleRequest {
+            user_group: group.to_string(),
+            rule_type: "topup".to_string(),
+            rebate_rate: serde_json::json!(rate),
+        };
+        let rule = create_rebate_rule(
+            axum::extract::State(state.clone()),
+            admin(),
+            axum::Json(request("__sales__", "0.15")),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert!(rule.effective_time > 0);
+        assert!(matches!(
+            create_rebate_rule(
+                axum::extract::State(state.clone()),
+                admin(),
+                axum::Json(request("__sales__", "0.15"))
+            )
+            .await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            update_rebate_rule(
+                axum::extract::State(state.clone()),
+                admin(),
+                axum::extract::Path(rule.id),
+                axum::Json(request("default", "0.05"))
+            )
+            .await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            delete_rebate_rule(
+                axum::extract::State(state.clone()),
+                admin(),
+                axum::extract::Path(rule.id)
+            )
+            .await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        let after: (String, i64) =
+            sqlx::query_as("SELECT rebate_rate::TEXT,effective_time FROM rebate_rules WHERE id=$1")
+                .bind(rule.id)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(after, ("0.1500".to_string(), rule.effective_time));
+
+        let ordinary = create_rebate_rule(
+            axum::extract::State(state.clone()),
+            admin(),
+            axum::Json(request("default", "0.05")),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert!(matches!(
+            update_rebate_rule(
+                axum::extract::State(state.clone()),
+                admin(),
+                axum::extract::Path(ordinary.id),
+                axum::Json(request("__sales__", "0.15")),
+            )
+            .await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            create_rebate_rule(
+                axum::extract::State(state.clone()),
+                admin(),
+                axum::Json(request("__sales__", "0.20")),
+            )
+            .await,
+            Err(crate::error::AppError::BadRequest(_))
+        ));
+        let updated = update_rebate_rule(
+            axum::extract::State(state.clone()),
+            admin(),
+            axum::extract::Path(ordinary.id),
+            axum::Json(request("default", "0.06")),
+        )
+        .await
+        .unwrap()
+        .0
+        .data;
+        assert_eq!(updated.rebate_rate, "0.0600");
+        let deleted = delete_rebate_rule(
+            axum::extract::State(state),
+            admin(),
+            axum::extract::Path(ordinary.id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(deleted.success);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn sales_topup_rate_uses_order_time_identity_and_preserves_snapshots() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        let cutover = 1_784_211_100_i64;
+        sqlx::query(
+            r#"
+            INSERT INTO rebate_rules(user_group,rule_type,rebate_rate,effective_time,created_at,updated_at)
+            VALUES ('default','topup',0.0500,1,1,1),
+                   ('__all__','topup',0.0500,1,1,1),
+                   ('__sales__','topup',0.1500,$1,$1,$1)
+            "#,
+        )
+        .bind(cutover)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sales_accounts(user_id,active,note,created_at,updated_at,updated_by) VALUES(1001,TRUE,'',1,1,1)")
+            .execute(&database.pool).await.unwrap();
+        for (active, at) in [
+            (true, cutover - 50),
+            (false, cutover + 20),
+            (true, cutover + 50),
+        ] {
+            sqlx::query("INSERT INTO sales_account_events(user_id,active,note,admin_id,created_at) VALUES(1001,$1,'',1,$2)")
+                .bind(active).bind(at).execute(&database.pool).await.unwrap();
+        }
+
+        let event = |source_order_id, inviter_id, completed_at| RebateSourceEvent {
+            schema_version: 2,
+            event_key: format!("newapi:topup:{source_order_id}"),
+            event_type: "topup.completed".to_string(),
+            source_order_id,
+            invitee_id: 2000 + source_order_id,
+            inviter_id: Some(inviter_id),
+            inviter_group: "default".to_string(),
+            rebate_base_amount_cents: None,
+            credited_quota: Some(1_000_000),
+            completed_at,
+            payment_provider: "epay".to_string(),
+        };
+        let cases = [
+            (9001, 1002, cutover + 60, "0.0500", 50_000),
+            (9002, 1001, cutover - 1, "0.0500", 50_000),
+            (9003, 1001, cutover, "0.0500", 50_000),
+            (9007, 1001, cutover + 1, "0.1500", 150_000),
+            (9008, 1001, cutover + 20, "0.1500", 150_000),
+            (9004, 1001, cutover + 21, "0.0500", 50_000),
+            (9009, 1001, cutover + 50, "0.0500", 50_000),
+            (9005, 1001, cutover + 51, "0.1500", 150_000),
+        ];
+        for (id, inviter_id, completed_at, rate, quota) in cases {
+            assert_eq!(
+                ingest_rebate_source_event(
+                    &database.pool,
+                    event(id, inviter_id, completed_at),
+                    500_000,
+                    1
+                )
+                .await
+                .unwrap(),
+                IngestOutcome::Created
+            );
+            let actual: (String, i64, String, i64) = sqlx::query_as(
+                "SELECT record.rebate_rate::TEXT, record.rebate_amount, snapshot.rebate_rate::TEXT, snapshot.rebate_quota FROM rebate_records record JOIN rebate_calculation_snapshots snapshot ON snapshot.rebate_record_id=record.id WHERE record.order_id=$1",
+            )
+            .bind(id).fetch_one(&database.pool).await.unwrap();
+            assert_eq!(
+                (actual.0, actual.1, actual.3),
+                (rate.to_string(), quota, quota)
+            );
+            assert_eq!(
+                actual.2.parse::<rust_decimal::Decimal>().unwrap(),
+                rate.parse::<rust_decimal::Decimal>().unwrap()
+            );
+        }
+        let mut reserved_group = event(9006, 1002, cutover + 60);
+        reserved_group.inviter_group = "__sales__".to_string();
+        ingest_rebate_source_event(&database.pool, reserved_group, 500_000, 1)
+            .await
+            .unwrap();
+        let ordinary_rate: String =
+            sqlx::query_scalar("SELECT rebate_rate::TEXT FROM rebate_records WHERE order_id=9006")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(ordinary_rate, "0.0500");
+
+        sqlx::query("UPDATE rebate_rules SET rebate_rate=0.2000 WHERE user_group='__sales__'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM rebate_source_event_receipts WHERE event_key='newapi:topup:9007'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            ingest_rebate_source_event(&database.pool, event(9007, 1001, cutover + 1), 500_000, 1)
+                .await
+                .unwrap(),
+            IngestOutcome::Replay
+        );
+        let frozen: (String, i64) = sqlx::query_as(
+            "SELECT rebate_rate::TEXT, rebate_amount FROM rebate_records WHERE order_id=9007",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(frozen, ("0.1500".to_string(), 150_000));
+
+        sqlx::query("UPDATE rebate_rules SET rebate_rate=0.1500 WHERE user_group='__sales__'")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO rebate_records(inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,rebate_rate,status,scan_started_at,initialization_ends_at,created_at,updated_at) VALUES(1001,9999,'default','topup',9999,2.00,$1,$2,0,NULL,'initializing',$1,$3,$1,$1)",
+        )
+        .bind(cutover + 60)
+        .bind(cutover + 60 + REBATE_EFFECTIVE_DELAY_SECONDS)
+        .bind(cutover + 60 + INITIALIZATION_SECONDS)
+        .execute(&database.pool).await.unwrap();
+        finalize_ready_initializing_records(&database.pool, cutover + 60 + INITIALIZATION_SECONDS)
+            .await
+            .unwrap();
+        let legacy: (String, i64) = sqlx::query_as(
+            "SELECT rebate_rate::TEXT, rebate_amount FROM rebate_records WHERE order_id=9999",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy, ("0.1500".to_string(), 150_000));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
     async fn user_rebate_records_include_initializing_and_always_hide_closed() {
         let database = TestDatabase::create().await;
         database.prepare().await.unwrap();
@@ -3448,6 +3724,64 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn reconciliation_handles_sales_and_ordinary_orders_in_one_group() {
+        let database = TestDatabase::create().await;
+        database.prepare().await.unwrap();
+        sqlx::query(
+            "INSERT INTO rebate_rules(user_group,rule_type,rebate_rate,effective_time,created_at,updated_at) VALUES('default','topup',0.0500,1,1,1),('__sales__','topup',0.1500,100,100,100)",
+        ).execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO sales_accounts(user_id,active,note,created_at,updated_at,updated_by) VALUES(11,TRUE,'',90,90,1)")
+            .execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO sales_account_events(user_id,active,note,admin_id,created_at) VALUES(11,TRUE,'',1,90)")
+            .execute(&database.pool).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE users(id BIGINT PRIMARY KEY,inviter_id BIGINT,"group" TEXT);
+            CREATE TABLE top_ups(id BIGINT PRIMARY KEY,user_id BIGINT,money DOUBLE PRECISION,
+                amount DOUBLE PRECISION,complete_time BIGINT,create_time BIGINT,
+                payment_provider TEXT,payment_method TEXT,trade_no TEXT,status TEXT);
+            CREATE TABLE subscription_orders(id BIGINT PRIMARY KEY,user_id BIGINT,
+                money DOUBLE PRECISION,complete_time BIGINT,create_time BIGINT,
+                trade_no TEXT,status TEXT);
+            CREATE TABLE redemptions(id BIGINT PRIMARY KEY,used_user_id BIGINT,quota BIGINT,
+                redeemed_time BIGINT,created_time BIGINT,status INTEGER);
+            INSERT INTO users(id,inviter_id,"group") VALUES
+                (11,NULL,'default'),(12,NULL,'default'),(21,11,'default'),(22,12,'default');
+            INSERT INTO top_ups(id,user_id,money,amount,complete_time,create_time,
+                payment_provider,payment_method,trade_no,status) VALUES
+                (1001,21,2,2,110,100,'epay','alipay','sales-1001','success'),
+                (1002,22,2,2,110,100,'epay','alipay','ordinary-1002','success');
+            "#,
+        )
+        .execute(&database.external_pool)
+        .await
+        .unwrap();
+
+        let manifest = plan(&database.pool, &database.external_pool, 500_000, 1001, 1002)
+            .await
+            .unwrap();
+        assert_eq!(manifest.orders.len(), 2);
+        assert_eq!(manifest.orders[0].rebate_rate, "0.1500");
+        assert_eq!(manifest.orders[0].expected_rebate_quota, 150_000);
+        assert_eq!(manifest.orders[1].rebate_rate, "0.0500");
+        assert_eq!(manifest.orders[1].expected_rebate_quota, 50_000);
+        assert_eq!(
+            apply_for_test(&database.pool, &database.external_pool, manifest.clone())
+                .await
+                .unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            verify_for_test(&database.pool, &database.external_pool, manifest)
+                .await
+                .unwrap(),
+            2
         );
         database.cleanup().await;
     }

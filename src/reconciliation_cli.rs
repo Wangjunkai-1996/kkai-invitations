@@ -9,7 +9,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::config::{self, SettlementMode};
-use crate::rebate_lifecycle::{matches_supported_rebate_schedule, ALL_USER_GROUP};
+use crate::rebate_lifecycle::{matches_supported_rebate_schedule, selected_rebate_rule};
 use crate::rebate_source_events::{
     attach_legacy_rebate_source_event_in_transaction, calculate_rebate_from_credited_quota,
     payload_hash_for_event, IngestError, IngestOutcome, RebateSourceEvent,
@@ -267,18 +267,16 @@ pub async fn plan(
         None,
     )
     .await?;
-    let mut rules = HashMap::new();
     let mut orders = Vec::with_capacity(source_orders.len());
     for source in source_orders {
         let credit_evidence = credited_quota_evidence(&source, quota_per_unit)?;
-        let rate = match rules.get(&source.inviter_group) {
-            Some(rate) => *rate,
-            None => {
-                let rate = load_rule_rate(invitations_pool, &source.inviter_group).await?;
-                rules.insert(source.inviter_group.clone(), rate);
-                rate
-            }
-        };
+        let rate = load_rule_rate(
+            invitations_pool,
+            &source.inviter_group,
+            source.inviter_id,
+            source.completed_at,
+        )
+        .await?;
         let expected_rebate_quota =
             calculate_rebate_from_credited_quota(credit_evidence.credited_quota, rate)?;
         let existing_record =
@@ -327,7 +325,7 @@ async fn apply(
     validate_configured_active_boundary(&envelope.manifest, configured_active_from_topup_id)?;
     revalidate_source(newapi_pool, &envelope.manifest).await?;
     let mut transaction = invitations_pool.begin().await?;
-    sqlx::query("LOCK TABLE rebate_rules IN SHARE MODE")
+    sqlx::query("LOCK TABLE rebate_rules, sales_account_events IN SHARE MODE")
         .execute(&mut *transaction)
         .await?;
     revalidate_manifest_rules(&mut transaction, &envelope.manifest).await?;
@@ -626,21 +624,18 @@ fn record_rate_matches(record_rate: Option<Decimal>, expected_rate: Decimal) -> 
 async fn load_rule_rate(
     pool: &PgPool,
     inviter_group: &str,
+    inviter_id: i64,
+    completed_at: i64,
 ) -> Result<Decimal, ReconciliationCliError> {
-    let rate: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT rebate_rate::TEXT
-        FROM rebate_rules
-        WHERE rule_type = $2 AND user_group IN ($1, $3)
-        ORDER BY CASE WHEN user_group = $1 THEN 0 ELSE 1 END
-        LIMIT 1
-        "#,
+    let rate = selected_rebate_rule(
+        pool,
+        inviter_group,
+        TOPUP_ORDER_TYPE,
+        inviter_id,
+        completed_at,
     )
-    .bind(inviter_group)
-    .bind(TOPUP_ORDER_TYPE)
-    .bind(ALL_USER_GROUP)
-    .fetch_optional(pool)
-    .await?;
+    .await?
+    .map(|(_, rate)| rate);
     let rate = rate
         .unwrap_or_else(|| "0".to_string())
         .parse::<Decimal>()
@@ -653,24 +648,19 @@ async fn revalidate_manifest_rules(
     transaction: &mut Transaction<'_, Postgres>,
     manifest: &ReconciliationManifest,
 ) -> Result<(), ReconciliationCliError> {
-    let mut rates = HashMap::new();
     for order in &manifest.orders {
         let manifest_rate = validate_manifest_order_rebate(order)?;
-        if let Some(previous) = rates.insert(order.inviter_group.clone(), manifest_rate) {
-            if previous != manifest_rate {
-                return Err(ReconciliationCliError::InvalidManifest(format!(
-                    "inviter group {} has inconsistent manifest rates",
-                    order.inviter_group
-                )));
-            }
-        }
-    }
-
-    for (group, expected_rate) in rates {
-        let current_rate = load_rule_rate_in_transaction(transaction, &group).await?;
-        if current_rate != expected_rate {
+        let current_rate = load_rule_rate_in_transaction(
+            transaction,
+            &order.inviter_group,
+            order.inviter_id,
+            order.completed_at,
+        )
+        .await?;
+        if current_rate != manifest_rate {
             return Err(ReconciliationCliError::SourceChanged(format!(
-                "rebate rule changed for inviter group {group}"
+                "rebate rule or sales status changed for topup {}",
+                order.source_order_id
             )));
         }
     }
@@ -680,21 +670,18 @@ async fn revalidate_manifest_rules(
 async fn load_rule_rate_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     inviter_group: &str,
+    inviter_id: i64,
+    completed_at: i64,
 ) -> Result<Decimal, ReconciliationCliError> {
-    let rate: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT rebate_rate::TEXT
-        FROM rebate_rules
-        WHERE rule_type = $2 AND user_group IN ($1, $3)
-        ORDER BY CASE WHEN user_group = $1 THEN 0 ELSE 1 END
-        LIMIT 1
-        "#,
+    let rate = selected_rebate_rule(
+        &mut **transaction,
+        inviter_group,
+        TOPUP_ORDER_TYPE,
+        inviter_id,
+        completed_at,
     )
-    .bind(inviter_group)
-    .bind(TOPUP_ORDER_TYPE)
-    .bind(ALL_USER_GROUP)
-    .fetch_optional(&mut **transaction)
-    .await?;
+    .await?
+    .map(|(_, rate)| rate);
     let rate = rate
         .unwrap_or_else(|| "0".to_string())
         .parse::<Decimal>()

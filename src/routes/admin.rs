@@ -24,7 +24,7 @@ use crate::payout::{pay_rebate_record, request_id_from_headers, PayRecordInput, 
 use crate::rebate_lifecycle::{
     finalize_initializing_records_by_ids, rebate_amount_for_cents,
     rebate_amount_for_credited_quota, rebate_effective_at_for_cutover, ALL_USER_GROUP,
-    INITIALIZATION_SECONDS,
+    INITIALIZATION_SECONDS, SALES_USER_GROUP,
 };
 use crate::rebate_types::{
     is_invitation_signup_reward_order_type, is_order_rebate_order_type,
@@ -601,6 +601,7 @@ pub async fn create_rebate_rule(
         VALUES ($1, $2, $3, $4, $4, $4)
         ON CONFLICT (user_group, rule_type)
         DO UPDATE SET rebate_rate = $3, effective_time = $4, updated_at = $4
+        WHERE rebate_rules.user_group <> $5
         RETURNING id, user_group, rule_type, rebate_rate::TEXT as rebate_rate,
                   effective_time, created_at, updated_at
         "#,
@@ -609,8 +610,10 @@ pub async fn create_rebate_rule(
     .bind(&validated.rule_type)
     .bind(validated.rebate_rate)
     .bind(now)
-    .fetch_one(&state.pool)
-    .await?;
+    .bind(SALES_USER_GROUP)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::Conflict("销售返利规则创建后不可覆盖".to_string()))?;
 
     tracing::info!(
         admin_id = admin.0.id,
@@ -633,13 +636,16 @@ pub async fn update_rebate_rule(
         return Err(AppError::BadRequest("无效的规则 ID".to_string()));
     }
     let validated = validate_rebate_rule_request(&req)?;
+    if validated.user_group == SALES_USER_GROUP {
+        return Err(AppError::Conflict("销售返利规则创建后不可修改".to_string()));
+    }
     let now = Utc::now().timestamp();
 
     let row = sqlx::query(
         r#"
         UPDATE rebate_rules
         SET user_group = $1, rule_type = $2, rebate_rate = $3, effective_time = $4, updated_at = $4
-        WHERE id = $5
+        WHERE id = $5 AND user_group <> $6
         RETURNING id, user_group, rule_type, rebate_rate::TEXT as rebate_rate,
                   effective_time, created_at, updated_at
         "#,
@@ -649,9 +655,25 @@ pub async fn update_rebate_rule(
     .bind(validated.rebate_rate)
     .bind(now)
     .bind(id)
+    .bind(SALES_USER_GROUP)
     .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("返利规则不存在".to_string()))?;
+    .await?;
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let protected: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM rebate_rules WHERE id=$1 AND user_group=$2)",
+            )
+            .bind(id)
+            .bind(SALES_USER_GROUP)
+            .fetch_one(&state.pool)
+            .await?;
+            if protected {
+                return Err(AppError::Conflict("销售返利规则创建后不可修改".to_string()));
+            }
+            return Err(AppError::NotFound("返利规则不存在".to_string()));
+        }
+    };
 
     tracing::info!(
         admin_id = admin.0.id,
@@ -672,13 +694,24 @@ pub async fn delete_rebate_rule(
         return Err(AppError::BadRequest("无效的规则 ID".to_string()));
     }
 
-    let rows = sqlx::query("DELETE FROM rebate_rules WHERE id = $1")
+    let rows = sqlx::query("DELETE FROM rebate_rules WHERE id = $1 AND user_group <> $2")
         .bind(id)
+        .bind(SALES_USER_GROUP)
         .execute(&state.pool)
         .await?
         .rows_affected();
 
     if rows == 0 {
+        let protected: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM rebate_rules WHERE id=$1 AND user_group=$2)",
+        )
+        .bind(id)
+        .bind(SALES_USER_GROUP)
+        .fetch_one(&state.pool)
+        .await?;
+        if protected {
+            return Err(AppError::Conflict("销售返利规则创建后不可删除".to_string()));
+        }
         return Err(AppError::NotFound("返利规则不存在".to_string()));
     }
 
@@ -2849,6 +2882,11 @@ fn validate_rebate_rule_request(req: &RebateRuleRequest) -> Result<ValidatedReba
 
     if !(0.0..=1.0).contains(&rate) {
         return Err(AppError::BadRequest("返利比例必须在 0-1 之间".to_string()));
+    }
+    if user_group == SALES_USER_GROUP && (rule_type != "topup" || rate != 0.15) {
+        return Err(AppError::BadRequest(
+            "销售返利专用规则仅支持充值 15%".to_string(),
+        ));
     }
 
     Ok(ValidatedRebateRuleRequest {

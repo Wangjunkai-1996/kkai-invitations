@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::{AppError, Result};
 use crate::rebate_lifecycle::{
-    matches_supported_rebate_schedule, order_rebate_effective_at, ALL_USER_GROUP,
+    matches_supported_rebate_schedule, order_rebate_effective_at, selected_rebate_rule,
     INITIALIZATION_SECONDS, REBATE_EFFECTIVE_DELAY_SECONDS,
 };
 use crate::rebate_types::TOPUP_ORDER_TYPE;
@@ -314,7 +314,13 @@ async fn ingest_rebate_source_event_with_policy(
         return Ok(outcome);
     }
 
-    let rule = load_rebate_rule(transaction, &event.inviter_group).await?;
+    let rule = load_rebate_rule(
+        transaction,
+        &event.inviter_group,
+        inviter_id,
+        event.completed_at,
+    )
+    .await?;
     let credited_quota = credited_quota_for_event(&event, quota_per_unit)?;
     let rebate_quota = calculate_rebate_from_credited_quota(credited_quota, rule.rate)?;
     let record_id = insert_rebate_record(
@@ -679,7 +685,13 @@ async fn ingest_existing_record(
             "源订单与已有返利记录的经济身份不一致".to_string(),
         ));
     }
-    let rule = load_rebate_rule(transaction, &event.inviter_group).await?;
+    let rule = load_rebate_rule(
+        transaction,
+        &event.inviter_group,
+        context.inviter_id,
+        event.completed_at,
+    )
+    .await?;
     let credited_quota = credited_quota_for_event(event, context.quota_per_unit)?;
     let rebate_quota = calculate_rebate_from_credited_quota(credited_quota, rule.rate)?;
     validate_existing_record_for_policy(
@@ -922,28 +934,23 @@ async fn validate_canonical_record_and_snapshot(
 async fn load_rebate_rule(
     transaction: &mut Transaction<'_, Postgres>,
     inviter_group: &str,
+    inviter_id: i64,
+    completed_at: i64,
 ) -> std::result::Result<RebateRuleSnapshot, IngestError> {
-    let row = sqlx::query(
-        r#"
-        SELECT id, rebate_rate::TEXT AS rebate_rate
-        FROM rebate_rules
-        WHERE rule_type = $2 AND user_group IN ($1, $3)
-        ORDER BY CASE WHEN user_group = $1 THEN 0 ELSE 1 END
-        LIMIT 1
-        "#,
+    let Some((rule_id, rate_text)) = selected_rebate_rule(
+        &mut **transaction,
+        inviter_group,
+        TOPUP_ORDER_TYPE,
+        inviter_id,
+        completed_at,
     )
-    .bind(inviter_group)
-    .bind(TOPUP_ORDER_TYPE)
-    .bind(ALL_USER_GROUP)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let Some(row) = row else {
+    .await?
+    else {
         return Ok(RebateRuleSnapshot {
             rule_id: None,
             rate: Decimal::ZERO,
         });
     };
-    let rate_text: String = row.try_get("rebate_rate")?;
     let rate = rate_text
         .parse::<Decimal>()
         .map_err(|_| IngestError::Invalid("返利规则格式无效".to_string()))?;
@@ -951,7 +958,7 @@ async fn load_rebate_rule(
         return Err(IngestError::Invalid("返利规则超出 0 到 1".to_string()));
     }
     Ok(RebateRuleSnapshot {
-        rule_id: Some(row.try_get("id")?),
+        rule_id: Some(rule_id),
         rate,
     })
 }
