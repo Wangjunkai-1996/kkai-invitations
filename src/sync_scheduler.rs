@@ -1,11 +1,17 @@
 use std::time::Duration;
 
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::routes::system::{run_rebate_sync, run_topup_reconciliation};
 use crate::AppState;
 
-pub fn spawn_rebate_sync_scheduler(state: AppState) {
+pub fn spawn_rebate_sync_scheduler(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    jobs: &mut JoinSet<()>,
+) {
     let interval_seconds = state.config.auto_sync_interval_seconds;
     let initial_delay_seconds = state.config.auto_sync_initial_delay_seconds;
     let Some((interval_duration, initial_delay)) =
@@ -17,7 +23,7 @@ pub fn spawn_rebate_sync_scheduler(state: AppState) {
 
     let first_tick = Instant::now() + initial_delay;
 
-    tokio::spawn(async move {
+    jobs.spawn(async move {
         tracing::info!(
             interval_seconds,
             initial_delay_seconds,
@@ -28,7 +34,12 @@ pub fn spawn_rebate_sync_scheduler(state: AppState) {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = crate::runtime::wait_for_shutdown(shutdown.clone()) => break,
+                _ = ticker.tick() => {},
+            }
+            // Finish the current transaction before observing the next stop signal.
             match run_rebate_sync(&state).await {
                 Ok(response) if response.skipped => {
                     tracing::info!("Automatic rebate sync skipped: sync already running");
@@ -53,7 +64,11 @@ pub fn spawn_rebate_sync_scheduler(state: AppState) {
     });
 }
 
-pub fn spawn_topup_reconciliation_scheduler(state: AppState) {
+pub fn spawn_topup_reconciliation_scheduler(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    jobs: &mut JoinSet<()>,
+) {
     let interval_seconds = state.config.topup_reconciliation_interval_seconds;
     let initial_delay_seconds = state.config.topup_reconciliation_initial_delay_seconds;
     let Some((interval_duration, initial_delay)) =
@@ -64,7 +79,7 @@ pub fn spawn_topup_reconciliation_scheduler(state: AppState) {
     };
 
     let first_tick = Instant::now() + initial_delay;
-    tokio::spawn(async move {
+    jobs.spawn(async move {
         tracing::info!(
             interval_seconds,
             initial_delay_seconds,
@@ -75,7 +90,12 @@ pub fn spawn_topup_reconciliation_scheduler(state: AppState) {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = crate::runtime::wait_for_shutdown(shutdown.clone()) => break,
+                _ = ticker.tick() => {},
+            }
+            // Finish the current transaction before observing the next stop signal.
             match run_topup_reconciliation(&state).await {
                 Ok(result) if result.skipped => {
                     tracing::info!("Automatic top-up reconciliation skipped: sync already running");

@@ -12,6 +12,62 @@ pub const DEFAULT_BALANCE_API_REQUEST_TIMEOUT_MILLISECONDS: u64 = 10_000;
 pub const BALANCE_LEASE_MILLISECONDS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeRole {
+    Standalone,
+    Serving,
+    Worker,
+}
+
+impl NodeRole {
+    pub fn from_value(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("standalone") => Ok(Self::Standalone),
+            Some("serving") => Ok(Self::Serving),
+            Some("worker") => Ok(Self::Worker),
+            Some(value) => Err(format!(
+                "INVITATIONS_NODE_ROLE must be standalone, serving, or worker; got {value:?}"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Serving => "serving",
+            Self::Worker => "worker",
+        }
+    }
+
+    pub const fn runs_background_jobs(self) -> bool {
+        !matches!(self, Self::Serving)
+    }
+
+    pub fn validate_listen_address(self, address: &str) -> Result<(), String> {
+        if self == Self::Standalone {
+            return Ok(());
+        }
+        let parsed: std::net::SocketAddr = address
+            .parse()
+            .map_err(|_| "LISTEN_ADDR must be an IP address and port in role mode".to_string())?;
+        if parsed.port() == 0 || (self == Self::Worker && !parsed.ip().is_loopback()) {
+            return Err(
+                "worker LISTEN_ADDR must be loopback; role mode requires a nonzero port"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn node_role_from_env() -> Result<NodeRole, String> {
+    match env::var("INVITATIONS_NODE_ROLE") {
+        Ok(value) => NodeRole::from_value(Some(&value)),
+        Err(env::VarError::NotPresent) => Ok(NodeRole::Standalone),
+        Err(_) => Err("INVITATIONS_NODE_ROLE must be valid Unicode".to_string()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettlementMode {
     Disabled,
     ReadOnly,
@@ -26,6 +82,7 @@ impl SettlementMode {
 
 #[derive(Clone)]
 pub struct Config {
+    pub node_role: NodeRole,
     pub listen_addr: String,
     pub base_path: String,
     pub database_url: String,
@@ -55,8 +112,12 @@ pub struct BalanceApiConfig {
 impl Config {
     pub fn from_env() -> std::result::Result<Self, String> {
         let settlement_mode = settlement_mode_from_env()?;
+        let node_role = node_role_from_env()?;
+        let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:6212".to_string());
+        node_role.validate_listen_address(&listen_addr)?;
         Ok(Self {
-            listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:6212".to_string()),
+            node_role,
+            listen_addr,
             base_path: env::var("BASE_PATH").unwrap_or_else(|_| "".to_string()),
             database_url: invitations_database_url_from_env()?,
             newapi_database_url: newapi_database_url_from_env()?,
@@ -335,6 +396,41 @@ fn parse_i64_env_value(name: &str, value: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_role_requires_an_explicit_known_value() {
+        use super::NodeRole;
+        assert_eq!(NodeRole::from_value(None).unwrap(), NodeRole::Standalone);
+        for role in [NodeRole::Standalone, NodeRole::Serving, NodeRole::Worker] {
+            assert_eq!(NodeRole::from_value(Some(role.as_str())).unwrap(), role);
+        }
+        for invalid in ["", "SERVER", "worker ", "readonly", "standalone,worker"] {
+            assert!(NodeRole::from_value(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn node_role_worker_only_binds_loopback() {
+        use super::NodeRole;
+        for address in ["127.0.0.1:6212", "[::1]:6212"] {
+            assert!(NodeRole::Worker.validate_listen_address(address).is_ok());
+        }
+        for address in [
+            "0.0.0.0:6212",
+            "[::]:6212",
+            "10.0.0.1:6212",
+            "localhost:6212",
+            "127.0.0.1:0",
+        ] {
+            assert!(NodeRole::Worker.validate_listen_address(address).is_err());
+        }
+        assert!(NodeRole::Serving
+            .validate_listen_address("0.0.0.0:6212")
+            .is_ok());
+        assert!(NodeRole::Serving
+            .validate_listen_address("malformed")
+            .is_err());
+    }
+
     use super::*;
 
     #[test]

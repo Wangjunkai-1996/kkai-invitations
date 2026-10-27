@@ -4,6 +4,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::config::{BalanceApiConfig, BALANCE_LEASE_MILLISECONDS};
@@ -399,25 +401,37 @@ async fn read_operation(
     .transpose()
 }
 
-pub fn spawn_balance_dispatcher(state: AppState) {
+pub fn spawn_balance_dispatcher(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    jobs: &mut JoinSet<()>,
+) {
     if !state.config.settlement_mode.is_enabled() {
         return;
     }
     let interval_milliseconds = state.config.balance_dispatch_interval_milliseconds;
-    tokio::spawn(async move {
+    jobs.spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_milliseconds));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tracing::info!(interval_milliseconds, "Balance dispatcher started");
         loop {
-            ticker.tick().await;
-            if let Err(error) = dispatch_available(&state, DISPATCH_BATCH_SIZE).await {
+            tokio::select! {
+                biased;
+                _ = crate::runtime::wait_for_shutdown(shutdown.clone()) => break,
+                _ = ticker.tick() => {},
+            }
+            if let Err(error) = dispatch_available(&state, DISPATCH_BATCH_SIZE, &shutdown).await {
                 tracing::error!(%error, "Balance dispatcher iteration failed");
             }
         }
     });
 }
 
-pub async fn dispatch_available(state: &AppState, limit: usize) -> Result<usize, sqlx::Error> {
+async fn dispatch_available(
+    state: &AppState,
+    limit: usize,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<usize, sqlx::Error> {
     let Some(api_config) = state.config.balance_api.as_ref() else {
         tracing::error!("Balance API configuration missing while dispatcher is enabled");
         return Ok(0);
@@ -429,6 +443,10 @@ pub async fn dispatch_available(state: &AppState, limit: usize) -> Result<usize,
 
     let mut dispatched = 0;
     for _ in 0..limit {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            break;
+        }
+        // Once claimed, finish HTTP delivery and persist its result before stopping.
         let now = chrono::Utc::now().timestamp();
         let Some(claimed) = claim_next_operation(&state.pool, now).await? else {
             break;

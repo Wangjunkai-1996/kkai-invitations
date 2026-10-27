@@ -1394,9 +1394,61 @@ pub async fn init_pool(
     Ok(pool)
 }
 
-pub async fn init_readonly_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+pub async fn init_verified_pool(database_url: &str) -> Result<PgPool, DatabaseStartupError> {
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(4)
+        .connect(database_url)
+        .await
+        .map_err(DatabaseStartupError::Connect)?;
+    verify_runtime_schema(&pool).await?;
+    Ok(pool)
+}
+
+async fn verify_runtime_schema(pool: &PgPool) -> Result<(), DatabaseStartupError> {
+    let mut transaction = pool.begin().await.map_err(verification_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .map_err(verification_error)?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(verification_error)?;
+    let applied: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(verification_error)?;
+    if applied.len() != MIGRATOR.iter().count() {
+        return Err(DatabaseStartupError::Verification(
+            "role mode requires the complete, exact migration ledger".to_string(),
+        ));
+    }
+    for ((version, checksum, success), expected) in applied.iter().zip(MIGRATOR.iter()) {
+        if !success
+            || *version != expected.version
+            || checksum.as_slice() != expected.checksum.as_ref()
+        {
+            return Err(DatabaseStartupError::Verification(format!(
+                "role mode migration version, success, or checksum mismatch at {version}"
+            )));
+        }
+    }
+    verify_schema(&mut transaction).await?;
+    transaction.commit().await.map_err(verification_error)?;
+    Ok(())
+}
+
+pub async fn init_readonly_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    init_readonly_pool_with_limit(database_url, 5).await
+}
+
+pub async fn init_readonly_pool_with_limit(
+    database_url: &str,
+    limit: u32,
+) -> Result<PgPool, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(limit)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 conn.execute(READONLY_CONNECTION_SETUP_SQL).await?;
@@ -2485,6 +2537,7 @@ mod tests {
         .unwrap();
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -2938,6 +2991,7 @@ mod tests {
         database.prepare().await.unwrap();
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -3559,6 +3613,7 @@ mod tests {
         let secret = "0123456789abcdef0123456789abcdef";
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -3876,6 +3931,7 @@ mod tests {
 
         let active_scope_state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -4226,6 +4282,7 @@ mod tests {
         .unwrap();
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -4390,6 +4447,7 @@ mod tests {
 
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".to_string(),
                 base_path: String::new(),
                 database_url: "postgresql://test/invitations".to_string(),
@@ -6208,6 +6266,7 @@ mod tests {
             .execute(&database.pool).await.unwrap();
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".into(),
                 base_path: String::new(),
                 database_url: String::new(),
@@ -6763,6 +6822,7 @@ mod tests {
             .execute(&database.pool).await.unwrap();
         let state = AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".into(),
                 base_path: String::new(),
                 database_url: String::new(),
@@ -7414,6 +7474,205 @@ mod tests {
                     .iter()
                     .any(|item| item == "rebate_records.relkind:v")
         }));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn node_role_startup_verifies_complete_schema_with_readonly_transactions() {
+        let database = TestDatabase::create().await;
+        MIGRATOR.run(&database.pool).await.unwrap();
+        let mut url = reqwest::Url::parse(&env::var("TEST_DATABASE_URL").unwrap()).unwrap();
+        url.query_pairs_mut().append_pair(
+            "options",
+            &format!(
+                "-c search_path={} -c default_transaction_read_only=on",
+                database.schema
+            ),
+        );
+        let pool = init_verified_pool(url.as_str()).await.unwrap();
+        let readonly: String = sqlx::query_scalar("SHOW default_transaction_read_only")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(readonly, "on");
+        pool.close().await;
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn node_role_rejects_ledger_drift_without_changing_it() {
+        for mutation in [
+            "DELETE FROM _sqlx_migrations WHERE version=202610140001",
+            "UPDATE _sqlx_migrations SET version=202610140002 WHERE version=202610140001",
+            "INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(209901010001,'unexpected',TRUE,decode('00','hex'),0)",
+            "UPDATE _sqlx_migrations SET success=FALSE WHERE version=202610140001",
+            "UPDATE _sqlx_migrations SET checksum=decode('00','hex') WHERE version=202610140001",
+        ] {
+            let database = TestDatabase::create().await;
+            MIGRATOR.run(&database.pool).await.unwrap();
+            sqlx::query(mutation).execute(&database.pool).await.unwrap();
+            let before: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+                "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version"
+            ).fetch_all(&database.pool).await.unwrap();
+            assert!(verify_runtime_schema(&database.pool).await.is_err(), "{mutation}");
+            let after: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as(
+                "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version"
+            ).fetch_all(&database.pool).await.unwrap();
+            assert_eq!(before, after);
+            database.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn node_role_rejects_missing_schema_without_creating_or_repairing_it() {
+        let database = TestDatabase::create().await;
+        assert!(verify_runtime_schema(&database.pool).await.is_err());
+        let ledger_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert!(!ledger_exists);
+        MIGRATOR.run(&database.pool).await.unwrap();
+        sqlx::query("DROP INDEX idx_sales_account_events_user")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let error = verify_runtime_schema(&database.pool).await.unwrap_err();
+        assert!(error.to_string().contains("index"), "{error}");
+        let index_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('idx_sales_account_events_user') IS NOT NULL")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert!(!index_exists);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL PostgreSQL instance"]
+    async fn node_role_worker_drains_inflight_payment_before_stopping_without_claiming_next() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::Arc;
+        use tokio::sync::{watch, Notify};
+        use tokio::task::JoinSet;
+        let database = TestDatabase::create().await;
+        MIGRATOR.run(&database.pool).await.unwrap();
+        for id in [101_i64, 102] {
+            sqlx::query(
+                "INSERT INTO rebate_records(id,inviter_id,invitee_id,user_group,order_type,order_id,order_amount,order_time,rebate_effective_at,rebate_amount,status,scan_started_at,initialization_ends_at,created_at,updated_at)
+                 VALUES($1,11,12,'default','topup',$1,100,1,1,5000000,'approved',1,1,1,1)"
+            ).bind(id).execute(&database.pool).await.unwrap();
+            let payout_id: i64 = sqlx::query_scalar(
+                "INSERT INTO invitation_rebate_payouts(rebate_record_id,inviter_user_id,invitee_user_id,order_id,order_type,amount_cents,quota_delta,kind,status,request_id,created_at,updated_at)
+                 VALUES($1,11,12,$1,'topup',1000,5000000,'payout','pending',$2,1,1) RETURNING id"
+            ).bind(id).bind(format!("drain-payment-{id}")).fetch_one(&database.pool).await.unwrap();
+            let mut tx = database.pool.begin().await.unwrap();
+            enqueue_operation(
+                &mut tx,
+                EnqueueOperation {
+                    kind: OperationKind::Credit,
+                    rebate_record_id: id,
+                    rebate_request_id: None,
+                    original_operation_ulid: None,
+                    user_id: 11,
+                    payout_id,
+                    delta_quota: 5_000_000,
+                    now: 1,
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let request_started = started.clone();
+        let request_release = release.clone();
+        let app = Router::new().route(
+            "/api/internal/balance-adjustments",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let started = request_started.clone();
+                let release = request_release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Json(serde_json::json!({
+                        "operation_id": request["operation_id"],
+                        "user_id": request["user_id"],
+                        "delta": request["delta"],
+                        "reason": request["reason"],
+                        "balance_before": 10_000_000,
+                        "balance_after": 15_000_000,
+                        "created_at": 1,
+                        "replayed": false,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut state = crate::node_role_tests::state(crate::config::NodeRole::Worker);
+        state.pool = database.pool.clone();
+        state.newapi_pool = database.external_pool.clone();
+        state.config.auto_sync_interval_seconds = 0;
+        state.config.topup_reconciliation_interval_seconds = 0;
+        state.config.balance_api = Some(crate::config::BalanceApiConfig {
+            base_url,
+            secret: "test".into(),
+            connect_timeout_milliseconds: 1000,
+            request_timeout_milliseconds: 10_000,
+        });
+        state.balance_client = Some(
+            crate::balance_dispatcher::build_http_client(
+                state.config.balance_api.as_ref().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (stop, shutdown) = watch::channel(false);
+        let mut jobs = JoinSet::new();
+        crate::runtime::spawn_background_jobs(state, shutdown, &mut jobs);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("first payment reached upstream");
+        stop.send_replace(true);
+        assert!(
+            jobs.try_join_next().is_none(),
+            "worker must wait for the in-flight payment"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = jobs.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("worker must drain after upstream response");
+        let outcomes: Vec<(i64, String, i32, bool)> = sqlx::query_as(
+            "SELECT rebate_record_id,operation_state,attempt_count,lease_token IS NULL FROM balance_operations ORDER BY rebate_record_id"
+        ).fetch_all(&database.pool).await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                (101, "completed".into(), 1, true),
+                (102, "queued".into(), 0, true)
+            ]
+        );
+        let payout_states: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT rebate_record_id,status FROM invitation_rebate_payouts ORDER BY rebate_record_id"
+        ).fetch_all(&database.pool).await.unwrap();
+        assert_eq!(
+            payout_states,
+            vec![(101, "completed".into()), (102, "pending".into())]
+        );
+        server.abort();
+        let _ = server.await;
         database.cleanup().await;
     }
 }

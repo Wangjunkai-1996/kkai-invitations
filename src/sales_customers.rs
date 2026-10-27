@@ -609,6 +609,7 @@ mod tests {
         "#).execute(&ledger).await.unwrap();
         AppState {
             config: Config {
+                node_role: crate::config::NodeRole::Standalone,
                 listen_addr: "127.0.0.1:0".into(),
                 base_path: String::new(),
                 database_url: url.clone(),

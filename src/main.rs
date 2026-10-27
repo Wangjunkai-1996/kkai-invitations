@@ -13,6 +13,7 @@ mod rebate_types;
 mod reconciliation_cli;
 mod response;
 mod routes;
+mod runtime;
 mod sales;
 mod sales_customers;
 mod sales_reprice;
@@ -28,7 +29,10 @@ use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
-use config::Config;
+use config::{Config, NodeRole};
+use std::future::IntoFuture;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -92,6 +96,10 @@ async fn main() {
         .init();
 
     if args.get(1).map(String::as_str) == Some("migrate-only") {
+        if config::node_role_from_env() != Ok(NodeRole::Standalone) {
+            eprintln!("migrate-only requires INVITATIONS_NODE_ROLE=standalone");
+            std::process::exit(2);
+        }
         if !matches!(
             config::settlement_mode_from_env(),
             Ok(config::SettlementMode::ReadOnly)
@@ -181,10 +189,20 @@ async fn main() {
 
     let config = Config::from_env()
         .unwrap_or_else(|error| panic!("invalid settlement configuration: {error}"));
-    let newapi_pool = db::init_readonly_pool(&config.newapi_database_url)
+    let newapi_limit = if config.node_role == NodeRole::Standalone {
+        5
+    } else {
+        2
+    };
+    let newapi_pool = db::init_readonly_pool_with_limit(&config.newapi_database_url, newapi_limit)
         .await
         .expect("failed to connect to new-api readonly database");
-    let pool = match db::init_pool(&config.database_url, &newapi_pool).await {
+    let pool_result = if config.node_role == NodeRole::Standalone {
+        db::init_pool(&config.database_url, &newapi_pool).await
+    } else {
+        db::init_verified_pool(&config.database_url).await
+    };
+    let pool = match pool_result {
         Ok(pool) => pool,
         Err(error) => {
             if let Some(report) = error.preflight_report() {
@@ -216,10 +234,67 @@ async fn main() {
         newapi_pool,
         balance_client,
     };
-    sync_scheduler::spawn_rebate_sync_scheduler(state.clone());
-    sync_scheduler::spawn_topup_reconciliation_scheduler(state.clone());
-    balance_dispatcher::spawn_balance_dispatcher(state.clone());
+    let (stop, shutdown) = watch::channel(false);
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .expect("failed to bind");
+    let app = application_router(state.clone(), shutdown.clone());
+    let mut jobs = JoinSet::new();
+    runtime::spawn_background_jobs(state.clone(), shutdown.clone(), &mut jobs);
+    tracing::info!(
+        node_role = state.config.node_role.as_str(),
+        "invitations server listening on {} (base_path: {:?})",
+        listen_addr,
+        base_path
+    );
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(runtime::wait_for_shutdown(shutdown))
+        .into_future();
+    tokio::pin!(server);
+    let mut server_finished = false;
+    let mut failed = false;
+    tokio::select! {
+        _ = runtime::shutdown_signal() => {},
+        result = &mut server => {
+            server_finished = true;
+            if let Err(error) = result {
+                tracing::error!(%error, "HTTP server failed");
+                failed = true;
+            }
+        },
+        result = jobs.join_next(), if !jobs.is_empty() => {
+            tracing::error!(?result, "Background job stopped unexpectedly");
+            failed = true;
+        },
+    }
+    stop.send_replace(true);
+    tracing::info!("Draining HTTP requests and background jobs");
+    if !server_finished {
+        if let Err(error) = server.await {
+            tracing::error!(%error, "HTTP drain failed");
+            failed = true;
+        }
+    }
+    while let Some(result) = jobs.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "Background job drain failed");
+            failed = true;
+        }
+    }
+    state.pool.close().await;
+    state.newapi_pool.close().await;
+    tracing::info!("HTTP and background jobs drained; database connections closed");
+    if failed {
+        std::process::exit(1);
+    }
+}
 
+fn application_router(state: AppState, shutdown: watch::Receiver<bool>) -> Router {
+    let health = runtime::health_router(state.clone(), shutdown);
+    if state.config.node_role == NodeRole::Worker {
+        return health.fallback(runtime::worker_unavailable);
+    }
+    let base_path = state.config.base_path.clone();
     let b = &base_path;
     let mut app = Router::new()
         // 用户 API
@@ -424,21 +499,10 @@ async fn main() {
 
     let settlement_guard =
         axum::middleware::from_fn_with_state(state.clone(), payout::enforce_settlement_mode);
-    let app = app
-        .layer(settlement_guard)
+    app.layer(settlement_guard)
         .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .expect("failed to bind");
-
-    tracing::info!(
-        "invitations server listening on {} (base_path: {:?})",
-        listen_addr,
-        base_path
-    );
-    axum::serve(listener, app).await.unwrap();
+        .with_state(state)
+        .merge(health)
 }
 
 fn exit_preflight_error(exit_code: i32, code: &str, message: &str) -> ! {
@@ -451,4 +515,162 @@ fn exit_preflight_error(exit_code: i32, code: &str, message: &str) -> ! {
     });
     println!("{payload}");
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod node_role_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    pub(crate) fn state(role: NodeRole) -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost:1/unavailable")
+            .unwrap();
+        AppState {
+            config: Config {
+                node_role: role,
+                listen_addr: "127.0.0.1:6212".into(),
+                base_path: "/invitations".into(),
+                database_url: String::new(),
+                newapi_database_url: String::new(),
+                session_secret: "test-session".into(),
+                rebate_event_ingest_secret: "test-ingest".into(),
+                sync_secret: None,
+                auto_sync_interval_seconds: 1,
+                auto_sync_initial_delay_seconds: 60,
+                topup_reconciliation_interval_seconds: 1,
+                topup_reconciliation_initial_delay_seconds: 60,
+                topup_rebate_active_from_id: 1,
+                settlement_mode: config::SettlementMode::Enabled,
+                quota_per_unit: 500000,
+                balance_api: None,
+                balance_dispatch_interval_milliseconds: 1000,
+            },
+            pool: pool.clone(),
+            newapi_pool: pool,
+            balance_client: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn node_role_worker_has_no_business_routes_and_health_identifies_draining() {
+        let (_stop, shutdown) = watch::channel(true);
+        let app = application_router(state(NodeRole::Worker), shutdown);
+        for (method, path) in [
+            ("GET", "/invitations/api/invitations/sales-profile"),
+            ("POST", "/api/internal/rebate-source-events"),
+            ("POST", "/invitations/api/admin/rebate-requests/1/approve"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["node_role"], "worker");
+        assert_eq!(body["schema_version"], db::latest_schema_version());
+        assert_eq!(body["deployment_protocol"], 1);
+        assert!(body["version"].as_str().is_some());
+        assert!(body["source_revision"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn node_role_serving_retains_business_routes_without_jobs() {
+        let (_stop, shutdown) = watch::channel(false);
+        let state = state(NodeRole::Serving);
+        let mut jobs = JoinSet::new();
+        runtime::spawn_background_jobs(state.clone(), shutdown.clone(), &mut jobs);
+        assert!(jobs.is_empty());
+        let response = application_router(state, shutdown)
+            .oneshot(
+                Request::builder()
+                    .uri("/invitations/api/invitations/sales-profile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn node_role_background_jobs_stop_before_starting_another_iteration() {
+        for role in [NodeRole::Worker, NodeRole::Standalone] {
+            let (_stop, shutdown) = watch::channel(true);
+            let mut jobs = JoinSet::new();
+            runtime::spawn_background_jobs(state(role), shutdown, &mut jobs);
+            assert_eq!(jobs.len(), 3);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while let Some(result) = jobs.join_next().await {
+                    result.unwrap();
+                }
+            }).await.expect("already-stopped jobs must never wait for the next tick or query the unavailable DB");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn node_role_health_checks_both_databases_and_reports_readiness() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let readonly_pool = db::init_readonly_pool_with_limit(&url, 2).await.unwrap();
+        let mut state = state(NodeRole::Serving);
+        state.pool = pool.clone();
+        state.newapi_pool = readonly_pool.clone();
+        let (_stop, shutdown) = watch::channel(false);
+        let app = application_router(state, shutdown);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["node_role"], "serving");
+        readonly_pool.close().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        pool.close().await;
+    }
 }

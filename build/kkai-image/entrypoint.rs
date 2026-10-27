@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
@@ -45,8 +45,8 @@ fn main() {
 
 fn load_secrets() -> Result<(), String> {
     for (file_environment, target_environment) in SECRET_ENVIRONMENTS {
-        let path = env::var(file_environment)
-            .map_err(|_| format!("{file_environment} must be set"))?;
+        let path =
+            env::var(file_environment).map_err(|_| format!("{file_environment} must be set"))?;
         if !path.starts_with("/run/secrets/") {
             return Err(format!("{file_environment} must reference /run/secrets"));
         }
@@ -75,11 +75,27 @@ fn healthcheck() -> i32 {
     let Some(port) = listen_port(&listen_address) else {
         return 2;
     };
-    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    match TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
-        Ok(_) => 0,
-        Err(_) => 1,
+    let address = listen_address
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|address| address.ip().is_loopback())
+        .unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
+    if http_healthcheck(address).unwrap_or(false) {
+        0
+    } else {
+        1
     }
+}
+
+fn http_healthcheck(address: SocketAddr) -> io::Result<bool> {
+    let timeout = Duration::from_secs(3);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status)?;
+    Ok(status.starts_with("HTTP/1.1 200 ") || status.starts_with("HTTP/1.0 200 "))
 }
 
 fn listen_port(address: &str) -> Option<u16> {
@@ -90,6 +106,25 @@ fn listen_port(address: &str) -> Option<u16> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn node_role_healthcheck_requires_ready_http_status() {
+        for (status, expected) in [("200 OK", true), ("503 Service Unavailable", false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                assert_eq!(request, "GET /health HTTP/1.1\r\n");
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").unwrap();
+            });
+            assert_eq!(http_healthcheck(address).unwrap(), expected);
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn parses_ipv4_and_ipv6_listen_ports() {

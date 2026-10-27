@@ -6,6 +6,8 @@ ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:b7bb25d9f7
 FROM ${RUST_IMAGE} AS application
 
 ARG APP_VERSION
+ARG SOURCE_REVISION
+ENV APP_VERSION=${APP_VERSION} SOURCE_REVISION=${SOURCE_REVISION}
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -17,7 +19,7 @@ COPY migrations ./migrations
 COPY src ./src
 COPY tests ./tests
 RUN cargo test --locked --all-targets
-RUN test -n "${APP_VERSION}" \
+RUN test -n "${APP_VERSION}" && test -n "${SOURCE_REVISION}" \
     && cargo clean --release --package invitations \
     && cargo build --locked --release \
     && mkdir -p /out \
