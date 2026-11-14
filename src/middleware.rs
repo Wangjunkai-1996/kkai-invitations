@@ -156,7 +156,13 @@ fn console_api_mode(status: &serde_json::Value) -> Option<u8> {
     let versions = status
         .pointer("/data/console_contract/api_contracts")?
         .as_array()?;
-    if versions.iter().any(|v| v.as_u64() == Some(2)) {
+    // Contract 3/4 keep the current Authorization + /api/user/self session
+    // flow. Only explicitly supported versions may select that flow so a
+    // future incompatible contract still fails closed.
+    if versions
+        .iter()
+        .any(|v| matches!(v.as_u64(), Some(2 | 3 | 4)))
+    {
         return Some(2);
     }
     if versions.iter().any(|v| v.as_u64() == Some(1)) {
@@ -178,9 +184,27 @@ mod credit_auth_tests {
         );
         assert_eq!(
             console_api_mode(
+                &serde_json::json!({"success":true,"data":{"console_contract":{"api_contracts":[3,4]}}})
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            console_api_mode(
+                &serde_json::json!({"success":true,"data":{"console_contract":{"api_contracts":[1,4]}}})
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            console_api_mode(
                 &serde_json::json!({"success":true,"data":{"console_contract":{"api_contracts":[1]}}})
             ),
             Some(1)
+        );
+        assert_eq!(
+            console_api_mode(
+                &serde_json::json!({"success":true,"data":{"console_contract":{"api_contracts":[5]}}})
+            ),
+            None
         );
         assert_eq!(
             console_api_mode(&serde_json::json!({"success":true,"data":{}})),
