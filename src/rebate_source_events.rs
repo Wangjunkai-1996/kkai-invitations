@@ -506,11 +506,9 @@ fn validate_event(event: RebateSourceEvent) -> std::result::Result<ValidatedEven
     {
         return Err(IngestError::Invalid("completed_at 必须为正数".to_string()));
     }
-    let inviter_group = match event.inviter_group.trim() {
-        "" => DEFAULT_INVITER_GROUP.to_string(),
-        value if value.len() <= 64 => value.to_string(),
-        _ => return Err(IngestError::Invalid("邀请人分组过长".to_string())),
-    };
+    let inviter_group = normalize_inviter_group(Some(&event.inviter_group))
+        .ok_or_else(|| IngestError::Invalid("邀请人分组过长".to_string()))?
+        .to_owned();
     Ok(ValidatedEvent {
         schema_version: event.schema_version,
         event_key: event.event_key,
@@ -524,6 +522,14 @@ fn validate_event(event: RebateSourceEvent) -> std::result::Result<ValidatedEven
         completed_at: event.completed_at,
         payment_provider: payment_provider.to_string(),
     })
+}
+
+pub(crate) fn normalize_inviter_group(group: Option<&str>) -> Option<&str> {
+    match group.unwrap_or_default().trim() {
+        "" => Some(DEFAULT_INVITER_GROUP),
+        value if value.len() <= 64 => Some(value),
+        _ => None,
+    }
 }
 
 fn source_revision(event: &ValidatedEvent) -> &'static str {
@@ -1203,6 +1209,22 @@ mod tests {
             credited_quota: Some(500_000_000),
             completed_at: 1_784_010_626,
             payment_provider: REDEMPTION_PAYMENT_PROVIDER.to_string(),
+        }
+    }
+
+    #[test]
+    fn my_code_topup_policy_normalizes_inviter_groups_at_the_event_byte_limit() {
+        let at_limit = "é".repeat(32);
+        let too_long = format!("{at_limit}a");
+        for (group, expected) in [
+            (None, Some("default")),
+            (Some(""), Some("default")),
+            (Some("\t\u{3000}\n"), Some("default")),
+            (Some("  Qa-Main\u{3000}"), Some("Qa-Main")),
+            (Some(at_limit.as_str()), Some(at_limit.as_str())),
+            (Some(too_long.as_str()), None),
+        ] {
+            assert_eq!(normalize_inviter_group(group), expected);
         }
     }
 

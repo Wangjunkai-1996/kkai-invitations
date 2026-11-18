@@ -1043,13 +1043,14 @@ fn settlement_write_route(method: &Method, path: &str) -> Option<SettlementWrite
         && (path.ends_with("/approve-and-pay")
             || path.ends_with("/approve-and-pay-batch")
             || path.ends_with("/confirm-issued"));
+    let user_request = path.contains("/api/invitations/rebate-requests");
     let legacy_completion = path.contains("/api/admin/rebate-requests/")
         && (path.ends_with("/complete") || path.ends_with("/undo-complete"));
 
     if legacy_completion {
         return Some(SettlementWriteRoute::LegacyCompletion);
     }
-    if payout_action || request_payout {
+    if payout_action || request_payout || user_request {
         return Some(SettlementWriteRoute::Current);
     }
     None
@@ -1134,6 +1135,7 @@ mod tests {
         "/api/admin/rebate-requests/1/approve-and-pay",
         "/api/admin/rebate-requests/1/confirm-issued",
         "/api/admin/rebate-requests/approve-and-pay-batch",
+        "/api/invitations/rebate-requests",
     ];
     const LEGACY_COMPLETION_PATHS: &[&str] = &[
         "/api/admin/rebate-requests/1/complete",
@@ -1222,6 +1224,7 @@ mod tests {
                 "/api/admin/rebate-requests/approve-and-pay-batch",
                 post(counted_handler),
             )
+            .route("/api/invitations/rebate-requests", post(counted_handler))
             .route(
                 "/api/admin/rebate-requests/{id}/complete",
                 post(counted_handler),
@@ -1368,6 +1371,8 @@ mod tests {
             "/api/admin/rebate-requests/1/confirm-issued",
             "/api/admin/rebate-requests/approve-and-pay-batch",
             "/invitations/api/admin/rebate-requests/1/approve-and-pay",
+            "/api/invitations/rebate-requests",
+            "/invitations/api/invitations/rebate-requests",
         ] {
             assert_eq!(
                 settlement_write_route(&Method::POST, path),
@@ -1387,6 +1392,7 @@ mod tests {
         for (method, path) in [
             (Method::GET, "/api/admin/rebate-payouts/1/status"),
             (Method::POST, "/api/admin/rebate-requests/1/approve"),
+            (Method::GET, "/api/invitations/rebate-requests"),
             (Method::POST, "/api/admin/tools/pay"),
         ] {
             assert_eq!(settlement_write_route(&method, path), None, "{path}");

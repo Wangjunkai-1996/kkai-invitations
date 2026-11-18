@@ -1,18 +1,22 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::Json;
 use chrono::{TimeZone, Utc};
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
 use crate::error::{AppError, Result};
 use crate::invitation_signup::unlock_paid_invitation_signup_rewards;
+use crate::rebate_lifecycle::current_rebate_rate;
+use crate::rebate_source_events::normalize_inviter_group;
 use crate::rebate_types::{
     is_invitation_signup_reward_order_type, is_order_rebate_order_type, CENTS_PER_YUAN,
     DEFAULT_QUOTA_UNITS_PER_YUAN, INVITATION_SIGNUP_INVITEE_ORDER_TYPE,
-    INVITATION_SIGNUP_INVITER_ORDER_TYPE,
+    INVITATION_SIGNUP_INVITER_ORDER_TYPE, TOPUP_ORDER_TYPE,
 };
 use crate::response::{message, ok, ApiResponse, PaginatedResponse};
 use crate::session::SessionUser;
@@ -56,6 +60,62 @@ pub struct InvitationStats {
     pub completed_rebate: i64,
     pub pending_rebate: i64,
     pub confirming_rebate: i64,
+    topup_rebate_policy: TopupRebatePolicy,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum TopupRebatePolicy {
+    Available { ratio: f64 },
+    NotConfigured,
+    Disabled,
+    Unavailable,
+}
+
+impl TopupRebatePolicy {
+    async fn for_inviter(state: &AppState, inviter_id: i64, as_of: i64) -> Self {
+        let lookup = async {
+            let Ok(group) = sqlx::query_scalar::<_, Option<String>>(
+                r#"SELECT "group" FROM users WHERE id = $1 AND deleted_at IS NULL"#,
+            )
+            .bind(inviter_id)
+            .fetch_one(&state.newapi_pool)
+            .await
+            else {
+                return Self::unavailable("group_read");
+            };
+            let Some(group) = normalize_inviter_group(group.as_deref()) else {
+                return Self::unavailable("invalid_group");
+            };
+            Self::from_rule_rate(
+                current_rebate_rate(&state.pool, group, TOPUP_ORDER_TYPE, inviter_id, as_of).await,
+            )
+        };
+        tokio::time::timeout(Duration::from_millis(500), lookup)
+            .await
+            .unwrap_or_else(|_| Self::unavailable("timeout"))
+    }
+
+    fn from_rule_rate(result: Result<Option<Decimal>>) -> Self {
+        let rate = match result {
+            Ok(Some(rate)) => rate,
+            Ok(None) => return Self::NotConfigured,
+            Err(AppError::Internal(_)) => return Self::unavailable("invalid_ratio"),
+            Err(_) => return Self::unavailable("rule_read"),
+        };
+        if !(Decimal::ZERO..=Decimal::ONE).contains(&rate) {
+            return Self::unavailable("invalid_ratio");
+        }
+        match rate.to_f64().filter(|ratio| ratio.is_finite()) {
+            Some(ratio) => Self::Available { ratio },
+            None => Self::unavailable("invalid_ratio"),
+        }
+    }
+
+    fn unavailable(reason: &'static str) -> Self {
+        tracing::warn!(event = "my_code_topup_policy_unavailable", reason);
+        Self::Unavailable
+    }
 }
 
 #[derive(Serialize)]
@@ -207,6 +267,14 @@ pub async fn my_code(
     State(state): State<AppState>,
     user: SessionUser,
 ) -> Result<Json<ApiResponse<InvitationStats>>> {
+    my_code_at(&state, user, Utc::now().timestamp()).await
+}
+
+pub(crate) async fn my_code_at(
+    state: &AppState,
+    user: SessionUser,
+    as_of: i64,
+) -> Result<Json<ApiResponse<InvitationStats>>> {
     let sales_profile = ensure_invitation_access(&state.pool, user.id).await?;
     let source_filter = get_rebate_record_source_filter(&state.pool).await?;
 
@@ -257,6 +325,11 @@ pub async fn my_code(
         completed_rebate: quota_to_cents(stats.try_get("completed")?),
         pending_rebate: quota_to_cents(stats.try_get("pending_rebate")?),
         confirming_rebate: quota_to_cents(stats.try_get("confirming_rebate")?),
+        topup_rebate_policy: if source_filter.order_rebate_enabled {
+            TopupRebatePolicy::for_inviter(state, user.id, as_of).await
+        } else {
+            TopupRebatePolicy::Disabled
+        },
     }))
 }
 
@@ -1191,10 +1264,60 @@ mod tests {
             completed_rebate: 500,
             pending_rebate: 500,
             confirming_rebate: 500,
+            topup_rebate_policy: TopupRebatePolicy::Disabled,
         };
 
-        let value = serde_json::to_value(stats).unwrap();
-        assert_eq!(value["confirmingRebate"], 500);
+        let mut value = serde_json::to_value(stats).unwrap();
+        assert_eq!(
+            value.as_object_mut().unwrap().remove("topupRebatePolicy"),
+            Some(serde_json::json!({"state": "disabled"}))
+        );
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "invitationCode": "invite", "isSales": false, "hasSalesAccount": false,
+                "invitedCount": 2, "totalRebate": 1500, "completedRebate": 500,
+                "pendingRebate": 500, "confirmingRebate": 500
+            })
+        );
+    }
+
+    #[test]
+    fn my_code_topup_policy_preserves_zero_and_decimal_precision() {
+        for (rate, expected_ratio) in [
+            (Decimal::ZERO, 0.0),
+            (Decimal::new(1, 4), 0.0001),
+            (Decimal::new(750, 4), 0.075),
+            (Decimal::ONE, 1.0),
+        ] {
+            let policy = TopupRebatePolicy::from_rule_rate(Ok(Some(rate)));
+            assert_eq!(
+                serde_json::to_value(policy).unwrap(),
+                serde_json::json!({"state": "available", "ratio": expected_ratio})
+            );
+        }
+    }
+
+    #[test]
+    fn my_code_topup_policy_distinguishes_no_match_from_failed_reads_and_invalid_rates() {
+        for (result, expected_state) in [
+            (Ok(None), "not_configured"),
+            (
+                Err(AppError::Database(sqlx::Error::PoolClosed)),
+                "unavailable",
+            ),
+            (
+                Err(AppError::Internal("invalid decimal".into())),
+                "unavailable",
+            ),
+            (Ok(Some(Decimal::new(-1, 4))), "unavailable"),
+            (Ok(Some(Decimal::new(10001, 4))), "unavailable"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(TopupRebatePolicy::from_rule_rate(result)).unwrap(),
+                serde_json::json!({"state": expected_state})
+            );
+        }
     }
 
     #[test]

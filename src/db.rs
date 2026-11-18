@@ -2185,6 +2185,8 @@ fn verification_error(error: sqlx::Error) -> DatabaseStartupError {
 
 #[cfg(test)]
 mod tests {
+    mod invitation_summary;
+
     use std::collections::BTreeSet;
     use std::env;
     use std::time::Duration;
