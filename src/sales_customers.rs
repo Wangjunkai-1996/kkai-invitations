@@ -235,12 +235,7 @@ pub async fn customers(
     user: SessionUser,
     Query(params): Query<SalesPagination>,
 ) -> Result<Json<ApiResponse<Customers>>> {
-    if !crate::sales::profile(&state.pool, user.id)
-        .await?
-        .registered
-    {
-        return Err(AppError::Forbidden);
-    }
+    crate::routes::user::ensure_invitation_access(&state.pool, user.id).await?;
     let (page, page_size, offset) = params.values()?;
     let (legacy_cutoff, credit_currency) = credit_context(&state).await?;
     let orders_sql = credited_orders_sql(&state.newapi_pool).await?;
@@ -395,12 +390,7 @@ pub async fn recharges(
     Path(customer_id): Path<i64>,
     Query(params): Query<SalesPagination>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<Recharge>>>> {
-    if !crate::sales::profile(&state.pool, user.id)
-        .await?
-        .registered
-    {
-        return Err(AppError::Forbidden);
-    }
+    crate::routes::user::ensure_invitation_access(&state.pool, user.id).await?;
     let owns: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND inviter_id=$2)")
             .bind(customer_id)
@@ -839,6 +829,10 @@ mod tests {
             .await,
             Err(AppError::NotFound(_))
         ));
+        sqlx::query("INSERT INTO system_config VALUES ('user_invitation_rebate_enabled','false')")
+            .execute(&ledger)
+            .await
+            .unwrap();
         let mut ordinary = user.clone();
         ordinary.id = 12;
         assert!(matches!(
@@ -853,6 +847,43 @@ mod tests {
             .await,
             Err(AppError::Forbidden)
         ));
+        sqlx::query(
+            "UPDATE system_config SET value='true' WHERE key='user_invitation_rebate_enabled'",
+        )
+        .execute(&ledger)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM sales_accounts WHERE user_id=11")
+            .execute(&ledger)
+            .await
+            .unwrap();
+        let page = || {
+            Query(SalesPagination {
+                page: None,
+                page_size: None,
+            })
+        };
+        let own = customers(State(state.clone()), user.clone(), page())
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert_eq!(own.total, 3);
+        assert!(own.items.iter().all(|item| item.user_id != 14));
+        let detail = recharges(State(state.clone()), user.clone(), Path(12), page())
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert_eq!(detail.total, 2);
+        assert!(matches!(
+            recharges(State(state.clone()), user.clone(), Path(14), page()).await,
+            Err(AppError::NotFound(_))
+        ));
+        sqlx::query("INSERT INTO sales_accounts(user_id,active) VALUES (11,TRUE)")
+            .execute(&ledger)
+            .await
+            .unwrap();
         // An inactive sales account retains read access to its financial history.
         sqlx::query("UPDATE sales_accounts SET active=FALSE")
             .execute(&ledger)

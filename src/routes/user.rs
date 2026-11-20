@@ -1072,7 +1072,7 @@ async fn get_config_value_tx(
         .map_err(|_| AppError::Internal("配置值格式错误".to_string()))
 }
 
-async fn ensure_invitation_access(
+pub(crate) async fn ensure_invitation_access(
     pool: &PgPool,
     user_id: i64,
 ) -> Result<crate::sales::SalesProfile> {
